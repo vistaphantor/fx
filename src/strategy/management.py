@@ -1,0 +1,233 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+from src.strategy.breakout import BreakoutDirection
+
+
+@dataclass(frozen=True, slots=True)
+class CampaignAction:
+    action: str
+    reason: str
+    new_stop_loss: float | None = None
+    stop_updates: tuple[tuple[int, float], ...] = ()
+    add_lot: float | None = None
+    metadata: dict[str, object] = field(default_factory=dict)
+
+
+def evaluate_campaign_action(
+    *,
+    positions,
+    current_price,
+    direction,
+    latest_trade_r_multiple,
+    default_lot,
+    add_on_lot_increment,
+    max_exposure_pct,
+    margin_snapshot,
+    reversal_confirmed,
+    continuation_edge=None,
+    continuation_threshold=None,
+    breakeven_distance: float = 1.5,
+    campaign_add_floor_r: float = 1.25,
+):
+    if reversal_confirmed:
+        return CampaignAction(
+            action="close_all",
+            reason="reversal_confirmed_exit",
+            metadata={"current_price": current_price},
+        )
+
+    stop_updates, stop_reason, stop_metadata = _build_stop_updates(
+        positions=positions,
+        current_price=current_price,
+        direction=direction,
+        breakeven_distance=breakeven_distance,
+    )
+    if stop_updates:
+        return CampaignAction(
+            action="trail_all",
+            reason=stop_reason,
+            new_stop_loss=stop_updates[-1][1] if len({stop_loss for _, stop_loss in stop_updates}) == 1 else None,
+            stop_updates=tuple(stop_updates),
+            metadata=stop_metadata,
+        )
+
+    if latest_trade_r_multiple >= campaign_add_floor_r:
+        campaign_exposure_pct = float(margin_snapshot["campaign_exposure_pct"])
+        preferred_add_exposure_pct = float(margin_snapshot["preferred_add_exposure_pct"])
+        fallback_add_exposure_pct = float(margin_snapshot["fallback_add_exposure_pct"])
+        preferred_lot = round(default_lot + add_on_lot_increment, 2)
+        if campaign_exposure_pct + preferred_add_exposure_pct <= max_exposure_pct:
+            return CampaignAction(
+                action="add_position",
+                reason="campaign_add_ready",
+                add_lot=preferred_lot,
+                metadata={
+                    "campaign_exposure_pct": campaign_exposure_pct,
+                    "continuation_edge": continuation_edge,
+                    "continuation_threshold": continuation_threshold,
+                },
+            )
+        if campaign_exposure_pct + fallback_add_exposure_pct <= max_exposure_pct:
+            return CampaignAction(
+                action="add_position",
+                reason="campaign_add_ready",
+                add_lot=default_lot,
+                metadata={
+                    "campaign_exposure_pct": campaign_exposure_pct,
+                    "continuation_edge": continuation_edge,
+                    "continuation_threshold": continuation_threshold,
+                },
+            )
+        return CampaignAction(
+            action="hold",
+            reason="campaign_exposure_limit_reached",
+            metadata={"campaign_exposure_pct": campaign_exposure_pct},
+        )
+
+    if latest_trade_r_multiple >= 1.0:
+        latest_position = positions[-1]
+        entry_price = _position_entry_price(latest_position)
+        initial_stop_loss = _position_initial_stop_loss(latest_position, entry_price)
+        risk = abs(entry_price - initial_stop_loss)
+        if direction is BreakoutDirection.BULLISH:
+            new_stop_loss = entry_price + (risk * 0.25)
+        else:
+            new_stop_loss = entry_price - (risk * 0.25)
+        return CampaignAction(
+            action="trail_all",
+            reason="campaign_trail_progression",
+            new_stop_loss=new_stop_loss,
+            metadata={"risk": risk},
+        )
+
+    return CampaignAction(
+        action="hold",
+        reason="campaign_waiting_for_progress",
+        metadata={"current_price": current_price},
+    )
+
+
+def _build_stop_updates(*, positions, current_price: float, direction: BreakoutDirection, breakeven_distance: float):
+    stop_updates: list[tuple[int, float]] = []
+    progress_by_index: dict[int, float] = {}
+    locked_r_by_index: dict[int, int] = {}
+    breakeven_any = False
+    profit_lock_any = False
+
+    for index, position in enumerate(positions):
+        entry_price = _position_entry_price(position)
+        initial_stop_loss = _position_initial_stop_loss(position, entry_price)
+        current_stop_loss = _position_current_stop_loss(position)
+        risk = abs(entry_price - initial_stop_loss)
+        if risk <= 0:
+            continue
+
+        progress_r = _position_progress_r(
+            position=position,
+            current_price=current_price,
+            direction=direction,
+        )
+        progress_by_index[index] = progress_r
+        target_stop_loss = None
+
+        breakeven_trigger_r = _breakeven_trigger_r(breakeven_distance=breakeven_distance, risk=risk)
+        if progress_r >= breakeven_trigger_r:
+            target_stop_loss = entry_price
+            breakeven_any = True
+
+        if progress_r >= 2.0:
+            locked_r = _locked_r_multiple(progress_r)
+            locked_r_by_index[index] = locked_r
+            if locked_r > 0:
+                target_stop_loss = _more_protective_stop_loss(
+                    existing_stop=target_stop_loss,
+                    candidate_stop=_locked_stop_loss(
+                        entry_price=entry_price,
+                        direction=direction,
+                        risk=risk,
+                        locked_r=locked_r,
+                    ),
+                    direction=direction,
+                )
+                profit_lock_any = True
+
+        if target_stop_loss is None:
+            continue
+        if _should_improve_stop_loss(current_stop_loss=current_stop_loss, new_stop_loss=target_stop_loss, direction=direction):
+            stop_updates.append((index, target_stop_loss))
+
+    reason = "campaign_profit_lock_progression" if profit_lock_any else "campaign_breakeven_earned"
+    metadata = {
+        "progress_by_index": progress_by_index,
+        "locked_r_by_index": locked_r_by_index,
+        "breakeven_distance": breakeven_distance,
+    }
+    return stop_updates, reason, metadata
+
+
+def _breakeven_trigger_r(*, breakeven_distance: float, risk: float) -> float:
+    return min(breakeven_distance, risk) / risk
+
+
+def _locked_r_multiple(progress_r: float) -> int:
+    return max(int(progress_r) - 1, 0)
+
+
+def _locked_stop_loss(*, entry_price: float, direction: BreakoutDirection, risk: float, locked_r: int) -> float:
+    if direction is BreakoutDirection.BULLISH:
+        return entry_price + (locked_r * risk)
+    return entry_price - (locked_r * risk)
+
+
+def _more_protective_stop_loss(*, existing_stop: float | None, candidate_stop: float, direction: BreakoutDirection) -> float:
+    if existing_stop is None:
+        return candidate_stop
+    if direction is BreakoutDirection.BULLISH:
+        return max(existing_stop, candidate_stop)
+    return min(existing_stop, candidate_stop)
+
+
+def _should_improve_stop_loss(*, current_stop_loss: float | None, new_stop_loss: float, direction: BreakoutDirection) -> bool:
+    if current_stop_loss is None or current_stop_loss == 0.0:
+        return True
+    if direction is BreakoutDirection.BULLISH:
+        return new_stop_loss > current_stop_loss
+    return new_stop_loss < current_stop_loss
+
+
+def _position_progress_r(*, position, current_price: float, direction: BreakoutDirection) -> float:
+    entry_price = _position_entry_price(position)
+    initial_stop_loss = _position_initial_stop_loss(position, entry_price)
+    risk = abs(entry_price - initial_stop_loss)
+    if risk == 0:
+        return 0.0
+    if direction is BreakoutDirection.BULLISH:
+        return (current_price - entry_price) / risk
+    return (entry_price - current_price) / risk
+
+
+def _position_entry_price(position) -> float:
+    if hasattr(position, "entry_price"):
+        return float(position.entry_price)
+    if hasattr(position, "price_open"):
+        return float(position.price_open)
+    raise AttributeError("Position object is missing entry price fields")
+
+
+def _position_initial_stop_loss(position, entry_price: float) -> float:
+    if hasattr(position, "initial_stop_loss"):
+        return float(position.initial_stop_loss)
+    current_stop_loss = _position_current_stop_loss(position)
+    if current_stop_loss is not None:
+        return current_stop_loss
+    return entry_price
+
+
+def _position_current_stop_loss(position) -> float | None:
+    if hasattr(position, "stop_loss"):
+        return float(position.stop_loss)
+    if hasattr(position, "sl"):
+        return float(position.sl)
+    return None
