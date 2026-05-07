@@ -438,7 +438,7 @@ def test_quick_loop_holds_when_selected_direction_has_no_matching_fvg(monkeypatc
     )
     monkeypatch.setattr(
         "src.quick_scalp_loop.resolve_quick_indicator_guidance",
-        lambda candles: QuickIndicatorGuidance(55.0, 105.0, BreakoutDirection.BEARISH),
+        lambda candles: QuickIndicatorGuidance(55.0, 101.0, BreakoutDirection.BULLISH),
     )
     monkeypatch.setattr(
         "src.quick_scalp_loop.resolve_quick_grid_permission",
@@ -459,8 +459,211 @@ def test_quick_loop_holds_when_selected_direction_has_no_matching_fvg(monkeypatc
     )
 
     assert opened == []
-    assert any("reason=no_matching_fvg" in message for message in events)
+    assert any("reason=no_matching_fvg_mixed_guidance" in message for message in events)
     assert any("swing_low=98.00" in message and "swing_high=105.00" in message for message in events)
+
+
+def test_quick_loop_allows_full_guidance_without_matching_fvg(monkeypatch):
+    from src.quick_scalp_loop import QuickFibonacciGuidance, QuickFvgGuidance, QuickGridPermission, QuickIndicatorGuidance, run_quick_scalp_loop
+    from src.strategy.breakout import BreakoutDirection
+
+    opened = []
+    events = []
+
+    class FakeMt5:
+        def symbol_info(self, symbol):
+            return SimpleNamespace(point=0.01)
+
+        def symbol_info_tick(self, symbol):
+            return SimpleNamespace(ask=100.18, bid=100.14)
+
+    class FakeExecutor:
+        mt5_module = FakeMt5()
+
+        def list_bot_positions(self, symbol, comment_prefix="strategy-live"):
+            return []
+
+        def open_strategy_trade(self, **kwargs):
+            opened.append(kwargs)
+            return SimpleNamespace(ticket=len(opened))
+
+    candles = [
+        SimpleNamespace(high=101.0, low=99.0, open=99.2, close=100.8)
+        for _ in range(30)
+    ]
+    monkeypatch.setattr("src.quick_scalp_loop.fetch_m1_candles", lambda mt5_module, symbol, count=30: candles)
+    monkeypatch.setattr("src.quick_scalp_loop.fetch_m15_candles", lambda mt5_module, symbol, count=50: candles)
+    monkeypatch.setattr("src.quick_scalp_loop.resolve_m1_direction", lambda candles: BreakoutDirection.BULLISH)
+    monkeypatch.setattr("src.quick_scalp_loop.fetch_recent_ticks", lambda mt5_module, symbol, count=60: bullish_ticks())
+    monkeypatch.setattr(
+        "src.quick_scalp_loop.resolve_quick_fibonacci_guidance",
+        lambda candles: QuickFibonacciGuidance(BreakoutDirection.BULLISH, "golden_zone", 100.0, 90.0, 111.0),
+    )
+    monkeypatch.setattr(
+        "src.quick_scalp_loop.resolve_quick_indicator_guidance",
+        lambda candles: QuickIndicatorGuidance(55.0, 99.0, BreakoutDirection.BULLISH),
+    )
+    monkeypatch.setattr(
+        "src.quick_scalp_loop.resolve_quick_grid_permission",
+        lambda **kwargs: QuickGridPermission(True, "ok", 1, 0.2, 100.0),
+    )
+    monkeypatch.setattr(
+        "src.quick_scalp_loop.resolve_quick_fvg_guidance",
+        lambda *args, **kwargs: QuickFvgGuidance(None, 0.0, 0.0, 0, 100.0, "no_matching_fvg"),
+    )
+    monkeypatch.setattr("src.quick_scalp_loop.build_quick_trade_levels", lambda **kwargs: (99.0, 101.0))
+
+    run_quick_scalp_loop(
+        mt5_module=FakeMt5(),
+        executor=FakeExecutor(),
+        symbol="XAUUSD",
+        lot=0.01,
+        max_positions=1,
+        profit_target=0.2,
+        poll_seconds=1,
+        max_loops=1,
+        sleep_fn=lambda seconds: None,
+        log_fn=lambda message: events.append(message),
+    )
+
+    assert len(opened) == 1
+    assert opened[0]["direction"] is BreakoutDirection.BULLISH
+    assert any("guidance=full_guidance" in message and "fvg_bars_since=0" in message for message in events)
+
+
+def test_quick_loop_allows_structure_override_without_matching_fvg(monkeypatch):
+    from src.quick_scalp_loop import QuickFibonacciGuidance, QuickFvgGuidance, QuickGridPermission, QuickIndicatorGuidance, run_quick_scalp_loop
+    from src.strategy.breakout import BreakoutDirection
+
+    opened = []
+    events = []
+
+    class FakeMt5:
+        def symbol_info(self, symbol):
+            return SimpleNamespace(point=0.01)
+
+        def symbol_info_tick(self, symbol):
+            return SimpleNamespace(ask=100.18, bid=100.14)
+
+    class FakeExecutor:
+        mt5_module = FakeMt5()
+
+        def list_bot_positions(self, symbol, comment_prefix="strategy-live"):
+            return []
+
+        def open_strategy_trade(self, **kwargs):
+            opened.append(kwargs)
+            return SimpleNamespace(ticket=len(opened))
+
+    candles = [
+        SimpleNamespace(high=101.0, low=99.0, open=99.2, close=100.8)
+        for _ in range(30)
+    ]
+    monkeypatch.setattr("src.quick_scalp_loop.fetch_m1_candles", lambda mt5_module, symbol, count=30: candles)
+    monkeypatch.setattr("src.quick_scalp_loop.fetch_m15_candles", lambda mt5_module, symbol, count=50: candles)
+    monkeypatch.setattr("src.quick_scalp_loop.resolve_m1_direction", lambda candles: BreakoutDirection.BULLISH)
+    monkeypatch.setattr("src.quick_scalp_loop.fetch_recent_ticks", lambda mt5_module, symbol, count=60: bullish_ticks())
+    monkeypatch.setattr(
+        "src.quick_scalp_loop.resolve_quick_fibonacci_guidance",
+        lambda candles: QuickFibonacciGuidance(BreakoutDirection.BULLISH, "golden_zone", 100.0, 90.0, 111.0),
+    )
+    monkeypatch.setattr(
+        "src.quick_scalp_loop.resolve_quick_indicator_guidance",
+        lambda candles: QuickIndicatorGuidance(82.0, 101.0, BreakoutDirection.BEARISH),
+    )
+    monkeypatch.setattr(
+        "src.quick_scalp_loop.resolve_quick_grid_permission",
+        lambda **kwargs: QuickGridPermission(True, "ok", 1, 0.2, 100.0),
+    )
+    monkeypatch.setattr(
+        "src.quick_scalp_loop.resolve_quick_fvg_guidance",
+        lambda *args, **kwargs: QuickFvgGuidance(None, 0.0, 0.0, 0, 100.0, "no_matching_fvg"),
+    )
+    monkeypatch.setattr("src.quick_scalp_loop.build_quick_trade_levels", lambda **kwargs: (99.0, 101.0))
+
+    run_quick_scalp_loop(
+        mt5_module=FakeMt5(),
+        executor=FakeExecutor(),
+        symbol="XAUUSD",
+        lot=0.01,
+        max_positions=1,
+        profit_target=0.2,
+        poll_seconds=1,
+        max_loops=1,
+        sleep_fn=lambda seconds: None,
+        log_fn=lambda message: events.append(message),
+    )
+
+    assert len(opened) == 1
+    assert opened[0]["direction"] is BreakoutDirection.BULLISH
+    assert any("guidance=structure_override" in message and "fvg_bars_since=0" in message for message in events)
+
+
+def test_quick_loop_holds_mixed_guidance_without_matching_fvg(monkeypatch):
+    from src.quick_scalp_loop import QuickFibonacciGuidance, QuickFvgGuidance, QuickGridPermission, QuickIndicatorGuidance, run_quick_scalp_loop
+    from src.strategy.breakout import BreakoutDirection
+
+    opened = []
+    events = []
+
+    class FakeMt5:
+        def symbol_info(self, symbol):
+            return SimpleNamespace(point=0.01)
+
+        def symbol_info_tick(self, symbol):
+            return SimpleNamespace(ask=100.18, bid=100.14)
+
+    class FakeExecutor:
+        mt5_module = FakeMt5()
+
+        def list_bot_positions(self, symbol, comment_prefix="strategy-live"):
+            return []
+
+        def open_strategy_trade(self, **kwargs):
+            opened.append(kwargs)
+            return SimpleNamespace(ticket=len(opened))
+
+    candles = [
+        SimpleNamespace(high=101.0, low=99.0, open=99.2, close=100.8)
+        for _ in range(30)
+    ]
+    monkeypatch.setattr("src.quick_scalp_loop.fetch_m1_candles", lambda mt5_module, symbol, count=30: candles)
+    monkeypatch.setattr("src.quick_scalp_loop.fetch_m15_candles", lambda mt5_module, symbol, count=50: candles)
+    monkeypatch.setattr("src.quick_scalp_loop.resolve_m1_direction", lambda candles: BreakoutDirection.BULLISH)
+    monkeypatch.setattr("src.quick_scalp_loop.fetch_recent_ticks", lambda mt5_module, symbol, count=60: bullish_ticks())
+    monkeypatch.setattr(
+        "src.quick_scalp_loop.resolve_quick_fibonacci_guidance",
+        lambda candles: QuickFibonacciGuidance(BreakoutDirection.BULLISH, "golden_zone", 100.0, 90.0, 111.0),
+    )
+    monkeypatch.setattr(
+        "src.quick_scalp_loop.resolve_quick_indicator_guidance",
+        lambda candles: QuickIndicatorGuidance(55.0, 101.0, BreakoutDirection.BEARISH),
+    )
+    monkeypatch.setattr(
+        "src.quick_scalp_loop.resolve_quick_grid_permission",
+        lambda **kwargs: QuickGridPermission(True, "ok", 1, 0.2, 100.0),
+    )
+    monkeypatch.setattr(
+        "src.quick_scalp_loop.resolve_quick_fvg_guidance",
+        lambda *args, **kwargs: QuickFvgGuidance(None, 0.0, 0.0, 0, 100.0, "no_matching_fvg"),
+    )
+    monkeypatch.setattr("src.quick_scalp_loop.build_quick_trade_levels", lambda **kwargs: (99.0, 101.0))
+
+    run_quick_scalp_loop(
+        mt5_module=FakeMt5(),
+        executor=FakeExecutor(),
+        symbol="XAUUSD",
+        lot=0.01,
+        max_positions=1,
+        profit_target=0.2,
+        poll_seconds=1,
+        max_loops=1,
+        sleep_fn=lambda seconds: None,
+        log_fn=lambda message: events.append(message),
+    )
+
+    assert opened == []
+    assert any("reason=no_matching_fvg_mixed_guidance" in message for message in events)
 
 
 def test_quick_loop_holds_when_spread_is_too_wide_for_tick_scalp(monkeypatch):

@@ -170,6 +170,16 @@ class QuickGuidanceDecision:
     rsi_allows: bool
 
 
+@dataclass(frozen=True)
+class QuickEntryQualityGate:
+    allowed: bool
+    reason: str
+    body_ratio: float
+    max_fvg_bars: int
+    price_distance: float
+    max_price_distance: float
+
+
 def resolve_quick_fibonacci_guidance(candles) -> QuickFibonacciGuidance:
     if len(candles) < 2:
         return QuickFibonacciGuidance(None, "unavailable", 0.0, 0.0, 0.0)
@@ -422,6 +432,54 @@ def _latest_candle_has_tradeable_body(candles) -> bool:
     if candle_range <= 0:
         return False
     return abs(close_price - open_price) / candle_range >= 0.35
+
+
+def _latest_candle_body_ratio(candles) -> float:
+    if not candles:
+        return 0.0
+    latest = candles[-1]
+    high = float(getattr(latest, "high"))
+    low = float(getattr(latest, "low"))
+    open_price = float(getattr(latest, "open", getattr(latest, "close")))
+    close_price = float(getattr(latest, "close"))
+    candle_range = high - low
+    if candle_range <= 0:
+        return 0.0
+    return abs(close_price - open_price) / candle_range
+
+
+def resolve_quick_mixed_guidance_quality_gate(
+    *,
+    candles,
+    fvg_guidance: QuickFvgGuidance,
+    direction: BreakoutDirection,
+    current_price: float,
+    minimum_body_ratio: float = 0.50,
+    max_fvg_bars: int = 8,
+    max_price_distance_atr: float = 1.0,
+) -> QuickEntryQualityGate:
+    if int(fvg_guidance.bars_since) > int(max_fvg_bars):
+        return QuickEntryQualityGate(False, "mixed_guidance_stale_fvg", 0.0, max_fvg_bars, 0.0, 0.0)
+
+    body_ratio = _latest_candle_body_ratio(candles)
+    if body_ratio < float(minimum_body_ratio):
+        return QuickEntryQualityGate(False, "mixed_guidance_weak_body", body_ratio, max_fvg_bars, 0.0, 0.0)
+
+    atr = _calculate_average_true_range(candles[-14:]) if len(candles) >= 2 else 0.0
+    midpoint = (float(fvg_guidance.top) + float(fvg_guidance.bottom)) / 2.0
+    price_distance = abs(float(current_price) - midpoint)
+    max_price_distance = float(atr) * float(max_price_distance_atr)
+    if atr > 0.0 and price_distance > max_price_distance:
+        return QuickEntryQualityGate(
+            False,
+            "mixed_guidance_far_from_fvg",
+            body_ratio,
+            max_fvg_bars,
+            price_distance,
+            max_price_distance,
+        )
+
+    return QuickEntryQualityGate(True, "ok", body_ratio, max_fvg_bars, price_distance, max_price_distance)
 
 
 def _position_direction(position, mt5_module) -> BreakoutDirection | None:
@@ -718,25 +776,6 @@ def run_quick_scalp_loop(
                     break
                 sleep_fn(poll_seconds)
                 continue
-            if fvg_guidance is None or not fvg_guidance.allows(trade_direction):
-                log_hold_once(
-                    f"QUICK HOLD {symbol} reason=no_matching_fvg signal={direction.value} "
-                    f"m1_signal={getattr(m1_direction, 'value', 'NONE')} "
-                    f"direction={trade_direction.value} "
-                    f"fib_direction={getattr(fibonacci_guidance.direction, 'value', 'NONE')} "
-                    f"fib_zone={fibonacci_guidance.zone} "
-                    f"swing_low={fibonacci_guidance.swing_low:.2f} "
-                    f"swing_high={fibonacci_guidance.swing_high:.2f} "
-                    f"current_price={fibonacci_guidance.current_price:.2f}"
-                )
-                loop_count += 1
-                if reload_check_fn is not None and reload_check_fn():
-                    log_fn(f"CODE CHANGE DETECTED {symbol} reloading bot")
-                    return "reload_requested"
-                if max_loops is not None and loop_count >= max_loops:
-                    break
-                sleep_fn(poll_seconds)
-                continue
             guidance_decision = resolve_quick_guidance_decision(
                 direction=trade_direction,
                 fibonacci_guidance=fibonacci_guidance,
@@ -757,6 +796,54 @@ def run_quick_scalp_loop(
                     f"fvg_bars_since={fvg_guidance.bars_since}"
                 )
             else:
+                fvg_matches = fvg_guidance is not None and fvg_guidance.allows(trade_direction)
+                if not fvg_matches:
+                    if guidance_decision.reason == "mixed_guidance":
+                        log_hold_once(
+                            f"QUICK HOLD {symbol} reason=no_matching_fvg_mixed_guidance signal={direction.value} "
+                            f"m1_signal={getattr(m1_direction, 'value', 'NONE')} "
+                            f"direction={trade_direction.value} "
+                            f"fib_direction={getattr(fibonacci_guidance.direction, 'value', 'NONE')} "
+                            f"fib_zone={fibonacci_guidance.zone} "
+                            f"swing_low={fibonacci_guidance.swing_low:.2f} "
+                            f"swing_high={fibonacci_guidance.swing_high:.2f} "
+                            f"current_price={fibonacci_guidance.current_price:.2f}"
+                        )
+                        loop_count += 1
+                        if reload_check_fn is not None and reload_check_fn():
+                            log_fn(f"CODE CHANGE DETECTED {symbol} reloading bot")
+                            return "reload_requested"
+                        if max_loops is not None and loop_count >= max_loops:
+                            break
+                        sleep_fn(poll_seconds)
+                        continue
+                elif guidance_decision.reason == "mixed_guidance":
+                    quality_gate = resolve_quick_mixed_guidance_quality_gate(
+                        candles=candles,
+                        fvg_guidance=fvg_guidance,
+                        direction=trade_direction,
+                        current_price=_grid_current_price(trade_direction, current_tick) if current_tick is not None else fibonacci_guidance.current_price,
+                    )
+                    if not quality_gate.allowed:
+                        log_hold_once(
+                            f"QUICK HOLD {symbol} reason={quality_gate.reason} signal={direction.value} "
+                            f"m1_signal={getattr(m1_direction, 'value', 'NONE')} "
+                            f"direction={trade_direction.value} "
+                            f"fib_zone={fibonacci_guidance.zone} "
+                            f"fvg_top={fvg_guidance.top:.2f} fvg_bottom={fvg_guidance.bottom:.2f} "
+                            f"fvg_bars_since={fvg_guidance.bars_since} "
+                            f"body_ratio={quality_gate.body_ratio:.2f} "
+                            f"price_distance={quality_gate.price_distance:.2f} "
+                            f"max_price_distance={quality_gate.max_price_distance:.2f}"
+                        )
+                        loop_count += 1
+                        if reload_check_fn is not None and reload_check_fn():
+                            log_fn(f"CODE CHANGE DETECTED {symbol} reloading bot")
+                            return "reload_requested"
+                        if max_loops is not None and loop_count >= max_loops:
+                            break
+                        sleep_fn(poll_seconds)
+                        continue
                 spread_state = resolve_spread_state(mt5_module=mt5_module, symbol=symbol)
                 if not spread_state.allowed:
                     log_hold_once(
@@ -838,9 +925,9 @@ def run_quick_scalp_loop(
                         f"guidance={guidance_decision.reason} fib_zone={fibonacci_guidance.zone} "
                         f"swing_low={fibonacci_guidance.swing_low:.2f} "
                         f"swing_high={fibonacci_guidance.swing_high:.2f} "
-                        f"fvg_top={fvg_guidance.top:.2f} fvg_bottom={fvg_guidance.bottom:.2f} "
-                        f"fvg_direction={getattr(fvg_guidance.direction, 'value', 'NONE')} "
-                        f"fvg_bars_since={fvg_guidance.bars_since} "
+                        f"fvg_top={getattr(fvg_guidance, 'top', 0.0):.2f} fvg_bottom={getattr(fvg_guidance, 'bottom', 0.0):.2f} "
+                        f"fvg_direction={getattr(getattr(fvg_guidance, 'direction', None), 'value', 'NONE')} "
+                        f"fvg_bars_since={getattr(fvg_guidance, 'bars_since', 0)} "
                         f"rsi={indicator_guidance.rsi:.2f} "
                         f"sar={indicator_guidance.sar:.2f} spacing={grid_permission.min_spacing:.2f} "
                         f"lot={lot} positions={len(positions)}"
