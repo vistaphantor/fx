@@ -50,6 +50,8 @@ def validate_quick_settings(settings: Settings) -> None:
         raise ValueError("quick_max_positions must be greater than 0")
     if float(settings.quick_profit_target) < 0:
         raise ValueError("quick_profit_target must be 0 or greater")
+    if float(settings.quick_max_loss) < 0:
+        raise ValueError("quick_max_loss must be 0 or greater")
     if int(settings.quick_poll_seconds) <= 0:
         raise ValueError("quick_poll_seconds must be greater than 0")
     if float(settings.quick_min_free_margin) < 0:
@@ -71,6 +73,7 @@ def format_quick_startup_summary(settings: Settings, account_info=None) -> str:
         f"login={login} currency={currency} balance={balance} equity={equity} "
         f"symbol={settings.trading_symbol} lot={settings.quick_trade_lot} "
         f"max_positions={settings.quick_max_positions} profit_target={settings.quick_profit_target} "
+        f"max_loss={settings.quick_max_loss} "
         f"poll_seconds={settings.quick_poll_seconds} min_free_margin={settings.quick_min_free_margin}"
     )
 
@@ -111,6 +114,7 @@ def main() -> int:
                 lot=settings.quick_trade_lot,
                 max_positions=settings.quick_max_positions,
                 profit_target=settings.quick_profit_target,
+                max_loss=settings.quick_max_loss,
                 poll_seconds=settings.quick_poll_seconds,
                 min_free_margin=settings.quick_min_free_margin,
                 max_loops=settings.max_live_loops,

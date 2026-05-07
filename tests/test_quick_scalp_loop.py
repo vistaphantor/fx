@@ -3,6 +3,24 @@ from types import SimpleNamespace
 import pytest
 
 
+def bullish_ticks():
+    return [
+        SimpleNamespace(bid=100.00, ask=100.04),
+        SimpleNamespace(bid=100.04, ask=100.08),
+        SimpleNamespace(bid=100.08, ask=100.12),
+        SimpleNamespace(bid=100.14, ask=100.18),
+    ]
+
+
+def bearish_ticks():
+    return [
+        SimpleNamespace(bid=100.14, ask=100.18),
+        SimpleNamespace(bid=100.08, ask=100.12),
+        SimpleNamespace(bid=100.04, ask=100.08),
+        SimpleNamespace(bid=100.00, ask=100.04),
+    ]
+
+
 def test_resolve_m1_direction_uses_latest_closed_bullish_candle():
     from src.quick_scalp_loop import resolve_m1_direction
     from src.strategy.breakout import BreakoutDirection
@@ -27,17 +45,126 @@ def test_resolve_m1_direction_uses_latest_closed_bearish_candle():
     assert resolve_m1_direction(candles) is BreakoutDirection.BEARISH
 
 
+def test_resolve_tick_direction_follows_upward_ticks():
+    from src.quick_scalp_loop import resolve_tick_direction
+    from src.strategy.breakout import BreakoutDirection
+
+    ticks = [
+        SimpleNamespace(bid=100.00, ask=100.04),
+        SimpleNamespace(bid=100.02, ask=100.06),
+        SimpleNamespace(bid=100.05, ask=100.09),
+        SimpleNamespace(bid=100.09, ask=100.13),
+        SimpleNamespace(bid=100.14, ask=100.18),
+    ]
+
+    guidance = resolve_tick_direction(ticks, point=0.01)
+
+    assert guidance.direction is BreakoutDirection.BULLISH
+    assert guidance.reason == "tick_momentum"
+
+
+def test_resolve_tick_direction_follows_downward_ticks():
+    from src.quick_scalp_loop import resolve_tick_direction
+    from src.strategy.breakout import BreakoutDirection
+
+    ticks = [
+        SimpleNamespace(bid=100.14, ask=100.18),
+        SimpleNamespace(bid=100.09, ask=100.13),
+        SimpleNamespace(bid=100.05, ask=100.09),
+        SimpleNamespace(bid=100.02, ask=100.06),
+        SimpleNamespace(bid=100.00, ask=100.04),
+    ]
+
+    guidance = resolve_tick_direction(ticks, point=0.01)
+
+    assert guidance.direction is BreakoutDirection.BEARISH
+    assert guidance.reason == "tick_momentum"
+
+
+def test_fetch_recent_ticks_uses_mt5_copy_ticks_from_api():
+    from src.quick_scalp_loop import fetch_recent_ticks
+
+    calls = []
+    expected_ticks = [SimpleNamespace(bid=100.0, ask=100.1)]
+
+    class FakeMt5:
+        COPY_TICKS_ALL = 7
+
+        def copy_ticks_from(self, symbol, date_from, count, flags):
+            calls.append((symbol, count, flags))
+            return expected_ticks
+
+    ticks = fetch_recent_ticks(FakeMt5(), "XAUUSD", count=60)
+
+    assert ticks == expected_ticks
+    assert calls == [("XAUUSD", 60, 7)]
+
+
+def test_quick_loop_holds_when_tick_api_is_unavailable(monkeypatch):
+    from src.quick_scalp_loop import QuickFibonacciGuidance, QuickIndicatorGuidance, run_quick_scalp_loop
+    from src.strategy.breakout import BreakoutDirection
+
+    opened = []
+    events = []
+
+    class FakeMt5:
+        def symbol_info_tick(self, symbol):
+            return SimpleNamespace(ask=100.1, bid=99.9)
+
+    class FakeExecutor:
+        mt5_module = FakeMt5()
+
+        def list_bot_positions(self, symbol, comment_prefix="strategy-live"):
+            return []
+
+        def open_strategy_trade(self, **kwargs):
+            opened.append(kwargs)
+            return SimpleNamespace(ticket=len(opened))
+
+    monkeypatch.setattr("src.quick_scalp_loop.fetch_m1_candles", lambda mt5_module, symbol, count=30: [])
+    monkeypatch.setattr("src.quick_scalp_loop.fetch_m15_candles", lambda mt5_module, symbol, count=50: [])
+    monkeypatch.setattr("src.quick_scalp_loop.resolve_m1_direction", lambda candles: BreakoutDirection.BEARISH)
+    monkeypatch.setattr("src.quick_scalp_loop.fetch_recent_ticks", lambda mt5_module, symbol, count=60: None)
+    monkeypatch.setattr(
+        "src.quick_scalp_loop.resolve_quick_fibonacci_guidance",
+        lambda candles: QuickFibonacciGuidance(BreakoutDirection.BEARISH, "in_market_mover", 100.0, 90.0, 111.0),
+    )
+    monkeypatch.setattr(
+        "src.quick_scalp_loop.resolve_quick_indicator_guidance",
+        lambda candles: QuickIndicatorGuidance(55.0, 99.0, BreakoutDirection.BEARISH),
+    )
+
+    run_quick_scalp_loop(
+        mt5_module=FakeMt5(),
+        executor=FakeExecutor(),
+        symbol="XAUUSD",
+        lot=0.01,
+        max_positions=1,
+        profit_target=0.2,
+        poll_seconds=1,
+        max_loops=1,
+        sleep_fn=lambda seconds: None,
+        log_fn=lambda message: events.append(message),
+    )
+
+    assert opened == []
+    assert any("reason=tick_api_unavailable" in message for message in events)
+
+
 def test_quick_loop_closes_profitable_quick_positions_before_opening(monkeypatch):
     from src.quick_scalp_loop import QuickFibonacciGuidance, QuickGridPermission, QuickIndicatorGuidance, run_quick_scalp_loop
     from src.strategy.breakout import BreakoutDirection
 
     events = []
     positions = [
-        SimpleNamespace(ticket=1, symbol="XAUUSD", profit=0.21),
-        SimpleNamespace(ticket=2, symbol="XAUUSD", profit=0.19),
+        SimpleNamespace(ticket=1, symbol="XAUUSD", type=1, profit=0.21),
+        SimpleNamespace(ticket=2, symbol="XAUUSD", type=0, profit=0.19),
     ]
 
     class FakeMt5:
+        ORDER_TYPE_BUY = 0
+        ORDER_TYPE_SELL = 1
+
         def symbol_info_tick(self, symbol):
             return SimpleNamespace(ask=100.1, bid=99.9)
 
@@ -90,10 +217,310 @@ def test_quick_loop_closes_profitable_quick_positions_before_opening(monkeypatch
         log_fn=lambda message: events.append(("log", message)),
     )
 
-    assert ("close", 1, "quick-scalp-profit-exit") in events
+    assert ("close", 1, "quick-scalp-tick-turn-profit-exit") in events
     assert events[-2][0] == "open"
     assert events[-2][1]["direction"] is BreakoutDirection.BULLISH
     assert events[-2][1]["comment"] == "quick-scalp"
+
+
+def test_quick_loop_uses_m1_inverse_when_tick_direction_disagrees(monkeypatch):
+    from src.quick_scalp_loop import (
+        QuickFibonacciGuidance,
+        QuickFvgGuidance,
+        QuickGridPermission,
+        QuickIndicatorGuidance,
+        run_quick_scalp_loop,
+    )
+    from src.strategy.breakout import BreakoutDirection
+
+    opened = []
+
+    class FakeMt5:
+        def symbol_info(self, symbol):
+            return SimpleNamespace(point=0.01)
+
+        def symbol_info_tick(self, symbol):
+            return SimpleNamespace(ask=100.18, bid=100.14)
+
+    class FakeExecutor:
+        mt5_module = FakeMt5()
+
+        def list_bot_positions(self, symbol, comment_prefix="strategy-live"):
+            return []
+
+        def open_strategy_trade(self, **kwargs):
+            opened.append(kwargs)
+            return SimpleNamespace(ticket=len(opened))
+
+    candles = [
+        SimpleNamespace(high=101.0, low=99.0, open=100.6, close=99.4)
+        for _ in range(30)
+    ]
+    upward_ticks = [
+        SimpleNamespace(bid=100.00, ask=100.04),
+        SimpleNamespace(bid=100.04, ask=100.08),
+        SimpleNamespace(bid=100.08, ask=100.12),
+        SimpleNamespace(bid=100.14, ask=100.18),
+    ]
+    monkeypatch.setattr("src.quick_scalp_loop.fetch_m1_candles", lambda mt5_module, symbol, count=30: candles)
+    monkeypatch.setattr("src.quick_scalp_loop.fetch_m15_candles", lambda mt5_module, symbol, count=50: [])
+    monkeypatch.setattr("src.quick_scalp_loop.resolve_m1_direction", lambda candles: BreakoutDirection.BEARISH)
+    monkeypatch.setattr("src.quick_scalp_loop.fetch_recent_ticks", lambda mt5_module, symbol, count=60: upward_ticks)
+    monkeypatch.setattr(
+        "src.quick_scalp_loop.resolve_quick_fibonacci_guidance",
+        lambda candles: QuickFibonacciGuidance(BreakoutDirection.BULLISH, "golden_zone", 100.0, 90.0, 111.0),
+    )
+    monkeypatch.setattr(
+        "src.quick_scalp_loop.resolve_quick_indicator_guidance",
+        lambda candles: QuickIndicatorGuidance(55.0, 99.0, BreakoutDirection.BULLISH),
+    )
+    monkeypatch.setattr(
+        "src.quick_scalp_loop.resolve_quick_grid_permission",
+        lambda **kwargs: QuickGridPermission(True, "ok", 1, 0.2, 100.0),
+    )
+    monkeypatch.setattr(
+        "src.quick_scalp_loop.resolve_quick_fvg_guidance",
+        lambda *args, **kwargs: QuickFvgGuidance(BreakoutDirection.BEARISH, 101.0, 100.0, 2, 100.0, "matching_fvg"),
+    )
+    monkeypatch.setattr("src.quick_scalp_loop.build_quick_trade_levels", lambda **kwargs: (99.0, 101.0))
+
+    run_quick_scalp_loop(
+        mt5_module=FakeMt5(),
+        executor=FakeExecutor(),
+        symbol="XAUUSD",
+        lot=0.01,
+        max_positions=1,
+        profit_target=0.2,
+        poll_seconds=1,
+        max_loops=1,
+        sleep_fn=lambda seconds: None,
+        log_fn=lambda message: None,
+    )
+
+    assert len(opened) == 1
+    assert opened[0]["direction"] is BreakoutDirection.BEARISH
+
+
+def test_quick_loop_opens_when_tick_direction_agrees_with_m1(monkeypatch):
+    from src.quick_scalp_loop import (
+        QuickFibonacciGuidance,
+        QuickFvgGuidance,
+        QuickGridPermission,
+        QuickIndicatorGuidance,
+        run_quick_scalp_loop,
+    )
+    from src.strategy.breakout import BreakoutDirection
+
+    opened = []
+
+    class FakeMt5:
+        def symbol_info(self, symbol):
+            return SimpleNamespace(point=0.01)
+
+        def symbol_info_tick(self, symbol):
+            return SimpleNamespace(ask=100.18, bid=100.14)
+
+    class FakeExecutor:
+        mt5_module = FakeMt5()
+
+        def list_bot_positions(self, symbol, comment_prefix="strategy-live"):
+            return []
+
+        def open_strategy_trade(self, **kwargs):
+            opened.append(kwargs)
+            return SimpleNamespace(ticket=len(opened))
+
+    candles = [
+        SimpleNamespace(high=101.0, low=99.0, open=99.4, close=100.6)
+        for _ in range(30)
+    ]
+    monkeypatch.setattr("src.quick_scalp_loop.fetch_m1_candles", lambda mt5_module, symbol, count=30: candles)
+    monkeypatch.setattr("src.quick_scalp_loop.fetch_m15_candles", lambda mt5_module, symbol, count=50: [])
+    monkeypatch.setattr("src.quick_scalp_loop.resolve_m1_direction", lambda candles: BreakoutDirection.BULLISH)
+    monkeypatch.setattr("src.quick_scalp_loop.fetch_recent_ticks", lambda mt5_module, symbol, count=60: bullish_ticks())
+    monkeypatch.setattr(
+        "src.quick_scalp_loop.resolve_quick_fibonacci_guidance",
+        lambda candles: QuickFibonacciGuidance(BreakoutDirection.BULLISH, "golden_zone", 100.0, 90.0, 111.0),
+    )
+    monkeypatch.setattr(
+        "src.quick_scalp_loop.resolve_quick_indicator_guidance",
+        lambda candles: QuickIndicatorGuidance(55.0, 99.0, BreakoutDirection.BULLISH),
+    )
+    monkeypatch.setattr(
+        "src.quick_scalp_loop.resolve_quick_grid_permission",
+        lambda **kwargs: QuickGridPermission(True, "ok", 1, 0.2, 100.0),
+    )
+    monkeypatch.setattr(
+        "src.quick_scalp_loop.resolve_quick_fvg_guidance",
+        lambda *args, **kwargs: QuickFvgGuidance(BreakoutDirection.BULLISH, 99.0, 98.0, 2, 100.0, "matching_fvg"),
+    )
+    monkeypatch.setattr("src.quick_scalp_loop.build_quick_trade_levels", lambda **kwargs: (99.0, 101.0))
+
+    run_quick_scalp_loop(
+        mt5_module=FakeMt5(),
+        executor=FakeExecutor(),
+        symbol="XAUUSD",
+        lot=0.01,
+        max_positions=1,
+        profit_target=0.2,
+        poll_seconds=1,
+        max_loops=1,
+        sleep_fn=lambda seconds: None,
+        log_fn=lambda message: None,
+    )
+
+    assert len(opened) == 1
+    assert opened[0]["direction"] is BreakoutDirection.BULLISH
+
+
+def test_resolve_quick_fvg_guidance_finds_nearest_matching_bullish_imbalance():
+    from src.quick_scalp_loop import resolve_quick_fvg_guidance
+    from src.strategy.breakout import BreakoutDirection
+
+    candles = [
+        SimpleNamespace(high=100.0, low=98.0, open=99.0, close=99.5, timestamp=1),
+        SimpleNamespace(high=103.0, low=99.5, open=100.0, close=102.5, timestamp=2),
+        SimpleNamespace(high=105.0, low=101.0, open=102.5, close=104.0, timestamp=3),
+    ]
+
+    guidance = resolve_quick_fvg_guidance(
+        candles,
+        direction=BreakoutDirection.BULLISH,
+        current_price=104.0,
+    )
+
+    assert guidance.allows(BreakoutDirection.BULLISH) is True
+    assert guidance.bottom == 100.0
+    assert guidance.top == 101.0
+    assert guidance.bars_since == 1
+
+
+def test_quick_loop_holds_when_selected_direction_has_no_matching_fvg(monkeypatch):
+    from src.quick_scalp_loop import QuickFibonacciGuidance, QuickGridPermission, QuickIndicatorGuidance, run_quick_scalp_loop
+    from src.strategy.breakout import BreakoutDirection
+
+    opened = []
+    events = []
+
+    class FakeMt5:
+        def symbol_info(self, symbol):
+            return SimpleNamespace(point=0.01)
+
+        def symbol_info_tick(self, symbol):
+            return SimpleNamespace(ask=100.18, bid=100.14)
+
+    class FakeExecutor:
+        mt5_module = FakeMt5()
+
+        def list_bot_positions(self, symbol, comment_prefix="strategy-live"):
+            return []
+
+        def open_strategy_trade(self, **kwargs):
+            opened.append(kwargs)
+            return SimpleNamespace(ticket=len(opened))
+
+    candles = [
+        SimpleNamespace(high=101.0, low=99.0, open=99.4, close=100.6)
+        for _ in range(30)
+    ]
+    m15_candles = [
+        SimpleNamespace(high=100.0, low=98.0, open=99.0, close=99.5, timestamp=1),
+        SimpleNamespace(high=103.0, low=99.5, open=100.0, close=102.5, timestamp=2),
+        SimpleNamespace(high=105.0, low=101.0, open=102.5, close=104.0, timestamp=3),
+    ]
+    monkeypatch.setattr("src.quick_scalp_loop.fetch_m1_candles", lambda mt5_module, symbol, count=30: candles)
+    monkeypatch.setattr("src.quick_scalp_loop.fetch_m15_candles", lambda mt5_module, symbol, count=50: m15_candles)
+    monkeypatch.setattr("src.quick_scalp_loop.resolve_m1_direction", lambda candles: BreakoutDirection.BEARISH)
+    monkeypatch.setattr("src.quick_scalp_loop.fetch_recent_ticks", lambda mt5_module, symbol, count=60: bearish_ticks())
+    monkeypatch.setattr(
+        "src.quick_scalp_loop.resolve_quick_fibonacci_guidance",
+        lambda candles: QuickFibonacciGuidance(BreakoutDirection.BEARISH, "in_market_mover", 104.0, 98.0, 105.0),
+    )
+    monkeypatch.setattr(
+        "src.quick_scalp_loop.resolve_quick_indicator_guidance",
+        lambda candles: QuickIndicatorGuidance(55.0, 105.0, BreakoutDirection.BEARISH),
+    )
+    monkeypatch.setattr(
+        "src.quick_scalp_loop.resolve_quick_grid_permission",
+        lambda **kwargs: QuickGridPermission(True, "ok", 1, 0.2, 100.0),
+    )
+
+    run_quick_scalp_loop(
+        mt5_module=FakeMt5(),
+        executor=FakeExecutor(),
+        symbol="XAUUSD",
+        lot=0.01,
+        max_positions=1,
+        profit_target=0.2,
+        poll_seconds=1,
+        max_loops=1,
+        sleep_fn=lambda seconds: None,
+        log_fn=lambda message: events.append(message),
+    )
+
+    assert opened == []
+    assert any("reason=no_matching_fvg" in message for message in events)
+    assert any("swing_low=98.00" in message and "swing_high=105.00" in message for message in events)
+
+
+def test_quick_loop_holds_when_spread_is_too_wide_for_tick_scalp(monkeypatch):
+    from src.quick_scalp_loop import QuickFibonacciGuidance, QuickIndicatorGuidance, run_quick_scalp_loop
+    from src.strategy.breakout import BreakoutDirection
+
+    opened = []
+    events = []
+
+    class FakeMt5:
+        def symbol_info(self, symbol):
+            return SimpleNamespace(point=0.01)
+
+        def symbol_info_tick(self, symbol):
+            return SimpleNamespace(ask=100.50, bid=100.00)
+
+    class FakeExecutor:
+        mt5_module = FakeMt5()
+
+        def list_bot_positions(self, symbol, comment_prefix="strategy-live"):
+            return []
+
+        def open_strategy_trade(self, **kwargs):
+            opened.append(kwargs)
+            return SimpleNamespace(ticket=len(opened))
+
+    ticks = [
+        SimpleNamespace(bid=100.00, ask=100.50),
+        SimpleNamespace(bid=100.04, ask=100.54),
+        SimpleNamespace(bid=100.08, ask=100.58),
+        SimpleNamespace(bid=100.12, ask=100.62),
+    ]
+    monkeypatch.setattr("src.quick_scalp_loop.fetch_m1_candles", lambda mt5_module, symbol, count=30: [])
+    monkeypatch.setattr("src.quick_scalp_loop.fetch_m15_candles", lambda mt5_module, symbol, count=50: [])
+    monkeypatch.setattr("src.quick_scalp_loop.resolve_m1_direction", lambda candles: BreakoutDirection.BULLISH)
+    monkeypatch.setattr("src.quick_scalp_loop.fetch_recent_ticks", lambda mt5_module, symbol, count=60: ticks)
+    monkeypatch.setattr(
+        "src.quick_scalp_loop.resolve_quick_fibonacci_guidance",
+        lambda candles: QuickFibonacciGuidance(BreakoutDirection.BULLISH, "golden_zone", 100.0, 90.0, 111.0),
+    )
+    monkeypatch.setattr(
+        "src.quick_scalp_loop.resolve_quick_indicator_guidance",
+        lambda candles: QuickIndicatorGuidance(55.0, 99.0, BreakoutDirection.BULLISH),
+    )
+
+    run_quick_scalp_loop(
+        mt5_module=FakeMt5(),
+        executor=FakeExecutor(),
+        symbol="XAUUSD",
+        lot=0.01,
+        max_positions=1,
+        profit_target=0.2,
+        poll_seconds=1,
+        max_loops=1,
+        sleep_fn=lambda seconds: None,
+        log_fn=lambda message: events.append(message),
+    )
+
+    assert opened == []
+    assert any("reason=spread_too_wide" in message for message in events)
 
 
 def test_quick_loop_closes_only_when_profit_is_greater_than_target(monkeypatch):
@@ -170,7 +597,8 @@ def test_close_profitable_quick_positions_logs_best_profit_when_nothing_closes()
     assert closed == 0
     assert events == [
         "QUICK PROFIT WAIT XAUUSD positions=2 positive=2 negative=0 flat=0 "
-        "net_profit=0.39 best_ticket=2 best_profit=0.20 worst_ticket=1 worst_profit=0.19 target=0.20"
+        "net_profit=0.39 best_ticket=2 best_profit=0.20 worst_ticket=1 worst_profit=0.19 "
+        "target=0.20 tick_direction=NONE"
     ]
 
 
@@ -200,8 +628,130 @@ def test_close_profitable_quick_positions_logs_positive_and_negative_basket_cont
     assert closed == 0
     assert events == [
         "QUICK PROFIT WAIT XAUUSD positions=3 positive=1 negative=1 flat=1 "
-        "net_profit=-1.05 best_ticket=2 best_profit=0.20 worst_ticket=1 worst_profit=-1.25 target=0.20"
+        "net_profit=-1.05 best_ticket=2 best_profit=0.20 worst_ticket=1 worst_profit=-1.25 "
+        "target=0.20 tick_direction=NONE"
     ]
+
+
+def test_close_profitable_quick_positions_holds_target_profit_when_ticks_still_favor_trade():
+    from src.quick_scalp_loop import close_profitable_quick_positions
+    from src.strategy.breakout import BreakoutDirection
+
+    events = []
+
+    class FakeMt5:
+        ORDER_TYPE_BUY = 0
+        ORDER_TYPE_SELL = 1
+
+    class FakeExecutor:
+        mt5_module = FakeMt5()
+
+        def list_bot_positions(self, symbol, comment_prefix="strategy-live"):
+            return [SimpleNamespace(ticket=1, type=0, profit=1.25)]
+
+        def close_position(self, position, comment):
+            raise AssertionError("profitable buy should keep running while ticks stay bullish")
+
+    closed = close_profitable_quick_positions(
+        executor=FakeExecutor(),
+        symbol="XAUUSD",
+        profit_target=0.2,
+        tick_direction=BreakoutDirection.BULLISH,
+        log_fn=lambda message: events.append(message),
+    )
+
+    assert closed == 0
+    assert "target=0.20" in events[0]
+    assert "tick_direction=BULLISH" in events[0]
+
+
+def test_close_profitable_quick_positions_locks_profit_when_ticks_turn_against_trade():
+    from src.quick_scalp_loop import close_profitable_quick_positions
+    from src.strategy.breakout import BreakoutDirection
+
+    events = []
+    positions = [SimpleNamespace(ticket=1, type=0, profit=0.05)]
+
+    class FakeMt5:
+        ORDER_TYPE_BUY = 0
+        ORDER_TYPE_SELL = 1
+
+    class FakeExecutor:
+        mt5_module = FakeMt5()
+
+        def list_bot_positions(self, symbol, comment_prefix="strategy-live"):
+            return list(positions)
+
+        def close_position(self, position, comment):
+            events.append(("close", position.ticket, comment))
+            positions.remove(position)
+
+    closed = close_profitable_quick_positions(
+        executor=FakeExecutor(),
+        symbol="XAUUSD",
+        profit_target=0.2,
+        tick_direction=BreakoutDirection.BEARISH,
+        log_fn=lambda message: events.append(("log", message)),
+    )
+
+    assert closed == 1
+    assert ("close", 1, "quick-scalp-tick-turn-profit-exit") in events
+    assert any("reason=tick_turn" in event[1] for event in events if event[0] == "log")
+
+
+def test_close_profitable_quick_positions_closes_loser_at_max_loss():
+    from src.quick_scalp_loop import close_profitable_quick_positions
+
+    events = []
+    positions = [
+        SimpleNamespace(ticket=1, profit=-19.99),
+        SimpleNamespace(ticket=2, profit=-20.00),
+    ]
+
+    class FakeExecutor:
+        def list_bot_positions(self, symbol, comment_prefix="strategy-live"):
+            return list(positions)
+
+        def close_position(self, position, comment):
+            events.append(("close", position.ticket, comment))
+            positions.remove(position)
+
+    closed = close_profitable_quick_positions(
+        executor=FakeExecutor(),
+        symbol="XAUUSD",
+        profit_target=0.2,
+        max_loss=20.0,
+        log_fn=lambda message: events.append(("log", message)),
+    )
+
+    assert closed == 1
+    assert ("close", 2, "quick-scalp-loss-exit") in events
+    assert all(event != ("close", 1, "quick-scalp-loss-exit") for event in events)
+    assert any("reason=max_loss" in event[1] for event in events if event[0] == "log")
+
+
+def test_close_profitable_quick_positions_does_not_close_loser_when_max_loss_disabled():
+    from src.quick_scalp_loop import close_profitable_quick_positions
+
+    events = []
+
+    class FakeExecutor:
+        def list_bot_positions(self, symbol, comment_prefix="strategy-live"):
+            return [SimpleNamespace(ticket=1, profit=-36.16)]
+
+        def close_position(self, position, comment):
+            raise AssertionError("max_loss=0 should leave the broker stop-loss in control")
+
+    closed = close_profitable_quick_positions(
+        executor=FakeExecutor(),
+        symbol="XAUUSD",
+        profit_target=0.2,
+        max_loss=0.0,
+        log_fn=lambda message: events.append(message),
+    )
+
+    assert closed == 0
+    assert any("worst_profit=-36.16" in message for message in events)
 
 
 def test_quick_loop_keeps_monitoring_when_profitable_close_is_rejected(monkeypatch):
@@ -831,6 +1381,62 @@ def test_resolve_quick_grid_permission_sets_zone_entry_caps():
     assert golden.max_new_entries == 3
     assert market_mover.allowed is True
     assert market_mover.max_new_entries == 1
+
+
+def test_build_quick_trade_levels_uses_one_to_three_rr_with_spread_padded_take_profit():
+    from src.quick_scalp_loop import build_quick_trade_levels
+    from src.strategy.breakout import BreakoutDirection
+
+    class FakeMt5:
+        def symbol_info(self, symbol):
+            return SimpleNamespace(point=0.01)
+
+        def symbol_info_tick(self, symbol):
+            return SimpleNamespace(ask=100.05, bid=100.00)
+
+    buy_sl, buy_tp = build_quick_trade_levels(
+        mt5_module=FakeMt5(),
+        symbol="XAUUSD",
+        direction=BreakoutDirection.BULLISH,
+    )
+    sell_sl, sell_tp = build_quick_trade_levels(
+        mt5_module=FakeMt5(),
+        symbol="XAUUSD",
+        direction=BreakoutDirection.BEARISH,
+    )
+
+    assert buy_sl == pytest.approx(96.05)
+    assert buy_tp == pytest.approx(112.10)
+    assert sell_sl == pytest.approx(104.00)
+    assert sell_tp == pytest.approx(87.95)
+
+
+def test_build_quick_trade_levels_respects_broker_minimum_stop_distance():
+    from src.quick_scalp_loop import build_quick_trade_levels
+    from src.strategy.breakout import BreakoutDirection
+
+    class FakeMt5:
+        def symbol_info(self, symbol):
+            return SimpleNamespace(point=0.01, trade_stops_level=60)
+
+        def symbol_info_tick(self, symbol):
+            return SimpleNamespace(ask=100.05, bid=100.00)
+
+    buy_sl, buy_tp = build_quick_trade_levels(
+        mt5_module=FakeMt5(),
+        symbol="XAUUSD",
+        direction=BreakoutDirection.BULLISH,
+    )
+    sell_sl, sell_tp = build_quick_trade_levels(
+        mt5_module=FakeMt5(),
+        symbol="XAUUSD",
+        direction=BreakoutDirection.BEARISH,
+    )
+
+    assert buy_sl == pytest.approx(96.05)
+    assert buy_tp == pytest.approx(112.10)
+    assert sell_sl == pytest.approx(104.00)
+    assert sell_tp == pytest.approx(87.95)
 
 
 def test_quick_loop_limits_new_entries_by_grid_permission(monkeypatch):

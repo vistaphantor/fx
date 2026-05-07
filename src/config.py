@@ -65,6 +65,7 @@ class Settings:
     quick_trade_lot: float = 0.01
     quick_max_positions: int = 100
     quick_profit_target: float = 0.2
+    quick_max_loss: float = 0.0
     quick_poll_seconds: int = 1
     quick_min_free_margin: float = 0.0
 
@@ -173,6 +174,7 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
         quick_trade_lot = float(str(values.get("QUICK_TRADE_LOT", default_trade_lot)).strip())
         quick_max_positions = int(str(values.get("QUICK_MAX_POSITIONS", "100")).strip())
         quick_profit_target = float(str(values.get("QUICK_PROFIT_TARGET", "0.2")).strip())
+        quick_max_loss = float(str(values.get("QUICK_MAX_LOSS", "0.0")).strip())
         quick_poll_seconds = int(str(values.get("QUICK_POLL_SECONDS", "1")).strip())
         quick_min_free_margin = float(str(values.get("QUICK_MIN_FREE_MARGIN", "0.0")).strip())
         strategy_profiles = _load_strategy_profiles(values)
@@ -205,6 +207,8 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
         raise ValueError("QUICK_MAX_POSITIONS must be greater than 0")
     if quick_profit_target < 0:
         raise ValueError("QUICK_PROFIT_TARGET must be 0 or greater")
+    if quick_max_loss < 0:
+        raise ValueError("QUICK_MAX_LOSS must be 0 or greater")
     if quick_poll_seconds <= 0:
         raise ValueError("QUICK_POLL_SECONDS must be greater than 0")
     if quick_min_free_margin < 0:
@@ -276,6 +280,7 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
         quick_trade_lot=quick_trade_lot,
         quick_max_positions=quick_max_positions,
         quick_profit_target=quick_profit_target,
+        quick_max_loss=quick_max_loss,
         quick_poll_seconds=quick_poll_seconds,
         quick_min_free_margin=quick_min_free_margin,
     )

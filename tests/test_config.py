@@ -91,6 +91,7 @@ def test_load_settings_reads_quick_scalp_defaults(tmp_path):
     assert settings.quick_trade_lot == pytest.approx(0.03)
     assert settings.quick_max_positions == 100
     assert settings.quick_profit_target == pytest.approx(0.2)
+    assert settings.quick_max_loss == pytest.approx(0.0)
     assert settings.quick_poll_seconds == 1
     assert settings.quick_min_free_margin == pytest.approx(0.0)
 
@@ -110,6 +111,7 @@ def test_load_settings_reads_quick_scalp_overrides(tmp_path):
                 "QUICK_TRADE_LOT=0.02",
                 "QUICK_MAX_POSITIONS=75",
                 "QUICK_PROFIT_TARGET=0.15",
+                "QUICK_MAX_LOSS=12.5",
                 "QUICK_POLL_SECONDS=2",
                 "QUICK_MIN_FREE_MARGIN=5.0",
             ]
@@ -123,6 +125,7 @@ def test_load_settings_reads_quick_scalp_overrides(tmp_path):
     assert settings.quick_trade_lot == pytest.approx(0.02)
     assert settings.quick_max_positions == 75
     assert settings.quick_profit_target == pytest.approx(0.15)
+    assert settings.quick_max_loss == pytest.approx(12.5)
     assert settings.quick_poll_seconds == 2
     assert settings.quick_min_free_margin == pytest.approx(5.0)
 

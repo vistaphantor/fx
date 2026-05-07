@@ -73,6 +73,7 @@ def test_format_quick_startup_summary_includes_operating_values():
         quick_trade_lot=0.02,
         quick_max_positions=100,
         quick_profit_target=0.2,
+        quick_max_loss=0.0,
         quick_poll_seconds=1,
         quick_min_free_margin=20.0,
     )
@@ -86,6 +87,7 @@ def test_format_quick_startup_summary_includes_operating_values():
     assert "lot=0.02" in summary
     assert "max_positions=100" in summary
     assert "profit_target=0.2" in summary
+    assert "max_loss=0.0" in summary
     assert "poll_seconds=1" in summary
     assert "min_free_margin=20.0" in summary
 
@@ -129,6 +131,7 @@ def test_quick_main_runs_quick_loop_with_forced_enabled_settings(monkeypatch):
     loop_event = [event for event in events if event[0] == "quick_loop"][0]
     assert loop_event[1]["lot"] == 0.02
     assert loop_event[1]["max_positions"] == 7
+    assert loop_event[1]["max_loss"] == settings.quick_max_loss
     assert loop_event[1]["symbol"] == "XAUUSD"
     assert loop_event[1]["reload_check_fn"]() is False
     assert events[-1] == ("shutdown",)
