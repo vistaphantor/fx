@@ -192,11 +192,11 @@ def test_quick_loop_closes_profitable_quick_positions_before_opening(monkeypatch
     monkeypatch.setattr("src.quick_scalp_loop.resolve_m1_direction", lambda candles: BreakoutDirection.BULLISH)
     monkeypatch.setattr(
         "src.quick_scalp_loop.resolve_quick_fibonacci_guidance",
-        lambda candles: QuickFibonacciGuidance(BreakoutDirection.BULLISH, "golden_zone", 100.0, 90.0, 111.0),
+        lambda candles: QuickFibonacciGuidance(BreakoutDirection.BEARISH, "golden_zone", 100.0, 90.0, 111.0),
     )
     monkeypatch.setattr(
         "src.quick_scalp_loop.resolve_quick_indicator_guidance",
-        lambda candles: QuickIndicatorGuidance(55.0, 99.0, BreakoutDirection.BULLISH),
+        lambda candles: QuickIndicatorGuidance(55.0, 101.0, BreakoutDirection.BEARISH),
     )
     monkeypatch.setattr(
         "src.quick_scalp_loop.resolve_quick_grid_permission",
@@ -268,11 +268,11 @@ def test_quick_loop_uses_m1_inverse_when_tick_direction_disagrees(monkeypatch):
     monkeypatch.setattr("src.quick_scalp_loop.fetch_recent_ticks", lambda mt5_module, symbol, count=60: upward_ticks)
     monkeypatch.setattr(
         "src.quick_scalp_loop.resolve_quick_fibonacci_guidance",
-        lambda candles: QuickFibonacciGuidance(BreakoutDirection.BULLISH, "golden_zone", 100.0, 90.0, 111.0),
+        lambda candles: QuickFibonacciGuidance(BreakoutDirection.BEARISH, "golden_zone", 100.0, 90.0, 111.0),
     )
     monkeypatch.setattr(
         "src.quick_scalp_loop.resolve_quick_indicator_guidance",
-        lambda candles: QuickIndicatorGuidance(55.0, 99.0, BreakoutDirection.BULLISH),
+        lambda candles: QuickIndicatorGuidance(55.0, 101.0, BreakoutDirection.BEARISH),
     )
     monkeypatch.setattr(
         "src.quick_scalp_loop.resolve_quick_grid_permission",
@@ -695,7 +695,8 @@ def test_close_profitable_quick_positions_locks_profit_when_ticks_turn_against_t
     )
 
     assert closed == 1
-    assert ("close", 1, "quick-scalp-tick-turn-profit-exit") in events
+    assert ("close", 1, "quick-scalp-tick-exit") in events
+    assert all(len(event[2]) <= 31 for event in events if event[0] == "close")
     assert any("reason=tick_turn" in event[1] for event in events if event[0] == "log")
 
 
@@ -950,7 +951,13 @@ def test_resolve_quick_fibonacci_guidance_allows_bearish_market_mover():
 
 
 def test_quick_loop_allows_reduced_grid_when_signal_conflicts_with_guidance(monkeypatch):
-    from src.quick_scalp_loop import QuickFibonacciGuidance, QuickIndicatorGuidance, run_quick_scalp_loop
+    from src.quick_scalp_loop import (
+        QuickFibonacciGuidance,
+        QuickFvgGuidance,
+        QuickIndicatorGuidance,
+        QuickTickGuidance,
+        run_quick_scalp_loop,
+    )
     from src.strategy.breakout import BreakoutDirection
 
     opened = []
@@ -982,9 +989,17 @@ def test_quick_loop_allows_reduced_grid_when_signal_conflicts_with_guidance(monk
         for _ in range(30)
     ]
     monkeypatch.setattr("src.quick_scalp_loop.fetch_m1_candles", lambda mt5_module, symbol, count=30: candles)
-    monkeypatch.setattr("src.quick_scalp_loop.fetch_m15_candles", lambda mt5_module, symbol, count=50: [])
+    monkeypatch.setattr("src.quick_scalp_loop.fetch_m15_candles", lambda mt5_module, symbol, count=50: candles)
     monkeypatch.setattr("src.quick_scalp_loop.resolve_m1_direction", lambda candles: BreakoutDirection.BULLISH)
+    monkeypatch.setattr(
+        "src.quick_scalp_loop.resolve_tick_direction",
+        lambda ticks, point=0.0: QuickTickGuidance(BreakoutDirection.BEARISH, "tick_momentum", 60, -1.2, 20, 40),
+    )
     monkeypatch.setattr("src.quick_scalp_loop.resolve_quick_fibonacci_guidance", lambda candles: guidance)
+    monkeypatch.setattr(
+        "src.quick_scalp_loop.resolve_quick_fvg_guidance",
+        lambda candles, direction, current_price: QuickFvgGuidance(direction, 97.0, 95.0, 3, current_price, "matching_fvg"),
+    )
     monkeypatch.setattr(
         "src.quick_scalp_loop.resolve_quick_indicator_guidance",
         lambda candles: QuickIndicatorGuidance(55.0, 101.0, BreakoutDirection.BEARISH),
@@ -1004,9 +1019,8 @@ def test_quick_loop_allows_reduced_grid_when_signal_conflicts_with_guidance(monk
         log_fn=lambda message: events.append(message),
     )
 
-    assert len(opened) == 1
-    assert opened[0]["direction"] is BreakoutDirection.BULLISH
-    assert any("guidance=signal_override" in message for message in events)
+    assert opened == []
+    assert any("reason=signal_override" in message for message in events)
 
 
 def test_quick_loop_logs_repeated_same_hold_state_once(monkeypatch):
@@ -1213,6 +1227,43 @@ def test_resolve_quick_indicator_guidance_blocks_buy_when_rsi_is_overbought():
     assert guidance.allows(BreakoutDirection.BULLISH) is False
 
 
+def test_quick_guidance_allows_moderate_overbought_rsi_when_structure_agrees():
+    from src.quick_scalp_loop import (
+        QuickFibonacciGuidance,
+        QuickIndicatorGuidance,
+        resolve_quick_guidance_decision,
+    )
+    from src.strategy.breakout import BreakoutDirection
+
+    decision = resolve_quick_guidance_decision(
+        direction=BreakoutDirection.BULLISH,
+        fibonacci_guidance=QuickFibonacciGuidance(BreakoutDirection.BULLISH, "golden_zone", 100.0, 90.0, 110.0),
+        indicator_guidance=QuickIndicatorGuidance(rsi=82.0, sar=99.0, sar_direction=BreakoutDirection.BEARISH),
+    )
+
+    assert decision.allowed is True
+    assert decision.reason == "structure_override"
+    assert decision.rsi_allows is False
+
+
+def test_quick_guidance_blocks_extreme_rsi_exhaustion():
+    from src.quick_scalp_loop import (
+        QuickFibonacciGuidance,
+        QuickIndicatorGuidance,
+        resolve_quick_guidance_decision,
+    )
+    from src.strategy.breakout import BreakoutDirection
+
+    decision = resolve_quick_guidance_decision(
+        direction=BreakoutDirection.BULLISH,
+        fibonacci_guidance=QuickFibonacciGuidance(BreakoutDirection.BULLISH, "golden_zone", 100.0, 90.0, 110.0),
+        indicator_guidance=QuickIndicatorGuidance(rsi=88.0, sar=99.0, sar_direction=BreakoutDirection.BULLISH),
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "indicator_filter"
+
+
 def test_resolve_quick_indicator_guidance_flips_sar_bearish_after_reversal():
     from src.quick_scalp_loop import resolve_quick_indicator_guidance
     from src.strategy.breakout import BreakoutDirection
@@ -1251,14 +1302,24 @@ def test_resolve_quick_indicator_guidance_flips_sar_bearish_after_reversal():
 
 
 def test_quick_loop_holds_when_m1_indicator_guidance_blocks_signal(monkeypatch):
-    from src.quick_scalp_loop import QuickFibonacciGuidance, QuickIndicatorGuidance, run_quick_scalp_loop
+    from src.quick_scalp_loop import (
+        QuickFibonacciGuidance,
+        QuickFvgGuidance,
+        QuickIndicatorGuidance,
+        QuickTickGuidance,
+        run_quick_scalp_loop,
+    )
     from src.strategy.breakout import BreakoutDirection
 
     opened = []
     events = []
 
+    class FakeMt5:
+        def symbol_info_tick(self, symbol):
+            return SimpleNamespace(ask=100.1, bid=99.9)
+
     class FakeExecutor:
-        mt5_module = SimpleNamespace()
+        mt5_module = FakeMt5()
 
         def list_bot_positions(self, symbol, comment_prefix="strategy-live"):
             return []
@@ -1267,20 +1328,32 @@ def test_quick_loop_holds_when_m1_indicator_guidance_blocks_signal(monkeypatch):
             opened.append(kwargs)
             return SimpleNamespace(ticket=len(opened))
 
-    monkeypatch.setattr("src.quick_scalp_loop.fetch_m1_candles", lambda mt5_module, symbol, count=30: [])
-    monkeypatch.setattr("src.quick_scalp_loop.fetch_m15_candles", lambda mt5_module, symbol, count=50: [])
+    candles = [
+        SimpleNamespace(high=101.0, low=99.0, open=99.4, close=100.6)
+        for _ in range(30)
+    ]
+    monkeypatch.setattr("src.quick_scalp_loop.fetch_m1_candles", lambda mt5_module, symbol, count=30: candles)
+    monkeypatch.setattr("src.quick_scalp_loop.fetch_m15_candles", lambda mt5_module, symbol, count=50: candles)
     monkeypatch.setattr("src.quick_scalp_loop.resolve_m1_direction", lambda candles: BreakoutDirection.BULLISH)
+    monkeypatch.setattr(
+        "src.quick_scalp_loop.resolve_tick_direction",
+        lambda ticks, point=0.0: QuickTickGuidance(BreakoutDirection.BULLISH, "tick_momentum", 60, 1.2, 40, 20),
+    )
     monkeypatch.setattr(
         "src.quick_scalp_loop.resolve_quick_fibonacci_guidance",
         lambda candles: QuickFibonacciGuidance(BreakoutDirection.BULLISH, "golden_zone", 96.0, 90.0, 111.0),
     )
     monkeypatch.setattr(
+        "src.quick_scalp_loop.resolve_quick_fvg_guidance",
+        lambda candles, direction, current_price: QuickFvgGuidance(direction, 97.0, 95.0, 3, current_price, "matching_fvg"),
+    )
+    monkeypatch.setattr(
         "src.quick_scalp_loop.resolve_quick_indicator_guidance",
-        lambda candles: QuickIndicatorGuidance(rsi=82.0, sar=99.0, sar_direction=BreakoutDirection.BULLISH),
+        lambda candles: QuickIndicatorGuidance(rsi=88.0, sar=99.0, sar_direction=BreakoutDirection.BULLISH),
     )
 
     run_quick_scalp_loop(
-        mt5_module=SimpleNamespace(),
+        mt5_module=FakeMt5(),
         executor=FakeExecutor(),
         symbol="XAUUSD",
         lot=0.01,
@@ -1405,10 +1478,10 @@ def test_build_quick_trade_levels_uses_one_to_three_rr_with_spread_padded_take_p
         direction=BreakoutDirection.BEARISH,
     )
 
-    assert buy_sl == pytest.approx(96.05)
-    assert buy_tp == pytest.approx(112.10)
-    assert sell_sl == pytest.approx(104.00)
-    assert sell_tp == pytest.approx(87.95)
+    assert buy_sl == pytest.approx(92.05)
+    assert buy_tp == pytest.approx(124.10)
+    assert sell_sl == pytest.approx(108.00)
+    assert sell_tp == pytest.approx(75.95)
 
 
 def test_build_quick_trade_levels_respects_broker_minimum_stop_distance():
@@ -1433,10 +1506,10 @@ def test_build_quick_trade_levels_respects_broker_minimum_stop_distance():
         direction=BreakoutDirection.BEARISH,
     )
 
-    assert buy_sl == pytest.approx(96.05)
-    assert buy_tp == pytest.approx(112.10)
-    assert sell_sl == pytest.approx(104.00)
-    assert sell_tp == pytest.approx(87.95)
+    assert buy_sl == pytest.approx(92.05)
+    assert buy_tp == pytest.approx(124.10)
+    assert sell_sl == pytest.approx(108.00)
+    assert sell_tp == pytest.approx(75.95)
 
 
 def test_quick_loop_limits_new_entries_by_grid_permission(monkeypatch):

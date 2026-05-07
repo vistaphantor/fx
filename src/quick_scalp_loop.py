@@ -284,19 +284,27 @@ def resolve_quick_guidance_decision(
     fib_allows = fibonacci_guidance.allows(direction)
     sar_allows = indicator_guidance.sar_direction is direction
     rsi_allows = _rsi_allows_direction(indicator_guidance.rsi, direction)
-    if not rsi_allows:
+    if _rsi_is_extreme_exhaustion(indicator_guidance.rsi, direction):
         return QuickGuidanceDecision(False, "indicator_filter", None, fib_allows, sar_allows, rsi_allows)
+    if not rsi_allows:
+        return QuickGuidanceDecision(True, "structure_override", 1, fib_allows, sar_allows, rsi_allows)
     if fib_allows and sar_allows:
         return QuickGuidanceDecision(True, "full_guidance", None, fib_allows, sar_allows, rsi_allows)
     if fib_allows or sar_allows:
         return QuickGuidanceDecision(True, "mixed_guidance", 1, fib_allows, sar_allows, rsi_allows)
-    return QuickGuidanceDecision(True, "signal_override", 1, fib_allows, sar_allows, rsi_allows)
+    return QuickGuidanceDecision(False, "signal_override", None, fib_allows, sar_allows, rsi_allows)
 
 
 def _rsi_allows_direction(rsi: float, direction: BreakoutDirection) -> bool:
     if direction is BreakoutDirection.BULLISH:
         return rsi < 70.0
     return rsi > 30.0
+
+
+def _rsi_is_extreme_exhaustion(rsi: float, direction: BreakoutDirection) -> bool:
+    if direction is BreakoutDirection.BULLISH:
+        return rsi >= 85.0
+    return rsi <= 15.0
 
 
 def _calculate_rsi(closes: list[float], period: int = 14) -> float:
@@ -483,8 +491,8 @@ def build_quick_trade_levels(
     mt5_module,
     symbol: str,
     direction: BreakoutDirection,
-    stop_loss_pips: float = 40.0,
-    take_profit_pips: float = 120.0,
+    stop_loss_pips: float = 80.0,
+    take_profit_pips: float = 240.0,
 ) -> tuple[float, float]:
     tick = mt5_module.symbol_info_tick(symbol) if hasattr(mt5_module, "symbol_info_tick") else None
     if tick is None:
@@ -595,7 +603,7 @@ def close_profitable_quick_positions(
 
         if exit_reason is not None:
             if exit_reason == "tick_turn":
-                exit_comment = f"{QUICK_COMMENT_PREFIX}-tick-turn-profit-exit"
+                exit_comment = f"{QUICK_COMMENT_PREFIX}-tick-exit"
             elif exit_reason == "max_loss":
                 exit_comment = f"{QUICK_COMMENT_PREFIX}-loss-exit"
             else:

@@ -63,7 +63,7 @@ class Settings:
     # Quick USC scalper settings
     quick_scalp_enabled: bool = False
     quick_trade_lot: float = 0.01
-    quick_max_positions: int = 100
+    quick_max_positions: int = 1
     quick_profit_target: float = 0.2
     quick_max_loss: float = 0.0
     quick_poll_seconds: int = 1
@@ -172,7 +172,7 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
         add_on_lot_increment = float(str(values.get("ADD_ON_LOT_INCREMENT", "0.01")).strip())
         campaign_max_exposure_pct = float(str(values.get("CAMPAIGN_MAX_EXPOSURE_PCT", "10.0")).strip())
         quick_trade_lot = float(str(values.get("QUICK_TRADE_LOT", default_trade_lot)).strip())
-        quick_max_positions = int(str(values.get("QUICK_MAX_POSITIONS", "100")).strip())
+        quick_max_positions = int(str(values.get("QUICK_MAX_POSITIONS", "1")).strip())
         quick_profit_target = float(str(values.get("QUICK_PROFIT_TARGET", "0.2")).strip())
         quick_max_loss = float(str(values.get("QUICK_MAX_LOSS", "0.0")).strip())
         quick_poll_seconds = int(str(values.get("QUICK_POLL_SECONDS", "1")).strip())

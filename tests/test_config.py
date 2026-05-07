@@ -89,7 +89,7 @@ def test_load_settings_reads_quick_scalp_defaults(tmp_path):
 
     assert settings.quick_scalp_enabled is False
     assert settings.quick_trade_lot == pytest.approx(0.03)
-    assert settings.quick_max_positions == 100
+    assert settings.quick_max_positions == 1
     assert settings.quick_profit_target == pytest.approx(0.2)
     assert settings.quick_max_loss == pytest.approx(0.0)
     assert settings.quick_poll_seconds == 1
