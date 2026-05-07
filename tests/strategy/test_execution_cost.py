@@ -217,3 +217,26 @@ def test_execution_cost_exposes_directional_tail_proxy_by_trade_direction():
     )
 
     assert long_assessment.directional_tail_proxy != short_assessment.directional_tail_proxy
+
+
+def test_execution_cost_uses_improved_live_market_price_for_buy_entries():
+    assessment = assess_market_order_execution(
+        direction=BreakoutDirection.BULLISH,
+        planned_entry=100.0,
+        stop_loss=98.8,
+        take_profit=101.6,
+        current_bid=99.88,
+        current_ask=99.90,
+        spread=0.02,
+        volatility_state=VolatilityState(
+            short_atr=0.02,
+            medium_atr=0.03,
+            realized_range=0.2,
+            body_efficiency=0.8,
+            range_expansion_ratio=1.0,
+        ),
+        requested_lot=0.01,
+        campaign_exposure_pct=0.0,
+    )
+
+    assert assessment.effective_entry < 100.0

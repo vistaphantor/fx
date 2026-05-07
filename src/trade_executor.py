@@ -147,6 +147,26 @@ def normalize_lot_size(symbol_info, requested_lot):
     return round(normalized, 8)
 
 
+def _resolve_opened_position(mt5_module, *, result, symbol, order_type, lot, comment):
+    positions = mt5_module.positions_get(ticket=getattr(result, "order", 0))
+    if positions:
+        return positions[0]
+
+    positions = mt5_module.positions_get(symbol=symbol) or []
+    matching_positions = [
+        position
+        for position in positions
+        if str(getattr(position, "symbol", "")).upper() == str(symbol).upper()
+        and int(getattr(position, "type", order_type)) == int(order_type)
+        and abs(float(getattr(position, "volume", lot) or 0.0) - float(lot)) < 1e-8
+        and str(getattr(position, "comment", "")).startswith(str(comment))
+    ]
+    if matching_positions:
+        return matching_positions[-1]
+
+    raise RuntimeError("Order reported success but no matching open position was found")
+
+
 class TradeExecutor:
     def __init__(self, mt5_module):
         self.mt5_module = mt5_module
@@ -170,14 +190,15 @@ class TradeExecutor:
         if getattr(result, "retcode", None) != self.mt5_module.TRADE_RETCODE_DONE:
             raise RuntimeError(f"Open trade rejected: {describe_retcode(self.mt5_module, result.retcode)}")
 
-        positions = self.mt5_module.positions_get(ticket=getattr(result, "order", 0))
-        if positions:
-            return positions[0]
-
-        positions = self.mt5_module.positions_get(symbol=symbol)
-        if not positions:
-            raise RuntimeError("Order reported success but no open position was found")
-        return positions[0]
+        order_type = self.mt5_module.ORDER_TYPE_BUY if side == "buy" else self.mt5_module.ORDER_TYPE_SELL
+        return _resolve_opened_position(
+            self.mt5_module,
+            result=result,
+            symbol=symbol,
+            order_type=order_type,
+            lot=lot,
+            comment=comment,
+        )
 
     def open_strategy_trade(self, symbol, direction, lot, stop_loss, take_profit, comment):
         if not self.mt5_module.symbol_select(symbol, True):
@@ -205,14 +226,14 @@ class TradeExecutor:
         if getattr(result, "retcode", None) != self.mt5_module.TRADE_RETCODE_DONE:
             raise RuntimeError(f"Strategy trade rejected: {describe_retcode(self.mt5_module, result.retcode)}")
 
-        positions = self.mt5_module.positions_get(ticket=getattr(result, "order", 0))
-        if positions:
-            return positions[0]
-
-        positions = self.mt5_module.positions_get(symbol=symbol)
-        if not positions:
-            raise RuntimeError("Strategy order reported success but no open position was found")
-        return positions[0]
+        return _resolve_opened_position(
+            self.mt5_module,
+            result=result,
+            symbol=symbol,
+            order_type=request["type"],
+            lot=normalized_lot,
+            comment=comment,
+        )
 
     def close_position(self, position, comment):
         symbol_info = self.mt5_module.symbol_info(position.symbol)

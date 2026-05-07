@@ -10,6 +10,9 @@ from typing import Any
 from src.strategy.breakout import BreakoutDirection
 
 
+DEFAULT_MAX_WEBHOOK_BODY_BYTES = 16 * 1024
+
+
 @dataclass(frozen=True, slots=True)
 class TradingViewAlert:
     is_valid: bool
@@ -96,6 +99,7 @@ def start_tradingview_webhook_server(
     port: int,
     expected_secret: str,
     store: TradingViewAlertStore,
+    max_body_bytes: int = DEFAULT_MAX_WEBHOOK_BODY_BYTES,
     log_fn=print,
 ) -> ThreadingHTTPServer:
     class TradingViewWebhookHandler(BaseHTTPRequestHandler):
@@ -104,7 +108,17 @@ def start_tradingview_webhook_server(
                 self.send_error(404, "Not Found")
                 return
 
-            content_length = int(self.headers.get("Content-Length", "0"))
+            try:
+                content_length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                self.send_error(400, "Invalid Content-Length")
+                return
+            if content_length < 0:
+                self.send_error(400, "Invalid Content-Length")
+                return
+            if content_length > max_body_bytes:
+                self.send_error(413, "Payload Too Large")
+                return
             try:
                 body = self.rfile.read(content_length)
                 payload = json.loads(body.decode("utf-8"))

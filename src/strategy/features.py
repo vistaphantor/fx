@@ -128,7 +128,7 @@ class FeatureExtractor:
             name: RollingBuffer(capacity=window) for name in self.FEATURE_NAMES
         }
         self._snapshot_count = 0
-        self._last_raw_values: dict[str, float] = {}
+        self._last_timestamp: datetime | None = None
 
     @property
     def window(self) -> int:
@@ -164,18 +164,19 @@ class FeatureExtractor:
             "spread_danger": spread_danger_raw,
         }
 
-        # Push raw values and compute z-scores with deduplication
+        should_push = self._last_timestamp is None or ts != self._last_timestamp
+
+        # Push one complete feature row per bar timestamp, then compute z-scores.
         z_scores: dict[str, float] = {}
         for name, raw in raw_values.items():
-            # Only push if value has changed meaningfully to avoid z-score stagnation
-            last_val = self._last_raw_values.get(name)
-            if last_val is None or not math.isclose(raw, last_val, rel_tol=1e-7):
+            if should_push:
                 self._buffers[name].push(raw)
-                self._last_raw_values[name] = raw
-            
+
             z_scores[name] = self._buffers[name].z_score(raw)
 
-        self._snapshot_count += 1
+        if should_push:
+            self._snapshot_count += 1
+            self._last_timestamp = ts
 
         return FeatureSnapshot(
             timestamp=ts,
@@ -334,7 +335,7 @@ def extract_spread_danger(spread: float, atr: float) -> float:
 
 
 def extract_expected_return(m15_candles: list[Any], lookback: int = 20) -> tuple[float, float]:
-    """Compute mean and std of log-returns from recent M15 candles.
+    """Compute EWMA mean and std of recent M15 returns.
 
     Returns (expected_return, return_std).
     """
@@ -352,11 +353,14 @@ def extract_expected_return(m15_candles: list[Any], lookback: int = 20) -> tuple
     if not returns:
         return 0.0, 1.0
 
-    mean_ret = sum(returns) / len(returns)
+    alpha = 2.0 / (len(returns) + 1.0)
+    weights = [(1.0 - alpha) ** (len(returns) - 1 - index) for index in range(len(returns))]
+    weight_sum = sum(weights)
+    mean_ret = sum(weight * ret for weight, ret in zip(weights, returns)) / weight_sum
     if len(returns) < 2:
         return mean_ret, 1.0
 
-    variance = sum((r - mean_ret) ** 2 for r in returns) / (len(returns) - 1)
+    variance = sum(weight * ((ret - mean_ret) ** 2) for weight, ret in zip(weights, returns)) / weight_sum
     std_ret = math.sqrt(max(variance, 0.0)) or 1.0
     return mean_ret, std_ret
 

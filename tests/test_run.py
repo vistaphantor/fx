@@ -40,6 +40,7 @@ def test_main_always_starts_live_signal_loop(monkeypatch):
     )
 
     monkeypatch.setattr(run, "load_settings", lambda: settings)
+    monkeypatch.setattr(run, "ensure_requirements_satisfied", lambda: events.append("requirements"))
     monkeypatch.setattr(run, "Mt5Session", FakeSession)
     monkeypatch.setattr(run, "create_mt5_module", lambda: "mt5")
     monkeypatch.setattr(
@@ -69,6 +70,7 @@ def test_main_always_starts_live_signal_loop(monkeypatch):
 
     assert exit_code == 0
     assert events == [
+        "requirements",
         ("session_init", settings.mt5_terminal_path, 5),
         "launch",
         ("login", 123456, "secret", "HFMarketsGlobal-Demo"),

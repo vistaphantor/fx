@@ -203,6 +203,43 @@ def compute_position_size(
     return round(max(normalized, volume_min), 8)
 
 
+def compute_price_risk_per_lot(*, entry_price: float, stop_loss: float, symbol_info) -> float:
+    """Estimate account-currency risk for one lot from entry to stop."""
+    stop_distance = abs(float(entry_price) - float(stop_loss))
+    if stop_distance <= 0:
+        return 0.0
+
+    tick_value = _first_positive_attr(
+        symbol_info,
+        "trade_tick_value_loss",
+        "trade_tick_value",
+        "trade_tick_value_profit",
+    )
+    tick_size = _first_positive_attr(symbol_info, "trade_tick_size", "point")
+    if tick_value is not None and tick_size is not None:
+        return (stop_distance / tick_size) * tick_value
+
+    contract_size = _first_positive_attr(symbol_info, "trade_contract_size")
+    if contract_size is not None:
+        return stop_distance * contract_size
+
+    return 0.0
+
+
+def _first_positive_attr(source, *names: str) -> float | None:
+    for name in names:
+        value = getattr(source, name, None)
+        if value is None:
+            continue
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            return parsed
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Persistence
 # ---------------------------------------------------------------------------
@@ -213,14 +250,25 @@ def save_equity_history(history: list[EquitySnapshot], path: str | Path) -> None
     file_path.parent.mkdir(parents=True, exist_ok=True)
     with open(file_path, "w", encoding="utf-8") as fh:
         for snapshot in history:
-            data = {
-                "timestamp": snapshot.timestamp.isoformat(),
-                "equity": snapshot.equity,
-                "peak_equity": snapshot.peak_equity,
-                "drawdown": snapshot.drawdown,
-                "drawdown_ratio": snapshot.drawdown_ratio,
-            }
-            fh.write(json.dumps(data) + "\n")
+            fh.write(json.dumps(_snapshot_to_jsonable(snapshot)) + "\n")
+
+
+def append_equity_snapshot_to_file(snapshot: EquitySnapshot, path: str | Path) -> None:
+    """Append one equity snapshot as JSONL."""
+    file_path = Path(path)
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(file_path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(_snapshot_to_jsonable(snapshot)) + "\n")
+
+
+def _snapshot_to_jsonable(snapshot: EquitySnapshot) -> dict[str, float | str]:
+    return {
+        "timestamp": snapshot.timestamp.isoformat(),
+        "equity": snapshot.equity,
+        "peak_equity": snapshot.peak_equity,
+        "drawdown": snapshot.drawdown,
+        "drawdown_ratio": snapshot.drawdown_ratio,
+    }
 
 
 def load_equity_history(path: str | Path) -> list[EquitySnapshot]:

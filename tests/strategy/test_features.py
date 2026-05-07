@@ -97,6 +97,26 @@ class TestFeatureExtractor:
         extractor = FeatureExtractor(window=5)
         assert extractor.window == 5
 
+    def test_same_timestamp_only_pushes_one_bar(self):
+        extractor = FeatureExtractor(window=10)
+        ts = datetime(2026, 4, 28, 6, 15, tzinfo=timezone.utc)
+
+        extractor.update(
+            momentum_raw=1.0, trend_raw=1.0, volume_raw=1.0,
+            order_block_raw=1.0, volatility_risk_raw=1.0,
+            entry_distance_raw=1.0, spread_danger_raw=1.0,
+            timestamp=ts,
+        )
+        extractor.update(
+            momentum_raw=2.0, trend_raw=2.0, volume_raw=2.0,
+            order_block_raw=2.0, volatility_risk_raw=2.0,
+            entry_distance_raw=2.0, spread_danger_raw=2.0,
+            timestamp=ts,
+        )
+
+        assert extractor.snapshot_count == 1
+        assert len(extractor._buffers["momentum"]) == 1
+
 
 class TestExtractMomentum:
     def test_basic_momentum(self):
@@ -190,3 +210,23 @@ class TestExtractExpectedReturn:
 
         mean_ret, std_ret = extract_expected_return([FakeCandle(100)], lookback=20)
         assert mean_ret == 0.0
+
+    def test_ewma_weights_recent_returns_more_than_old_outlier(self):
+        class FakeCandle:
+            def __init__(self, close):
+                self.close = close
+
+        candles = [FakeCandle(100.0), FakeCandle(90.0)]
+        price = 90.0
+        for _ in range(19):
+            price *= 1.002
+            candles.append(FakeCandle(price))
+
+        mean_ret, _ = extract_expected_return(candles, lookback=20)
+        arithmetic_mean = sum(
+            (candles[i].close - candles[i - 1].close) / candles[i - 1].close
+            for i in range(1, len(candles))
+        ) / 20
+
+        assert mean_ret > arithmetic_mean
+        assert mean_ret > 0.0

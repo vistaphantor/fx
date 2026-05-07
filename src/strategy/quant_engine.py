@@ -15,6 +15,11 @@ from typing import Any
 from src.strategy.features import FeatureSnapshot
 
 
+TRADE_PNL_SCALE = 100.0
+POOR_SHARPE_FLOOR = 0.05
+CVAR_GATE_COEFFICIENT = 0.5
+
+
 @dataclass(frozen=True, slots=True)
 class OmegaWeights:
     """Weights for the Omega z-score combination."""
@@ -90,11 +95,11 @@ def compute_omega_t(
     bars_per_day: float = 96.0,
 ) -> float:
     """Compute the full trade-quality multiplier Omega_t."""
+    del bars_per_day
     signal = compute_omega_signal(features, weights)
     return_std = max(features.return_std, 1e-9)
     raw_sharpe = abs(features.expected_return) / return_std
-    annualized_sharpe = raw_sharpe * math.sqrt(max(bars_per_day, 1.0))
-    sharpe_quality = _sigmoid(annualized_sharpe)
+    sharpe_quality = max(0.0, min(1.0, raw_sharpe / POOR_SHARPE_FLOOR))
     dd_factor = max(0.0, min(1.0, drawdown_dampener))
     return signal * sharpe_quality * dd_factor
 
@@ -126,7 +131,7 @@ def compute_cara_utility(
     dd_rho: float,
 ) -> float:
     """Legacy CARA utility helper retained for direct tests and compatibility."""
-    trade_pnl = action * position_fraction * expected_return * omega_t
+    trade_pnl = action * position_fraction * expected_return * omega_t * TRADE_PNL_SCALE
     cost_penalty = abs(action) * transaction_cost
     tail_risk = cvar_eta * cvar * abs(action)
     dd_penalty = dd_rho * drawdown_pct
@@ -295,7 +300,7 @@ def apply_execution_rules(
         return False, f"omega_below_threshold_{omega_t:.4f}_vs_{omega_threshold}"
 
     directional_return = action * expected_return
-    cost_plus_tail = transaction_cost + cvar_eta * cvar
+    cost_plus_tail = transaction_cost + (CVAR_GATE_COEFFICIENT * cvar_eta * cvar)
     if directional_return <= cost_plus_tail:
         return (
             False,

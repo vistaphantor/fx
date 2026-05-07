@@ -8,7 +8,7 @@ from src.strategy.breakout import BreakoutDirection
 from src.strategy.campaign_add import evaluate_campaign_add
 from src.strategy.decision_tree import TopDownNoTrade, TopDownTradePlan, evaluate_top_down_decision_tree
 from src.strategy.execution_cost import assess_market_order_execution
-from src.strategy.management import evaluate_campaign_action
+from src.strategy.management import evaluate_campaign_action, remember_position_initial_stop_loss
 from src.strategy.volatility import build_volatility_state
 
 
@@ -164,6 +164,13 @@ def _collect_recent_returns(m15_candles, lookback: int = 50) -> list[float]:
     return returns
 
 
+def _collect_directional_recent_returns(m15_candles, direction: BreakoutDirection, lookback: int = 50) -> list[float]:
+    returns = _collect_recent_returns(m15_candles, lookback=lookback)
+    if direction is BreakoutDirection.BEARISH:
+        return [-value for value in returns]
+    return returns
+
+
 def _sigmoid(value: float) -> float:
     if value >= 0:
         return 1.0 / (1.0 + exp(-value))
@@ -200,7 +207,14 @@ def _fallback_volatility_state(live_input):
     )
 
 
-def _estimate_strategy_trade_statistics(*, strategy_result, live_input, spread) -> dict[str, object]:
+def _estimate_strategy_trade_statistics(
+    *,
+    strategy_result,
+    live_input,
+    spread,
+    requested_lot: float,
+    campaign_exposure_pct: float,
+) -> dict[str, object]:
     from src.strategy.breakout import BreakoutDirection
     from src.strategy.features import extract_expected_return
 
@@ -293,8 +307,8 @@ def _estimate_strategy_trade_statistics(*, strategy_result, live_input, spread) 
         current_ask=current_ask,
         spread=float(spread),
         volatility_state=volatility_state,
-        requested_lot=0.01,
-        campaign_exposure_pct=0.0,
+        requested_lot=float(requested_lot),
+        campaign_exposure_pct=float(campaign_exposure_pct),
         continuation_context=continuation_context,
     )
 
@@ -314,10 +328,11 @@ def _estimate_strategy_trade_statistics(*, strategy_result, live_input, spread) 
     return_std = max(sqrt(max(variance, 0.0)), 1e-9)
 
     direction_sign = 1.0 if strategy_result.direction is BreakoutDirection.BULLISH else -1.0
-    sample_count = 20
-    win_samples = max(1, min(sample_count - 1, int(round(win_rate * sample_count))))
-    loss_samples = sample_count - win_samples
-    recent_returns = ([avg_win] * win_samples) + ([-avg_loss] * loss_samples)
+    recent_returns = _collect_directional_recent_returns(
+        live_input.m15_candles,
+        strategy_result.direction,
+        lookback=50,
+    )
 
     return {
         "win_rate": win_rate,
@@ -470,6 +485,16 @@ def run_live_signal_loop(
             strategy_profile=strategy_profile,
         )
 
+        campaign_positions = executor.list_bot_positions(symbol)
+        campaign_margin_snapshot = _build_margin_snapshot(
+            mt5_module=getattr(executor, "mt5_module", None),
+            symbol=symbol,
+            positions=campaign_positions,
+            direction=_campaign_direction(campaign_positions[-1]) if campaign_positions else BreakoutDirection.BULLISH,
+            default_lot=lot,
+            add_on_lot_increment=add_on_lot_increment,
+        )
+
         # ---------------------------------------------------------------
         # Quant engine overlay
         # ---------------------------------------------------------------
@@ -480,7 +505,15 @@ def run_live_signal_loop(
             # Update equity tracker
             account_info = mt5_module.account_info() if hasattr(mt5_module, "account_info") else None
             current_equity = float(getattr(account_info, "equity", 10000.0) or 10000.0) if account_info else 10000.0
-            equity_tracker.update(current_equity)
+            equity_snapshot = equity_tracker.update(current_equity)
+            equity_log_path = getattr(settings, "equity_log_path", None) if settings else None
+            if equity_log_path:
+                try:
+                    from src.strategy.equity_tracker import append_equity_snapshot_to_file
+
+                    append_equity_snapshot_to_file(equity_snapshot, equity_log_path)
+                except Exception:
+                    pass  # Don't crash on logging failure
 
             # Extract features
             spread = getattr(live_input, "spread", 0.0)
@@ -488,6 +521,8 @@ def run_live_signal_loop(
                 strategy_result=strategy_result,
                 live_input=live_input,
                 spread=spread,
+                requested_lot=lot,
+                campaign_exposure_pct=float(campaign_margin_snapshot["campaign_exposure_pct"]),
             )
             features, expected_return, return_std = _extract_features_from_strategy(
                 live_input=live_input,
@@ -541,7 +576,18 @@ def run_live_signal_loop(
             else:
                 # Compute effective lot from quant engine position sizing
                 if quant_decision.is_trade:
-                    from src.strategy.equity_tracker import compute_position_size
+                    from src.strategy.equity_tracker import compute_position_size, compute_price_risk_per_lot
+
+                    symbol_info = mt5_module.symbol_info(symbol) if hasattr(mt5_module, "symbol_info") else None
+                    price_risk_per_lot = (
+                        compute_price_risk_per_lot(
+                            entry_price=float(strategy_result.entry_price),
+                            stop_loss=float(strategy_result.stop_loss),
+                            symbol_info=symbol_info,
+                        )
+                        if symbol_info is not None
+                        else 0.0
+                    )
 
                     effective_lot = compute_position_size(
                         equity=current_equity,
@@ -552,10 +598,7 @@ def run_live_signal_loop(
                         r_max=quant_params.position_r_max,
                         volume_min=lot,  # Use configured lot as floor
                         volume_step=0.01,
-                        price_per_lot=max(
-                            float(live_input.m15_candles[-1].close) * float(quant_trade_stats["avg_loss"]),
-                            1e-6,
-                        ),
+                        price_per_lot=price_risk_per_lot or float("inf"),
                     )
                     effective_lot *= max(float(getattr(quant_decision, "lot_multiplier", 1.0) or 1.0), 0.0)
                     log_fn(
@@ -587,11 +630,14 @@ def run_live_signal_loop(
                             f"QUANT DIRECTION {symbol} quant_action={quant_decision.action} "
                             f"strategy_direction={strategy_result.direction.value}"
                         )
-                        strategy_result_for_execution = strategy_result
+                        strategy_result_for_execution = TopDownNoTrade(
+                            is_trade=False,
+                            reason="quant_direction_mismatch",
+                            failed_node="quant_engine",
+                            metadata={"quant_decision": quant_decision},
+                        )
         else:
             strategy_result_for_execution = strategy_result
-
-        campaign_positions = executor.list_bot_positions(symbol)
 
         if campaign_positions:
             try:
@@ -636,6 +682,11 @@ def run_live_signal_loop(
                 except Exception as exc:
                     log_fn(f"LIVE ORDER REJECTED {symbol} reason={exc}")
                 else:
+                    remember_position_initial_stop_loss(
+                        position,
+                        strategy_result_for_execution.stop_loss,
+                        entry_price=strategy_result_for_execution.entry_price,
+                    )
                     quant_info = ""
                     if quant_decision:
                         quant_info = f" Ω={quant_decision.omega_t:.3f} lot={adjusted_lot}"
@@ -976,9 +1027,6 @@ def _position_current_stop_loss(position) -> float | None:
 
 
 def _position_initial_stop_loss(position, entry_price: float) -> float:
-    if hasattr(position, "initial_stop_loss"):
-        return float(position.initial_stop_loss)
-    current_stop_loss = _position_current_stop_loss(position)
-    if current_stop_loss is not None:
-        return current_stop_loss
-    return entry_price
+    from src.strategy.management import _position_initial_stop_loss as resolve_initial_stop_loss
+
+    return resolve_initial_stop_loss(position, entry_price)

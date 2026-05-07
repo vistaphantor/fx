@@ -109,13 +109,137 @@ def test_decision_tree_returns_trade_plan_when_all_nodes_align():
     assert result.metadata["daily_context"].current_price == 106.4
     assert result.metadata["regime_state"].tradable is True
     assert result.metadata["score_decision"].is_tradeable is True
-    assert result.metadata["is_continuation_setup"] is True
+    assert result.metadata["is_continuation_setup"] is False
     assert result.metadata["m15_quality"] > 0.0
     assert result.metadata["m10_quality"] > 0.0
     assert result.metadata["m5_quality"] > 0.0
     assert result.metadata["range_expansion_ratio"] > 0.0
     assert result.metadata["body_efficiency"] > 0.0
     assert result.metadata["regime_confidence"] > 0.0
+
+
+def test_decision_tree_marks_true_continuation_trade_plans_as_continuations(monkeypatch):
+    from src.strategy import decision_tree as decision_tree_module
+
+    monkeypatch.setattr(
+        decision_tree_module,
+        "evaluate_m30_setup",
+        lambda **kwargs: SetupDecision(
+            is_ready=True,
+            reason="m30_continuation_reacceptance_ready",
+            setup_state="continuation_reacceptance",
+            metadata={},
+            quality_score=0.88,
+        ),
+    )
+    monkeypatch.setattr(
+        decision_tree_module,
+        "evaluate_m15_trigger",
+        lambda **kwargs: TriggerDecision(
+            is_ready=True,
+            reason="m15_trigger_still_valid",
+            entry_price=106.0,
+            invalidation_price=104.8,
+            metadata={},
+            quality_score=0.9,
+            expected_move_multiple=2.0,
+        ),
+    )
+    monkeypatch.setattr(
+        decision_tree_module,
+        "evaluate_m10_setup",
+        lambda **kwargs: SetupDecision(
+            is_ready=True,
+            reason="m10_continuation_ready",
+            setup_state="refining",
+            metadata={},
+            quality_score=0.82,
+        ),
+    )
+    monkeypatch.setattr(
+        decision_tree_module,
+        "evaluate_m5_trigger",
+        lambda **kwargs: TriggerDecision(
+            is_ready=True,
+            reason="m5_continuation_ready",
+            entry_price=106.4,
+            invalidation_price=105.6,
+            metadata={},
+            quality_score=0.84,
+            expected_move_multiple=1.9,
+        ),
+    )
+
+    result = evaluate_top_down_decision_tree(
+        d1_candles=_candles(
+            "D1",
+            [
+                (101.0, 108.0, 99.0, 105.0, 1000),
+                (105.0, 112.0, 100.0, 109.0, 1200),
+            ],
+        ),
+        h4_candles=_candles(
+            "H4",
+            [
+                (100.0, 104.0, 98.0, 103.0, 80),
+                (103.0, 110.0, 96.0, 108.0, 95),
+                (108.0, 109.0, 101.0, 102.0, 70),
+                (102.0, 117.0, 100.0, 116.0, 150),
+                (116.0, 131.0, 114.0, 128.0, 210),
+                (128.0, 129.0, 120.0, 123.0, 130),
+                (123.0, 126.0, 119.0, 124.0, 90),
+            ],
+        ),
+        h1_candles=_candles(
+            "H1",
+            [
+                (99.0, 101.0, 98.0, 100.0, 100),
+                (100.0, 102.0, 99.5, 101.5, 101),
+                (101.5, 104.0, 101.0, 103.0, 102),
+                (103.0, 105.0, 102.5, 104.0, 103),
+                (104.0, 107.0, 103.5, 106.0, 104),
+            ],
+        ),
+        m30_candles=_candles(
+            "M30",
+            [
+                (104.5, 105.0, 103.4, 104.0, 100),
+                (104.0, 104.5, 103.2, 103.9, 101),
+                (103.9, 106.4, 103.0, 106.0, 102),
+            ],
+        ),
+        m15_candles=_candles(
+            "M15",
+            [
+                (104.0, 104.5, 103.8, 104.1, 100),
+                (104.1, 104.4, 103.9, 104.0, 101),
+                (104.0, 106.2, 103.95, 105.9, 102),
+                (105.9, 106.3, 104.8, 105.5, 103),
+                (105.5, 106.0, 104.7, 105.7, 104),
+                (105.7, 106.4, 104.5, 106.1, 105),
+            ],
+        ),
+        m10_candles=_candles(
+            "M10",
+            [
+                (105.4, 105.7, 105.1, 105.5, 100),
+                (105.5, 105.9, 105.2, 105.7, 101),
+                (105.7, 106.1, 105.5, 105.95, 102),
+            ],
+        ),
+        m5_candles=_candles(
+            "M5",
+            [
+                (105.9, 106.0, 105.7, 105.95, 100),
+                (105.95, 106.2, 105.8, 106.05, 101),
+                (106.05, 106.8, 105.9, 106.4, 102),
+            ],
+        ),
+        risk_buffer=0.05,
+    )
+
+    assert result.is_trade is True
+    assert result.metadata["is_continuation_setup"] is True
 
 
 def test_decision_tree_returns_exact_failed_node_reason():
@@ -154,7 +278,7 @@ def test_decision_tree_returns_exact_failed_node_reason():
             [
                 (105.4, 106.1, 105.0, 105.7, 100),
                 (105.7, 106.2, 105.2, 105.9, 101),
-                (105.9, 106.3, 105.4, 106.0, 102),
+                (105.9, 106.05, 104.7, 105.3, 102),
             ],
         ),
         m15_candles=_candles(

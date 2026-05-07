@@ -112,6 +112,20 @@ class TestOmegaT:
         assert omega_half < omega_full
         assert omega_half == pytest.approx(omega_full * 0.5, abs=0.01)
 
+    def test_strong_sharpe_does_not_boost_omega_above_raw_signal(self):
+        features = _make_features(expected_return=0.02, return_std=0.01)
+        omega = compute_omega_t(features, OmegaWeights(), drawdown_dampener=1.0)
+        signal = compute_omega_signal(features, OmegaWeights())
+
+        assert omega == pytest.approx(signal)
+
+    def test_poor_sharpe_penalizes_omega(self):
+        features = _make_features(expected_return=0.00001, return_std=0.01)
+        omega = compute_omega_t(features, OmegaWeights(), drawdown_dampener=1.0)
+        signal = compute_omega_signal(features, OmegaWeights())
+
+        assert omega < signal
+
 
 class TestCVaR:
     def test_empty_returns(self):
@@ -175,6 +189,22 @@ class TestCARAUtility:
             cvar=0.001, cvar_eta=1.0, drawdown_pct=0.0, dd_rho=0.5,
         )
         assert utility_short > utility_long
+
+    def test_trade_pnl_scale_can_overcome_realistic_cost_and_tail(self):
+        utility_flat = compute_cara_utility(
+            gamma=2.0, wealth=1.0, action=0,
+            position_fraction=0.02, expected_return=0.006,
+            omega_t=0.8, transaction_cost=0.0002,
+            cvar=0.001, cvar_eta=1.5, drawdown_pct=0.0, dd_rho=0.5,
+        )
+        utility_long = compute_cara_utility(
+            gamma=2.0, wealth=1.0, action=1,
+            position_fraction=0.02, expected_return=0.006,
+            omega_t=0.8, transaction_cost=0.0002,
+            cvar=0.001, cvar_eta=1.5, drawdown_pct=0.0, dd_rho=0.5,
+        )
+
+        assert utility_long > utility_flat
 
 
 class TestCertaintyEquivalent:

@@ -1,7 +1,19 @@
 from types import SimpleNamespace
 
+import pytest
+
 from src.strategy.breakout import BreakoutDirection
 from src.strategy.management import evaluate_campaign_action
+
+
+@pytest.fixture(autouse=True)
+def isolated_initial_stop_cache(monkeypatch, tmp_path):
+    import src.strategy.management as management
+
+    monkeypatch.setattr(management, "_INITIAL_STOP_CACHE_PATH", tmp_path / "initial_stop_cache.json")
+    management._INITIAL_STOP_CACHE.clear()
+    yield
+    management._INITIAL_STOP_CACHE.clear()
 
 
 def test_management_allows_add_after_latest_trade_reaches_two_r():
@@ -141,6 +153,105 @@ def test_management_supports_mt5_trade_position_field_names_when_trailing():
     assert result.action == "trail_all"
     assert result.reason == "campaign_breakeven_earned"
     assert result.stop_updates == ((0, 100.0), (1, 105.0))
+
+
+def test_management_preserves_original_mt5_risk_after_stop_moves_for_same_ticket():
+    first_snapshot = [
+        SimpleNamespace(ticket=11, price_open=100.0, sl=95.0, volume=0.01, type=0),
+    ]
+    evaluate_campaign_action(
+        positions=first_snapshot,
+        current_price=100.5,
+        direction=BreakoutDirection.BULLISH,
+        latest_trade_r_multiple=0.1,
+        default_lot=0.01,
+        add_on_lot_increment=0.01,
+        max_exposure_pct=10.0,
+        margin_snapshot={
+            "campaign_exposure_pct": 4.0,
+            "preferred_add_exposure_pct": 1.5,
+            "fallback_add_exposure_pct": 1.0,
+        },
+        reversal_confirmed=False,
+        breakeven_distance=1.5,
+    )
+
+    tightened_snapshot = [
+        SimpleNamespace(ticket=11, price_open=100.0, sl=100.0, volume=0.01, type=0),
+    ]
+    result = evaluate_campaign_action(
+        positions=tightened_snapshot,
+        current_price=110.0,
+        direction=BreakoutDirection.BULLISH,
+        latest_trade_r_multiple=2.0,
+        default_lot=0.01,
+        add_on_lot_increment=0.01,
+        max_exposure_pct=10.0,
+        margin_snapshot={
+            "campaign_exposure_pct": 4.0,
+            "preferred_add_exposure_pct": 1.5,
+            "fallback_add_exposure_pct": 1.0,
+        },
+        reversal_confirmed=False,
+    )
+
+    assert result.action == "trail_all"
+    assert result.reason == "campaign_profit_lock_progression"
+    assert result.stop_updates == ((0, 105.0),)
+
+
+def test_management_preserves_original_mt5_risk_after_process_reload(monkeypatch, tmp_path):
+    import src.strategy.management as management
+
+    monkeypatch.setattr(
+        management,
+        "_INITIAL_STOP_CACHE_PATH",
+        tmp_path / "initial_stop_cache.json",
+        raising=False,
+    )
+    management._INITIAL_STOP_CACHE.clear()
+
+    initial_position = SimpleNamespace(
+        ticket=22,
+        price_open=100.0,
+        sl=95.0,
+        volume=0.01,
+        type=0,
+        symbol="XAUUSD",
+    )
+    management.remember_position_initial_stop_loss(initial_position)
+
+    management._INITIAL_STOP_CACHE.clear()
+
+    tightened_snapshot = [
+        SimpleNamespace(
+            ticket=22,
+            price_open=100.0,
+            sl=100.0,
+            volume=0.01,
+            type=0,
+            symbol="XAUUSD",
+        ),
+    ]
+    result = management.evaluate_campaign_action(
+        positions=tightened_snapshot,
+        current_price=110.0,
+        direction=BreakoutDirection.BULLISH,
+        latest_trade_r_multiple=2.0,
+        default_lot=0.01,
+        add_on_lot_increment=0.01,
+        max_exposure_pct=10.0,
+        margin_snapshot={
+            "campaign_exposure_pct": 4.0,
+            "preferred_add_exposure_pct": 1.5,
+            "fallback_add_exposure_pct": 1.0,
+        },
+        reversal_confirmed=False,
+    )
+
+    assert result.action == "trail_all"
+    assert result.reason == "campaign_profit_lock_progression"
+    assert result.stop_updates == ((0, 105.0),)
 
 
 def test_management_blocks_add_when_campaign_exposure_exceeds_limit():

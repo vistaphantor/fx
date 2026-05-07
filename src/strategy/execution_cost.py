@@ -71,9 +71,9 @@ def assess_market_order_execution(
     safe_spread = max(float(spread), 0.0)
     expected_slippage = max(safe_spread * 0.5, float(volatility_state.short_atr) * 0.12, 0.0)
     if direction is BreakoutDirection.BULLISH:
-        effective_entry = max(float(planned_entry), market_price) + expected_slippage
+        effective_entry = market_price + expected_slippage
     else:
-        effective_entry = min(float(planned_entry), market_price) - expected_slippage
+        effective_entry = market_price - expected_slippage
 
     effective_stop_distance = abs(effective_entry - float(stop_loss))
     effective_reward_distance = max(abs(float(take_profit) - effective_entry), 0.0)

@@ -173,6 +173,55 @@ def test_open_strategy_trade_uses_fok_when_symbol_bitmask_is_fok():
     assert captured_requests[0]["type_filling"] == mt5.ORDER_FILLING_FOK
 
 
+def test_open_strategy_trade_fallback_returns_matching_bot_position_not_first_symbol_position():
+    mt5 = FakeMt5()
+    mt5.symbol_select = lambda symbol, enabled: True
+    mt5.symbol_info = lambda symbol: SimpleNamespace(
+        filling_mode=0,
+        volume_min=0.01,
+        volume_max=1.0,
+        volume_step=0.01,
+    )
+    mt5.symbol_info_tick = lambda symbol: SimpleNamespace(ask=2350.5, bid=2350.1)
+    mt5.order_check = lambda request: SimpleNamespace(retcode=0, comment="Done")
+    mt5.order_send = lambda request: SimpleNamespace(retcode=mt5.TRADE_RETCODE_DONE, order=88)
+
+    manual_position = SimpleNamespace(
+        ticket=11,
+        symbol="XAUUSD",
+        volume=0.01,
+        type=mt5.ORDER_TYPE_BUY,
+        comment="manual",
+    )
+    bot_position = SimpleNamespace(
+        ticket=22,
+        symbol="XAUUSD",
+        volume=0.01,
+        type=mt5.ORDER_TYPE_BUY,
+        comment="strategy-live",
+    )
+
+    def positions_get(**kwargs):
+        if "ticket" in kwargs:
+            return []
+        return [manual_position, bot_position]
+
+    mt5.positions_get = positions_get
+    mt5.last_error = lambda: (0, "ok")
+
+    executor = TradeExecutor(mt5)
+    position = executor.open_strategy_trade(
+        symbol="XAUUSD",
+        direction=BreakoutDirection.BULLISH,
+        lot=0.01,
+        stop_loss=2345.0,
+        take_profit=2365.0,
+        comment="strategy-live",
+    )
+
+    assert position.ticket == 22
+
+
 def test_update_position_stop_loss_builds_modify_request():
     position = SimpleNamespace(ticket=88, symbol="XAUUSD", tp=2365.0)
 

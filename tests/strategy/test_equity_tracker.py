@@ -10,6 +10,7 @@ from src.strategy.equity_tracker import (
     EquityTracker,
     compute_kelly_fraction,
     compute_position_size,
+    compute_price_risk_per_lot,
 )
 
 
@@ -145,3 +146,24 @@ class TestPositionSize:
             price_per_lot=100.0,
         )
         assert size == 0.01
+
+
+class TestPriceRiskPerLot:
+    def test_uses_tick_value_and_tick_size_for_stop_distance(self):
+        symbol_info = type(
+            "SymbolInfo",
+            (),
+            {
+                "trade_tick_value": 1.0,
+                "trade_tick_size": 0.01,
+                "trade_contract_size": 100.0,
+            },
+        )()
+
+        risk = compute_price_risk_per_lot(
+            entry_price=4700.0,
+            stop_loss=4696.0,
+            symbol_info=symbol_info,
+        )
+
+        assert risk == pytest.approx(400.0)

@@ -167,6 +167,78 @@ def test_evaluate_m30_setup_uses_live_current_price_for_bearish_breakaway():
     assert result.reason == "m30_breakaway_ready"
 
 
+def test_evaluate_m30_setup_accepts_bullish_continuation_reacceptance_with_strong_h1_bias():
+    direction_decision = DirectionDecision(
+        is_valid=True,
+        direction=BreakoutDirection.BULLISH,
+        reason="h1_bias_bullish",
+        metadata={},
+        bullish_contribution=8.0,
+        bearish_contribution=1.0,
+    )
+    h4_context = H4Context(
+        previous_session_high=110.0,
+        previous_session_low=96.0,
+        demand_zones=((100.0, 102.0),),
+        supply_zones=((112.0, 116.0),),
+        volume_profile_levels=(109.0, 107.0, 103.0),
+    )
+
+    result = evaluate_m30_setup(
+        m30_candles=_candles(
+            [
+                (103.2, 106.8, 103.0, 106.2),
+                (106.2, 107.4, 105.6, 107.0),
+                (106.9, 107.2, 105.9, 106.6),
+            ]
+        ),
+        direction_decision=direction_decision,
+        h4_context=h4_context,
+    )
+
+    assert result.is_ready is True
+    assert result.reason == "m30_continuation_reacceptance_ready"
+    assert result.setup_state == "continuation_reacceptance"
+    assert result.metadata["continuation_reacceptance_score"] >= 0.5
+    assert result.metadata["h1_bias_strength"] > 0.5
+
+
+def test_evaluate_m30_setup_rejects_same_continuation_when_h1_bias_is_weak():
+    direction_decision = DirectionDecision(
+        is_valid=True,
+        direction=BreakoutDirection.BULLISH,
+        reason="h1_bias_bullish",
+        metadata={},
+        bullish_contribution=4.0,
+        bearish_contribution=3.0,
+    )
+    h4_context = H4Context(
+        previous_session_high=110.0,
+        previous_session_low=96.0,
+        demand_zones=((100.0, 102.0),),
+        supply_zones=((112.0, 116.0),),
+        volume_profile_levels=(109.0, 107.0, 103.0),
+    )
+
+    result = evaluate_m30_setup(
+        m30_candles=_candles(
+            [
+                (103.2, 106.8, 103.0, 106.2),
+                (106.2, 107.4, 105.6, 107.0),
+                (106.9, 107.2, 105.9, 106.6),
+            ]
+        ),
+        direction_decision=direction_decision,
+        h4_context=h4_context,
+    )
+
+    assert result.is_ready is False
+    assert result.reason == "m30_setup_not_ready"
+    assert result.setup_state == "continuation_reacceptance"
+    assert result.metadata["continuation_reacceptance_score"] >= 0.5
+    assert result.metadata["h1_bias_strength"] < 0.5
+
+
 def test_evaluate_m10_setup_marks_refinement_ready_after_m15_confirmation():
     direction_decision = DirectionDecision(
         is_valid=True,

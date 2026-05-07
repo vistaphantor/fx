@@ -66,18 +66,29 @@ def _classify_regime_label(
 # ---------------------------------------------------------------------------
 
 def load_feature_rows(path: str | Path) -> list[dict]:
-    """Load feature snapshots from JSONL."""
+    """Load canonical feature snapshots from JSONL."""
     file_path = Path(path)
     if not file_path.exists():
         raise FileNotFoundError(f"Feature file not found: {file_path}")
 
     rows: list[dict] = []
+    seen_timestamps: set[object] = set()
     with open(file_path, encoding="utf-8") as fh:
         for line in fh:
             line = line.strip()
             if not line:
                 continue
-            rows.append(json.loads(line))
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(row, dict) or "timestamp" not in row:
+                continue
+            timestamp = row["timestamp"]
+            if timestamp in seen_timestamps:
+                continue
+            seen_timestamps.add(timestamp)
+            rows.append(row)
     return rows
 
 

@@ -68,6 +68,102 @@ def test_load_settings_reads_live_loop_and_campaign_values(tmp_path):
     assert settings.max_candles_since_breakout == 4
 
 
+def test_load_settings_reads_quick_scalp_defaults(tmp_path):
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "\n".join(
+            [
+                "MT5_TERMINAL_PATH=C:\\Program Files\\MT5\\terminal64.exe",
+                "HFM_LOGIN=123456",
+                "HFM_PASSWORD=secret",
+                "HFM_SERVER=HFMarketsGlobal-Demo",
+                "TRADING_SYMBOL=XAUUSD",
+                "MT5_STARTUP_WAIT_SECONDS=10",
+                "DEFAULT_TRADE_LOT=0.03",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    settings = load_settings(env_path)
+
+    assert settings.quick_scalp_enabled is False
+    assert settings.quick_trade_lot == pytest.approx(0.03)
+    assert settings.quick_max_positions == 100
+    assert settings.quick_profit_target == pytest.approx(0.2)
+    assert settings.quick_poll_seconds == 1
+    assert settings.quick_min_free_margin == pytest.approx(0.0)
+
+
+def test_load_settings_reads_quick_scalp_overrides(tmp_path):
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "\n".join(
+            [
+                "MT5_TERMINAL_PATH=C:\\Program Files\\MT5\\terminal64.exe",
+                "HFM_LOGIN=123456",
+                "HFM_PASSWORD=secret",
+                "HFM_SERVER=HFMarketsGlobal-Demo",
+                "TRADING_SYMBOL=XAUUSD",
+                "MT5_STARTUP_WAIT_SECONDS=10",
+                "QUICK_SCALP_ENABLED=true",
+                "QUICK_TRADE_LOT=0.02",
+                "QUICK_MAX_POSITIONS=75",
+                "QUICK_PROFIT_TARGET=0.15",
+                "QUICK_POLL_SECONDS=2",
+                "QUICK_MIN_FREE_MARGIN=5.0",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    settings = load_settings(env_path)
+
+    assert settings.quick_scalp_enabled is True
+    assert settings.quick_trade_lot == pytest.approx(0.02)
+    assert settings.quick_max_positions == 75
+    assert settings.quick_profit_target == pytest.approx(0.15)
+    assert settings.quick_poll_seconds == 2
+    assert settings.quick_min_free_margin == pytest.approx(5.0)
+
+
+def test_load_settings_reads_equity_log_path(tmp_path):
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "\n".join(
+            [
+                "MT5_TERMINAL_PATH=C:\\Program Files\\MT5\\terminal64.exe",
+                "HFM_LOGIN=123456",
+                "HFM_PASSWORD=secret",
+                "HFM_SERVER=HFMarketsGlobal-Demo",
+                "TRADING_SYMBOL=XAUUSD",
+                "MT5_STARTUP_WAIT_SECONDS=10",
+                "EQUITY_LOG_PATH=logs/custom_equity.jsonl",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    settings = load_settings(env_path)
+
+    assert settings.equity_log_path == "logs/custom_equity.jsonl"
+
+
+def test_load_settings_reads_equity_log_path_from_environment(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MT5_TERMINAL_PATH", "C:\\Program Files\\MT5\\terminal64.exe")
+    monkeypatch.setenv("HFM_LOGIN", "123456")
+    monkeypatch.setenv("HFM_PASSWORD", "secret")
+    monkeypatch.setenv("HFM_SERVER", "HFMarketsGlobal-Demo")
+    monkeypatch.setenv("TRADING_SYMBOL", "XAUUSD")
+    monkeypatch.setenv("MT5_STARTUP_WAIT_SECONDS", "10")
+    monkeypatch.setenv("EQUITY_LOG_PATH", "logs/env_equity.jsonl")
+
+    settings = load_settings()
+
+    assert settings.equity_log_path == "logs/env_equity.jsonl"
+
+
 def test_load_settings_reads_tradingview_webhook_settings(tmp_path):
     env_path = tmp_path / ".env"
     env_path.write_text(

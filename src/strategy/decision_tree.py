@@ -211,6 +211,12 @@ def evaluate_top_down_decision_tree(
     )
 
     objective_price = _directional_objective_price(direction_decision.direction, daily_context)
+    is_continuation_setup = _is_continuation_setup(
+        setup_decision=setup_decision,
+        trigger_decision=trigger_decision,
+        refinement_decision=refinement_decision,
+        execution_decision=execution_decision,
+    )
 
     return TopDownTradePlan(
         is_trade=True,
@@ -236,7 +242,7 @@ def evaluate_top_down_decision_tree(
             "regime_state": regime_state,
             "score_decision": score_decision,
             "symbol_profile": profile,
-            "is_continuation_setup": True,
+            "is_continuation_setup": is_continuation_setup,
             "m15_quality": trigger_decision.quality_score,
             "m10_quality": refinement_decision.quality_score,
             "m5_quality": execution_decision.quality_score,
@@ -254,6 +260,24 @@ def _no_trade(reason: str, failed_node: str, **metadata) -> TopDownNoTrade:
         failed_node=failed_node,
         metadata=metadata,
     )
+
+
+def _is_continuation_setup(*, setup_decision, trigger_decision, refinement_decision, execution_decision) -> bool:
+    continuation_setup_states = {"continuation_reacceptance"}
+    continuation_reasons = {
+        "m15_trigger_still_valid",
+        "m10_continuation_ready",
+        "m5_continuation_ready",
+    }
+    if getattr(setup_decision, "setup_state", None) in continuation_setup_states:
+        return True
+    if getattr(trigger_decision, "reason", None) in continuation_reasons:
+        return True
+    if getattr(refinement_decision, "reason", None) in continuation_reasons:
+        return True
+    if getattr(execution_decision, "reason", None) in continuation_reasons:
+        return True
+    return False
 
 
 def _default_strategy_profile(symbol: str) -> SymbolStrategyProfile:

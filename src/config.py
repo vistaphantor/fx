@@ -60,6 +60,13 @@ class Settings:
     feature_logging_enabled: bool = True
     feature_log_path: str = "data/features.jsonl"
     equity_log_path: str = "data/equity_history.jsonl"
+    # Quick USC scalper settings
+    quick_scalp_enabled: bool = False
+    quick_trade_lot: float = 0.01
+    quick_max_positions: int = 100
+    quick_profit_target: float = 0.2
+    quick_poll_seconds: int = 1
+    quick_min_free_margin: float = 0.0
 
 
 _PROFILE_DEFAULTS = {
@@ -115,9 +122,25 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
                 "TRADINGVIEW_WEBHOOK_PORT",
                 "TRADINGVIEW_WEBHOOK_SECRET",
                 "TRADINGVIEW_ALERT_MAX_AGE_SECONDS",
+                "QUANT_ENABLED",
+                "QUANT_GAMMA",
+                "QUANT_CVAR_ALPHA",
+                "QUANT_CVAR_ETA",
+                "QUANT_DD_MAX",
+                "QUANT_DD_RHO",
+                "QUANT_OMEGA_THRESHOLD",
+                "QUANT_POSITION_R_MAX",
+                "QUANT_TRANSACTION_LAMBDA",
+                "QUANT_ZSCORE_WINDOW",
+                "ML_ENABLED",
+                "ML_MODEL_PATH",
+                "FEATURE_LOGGING_ENABLED",
+                "FEATURE_LOG_PATH",
+                "EQUITY_LOG_PATH",
             }
             or key.startswith("XAUUSD_")
             or key.startswith("EURJPY_")
+            or key.startswith("QUICK_")
         }
 
     required = [
@@ -147,6 +170,11 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
         )
         add_on_lot_increment = float(str(values.get("ADD_ON_LOT_INCREMENT", "0.01")).strip())
         campaign_max_exposure_pct = float(str(values.get("CAMPAIGN_MAX_EXPOSURE_PCT", "10.0")).strip())
+        quick_trade_lot = float(str(values.get("QUICK_TRADE_LOT", default_trade_lot)).strip())
+        quick_max_positions = int(str(values.get("QUICK_MAX_POSITIONS", "100")).strip())
+        quick_profit_target = float(str(values.get("QUICK_PROFIT_TARGET", "0.2")).strip())
+        quick_poll_seconds = int(str(values.get("QUICK_POLL_SECONDS", "1")).strip())
+        quick_min_free_margin = float(str(values.get("QUICK_MIN_FREE_MARGIN", "0.0")).strip())
         strategy_profiles = _load_strategy_profiles(values)
     except ValueError as exc:
         raise ValueError(f"Invalid numeric setting: {exc}") from exc
@@ -171,9 +199,22 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
         raise ValueError("ADD_ON_LOT_INCREMENT must be greater than 0")
     if campaign_max_exposure_pct <= 0:
         raise ValueError("CAMPAIGN_MAX_EXPOSURE_PCT must be greater than 0")
+    if quick_trade_lot <= 0:
+        raise ValueError("QUICK_TRADE_LOT must be greater than 0")
+    if quick_max_positions <= 0:
+        raise ValueError("QUICK_MAX_POSITIONS must be greater than 0")
+    if quick_profit_target < 0:
+        raise ValueError("QUICK_PROFIT_TARGET must be 0 or greater")
+    if quick_poll_seconds <= 0:
+        raise ValueError("QUICK_POLL_SECONDS must be greater than 0")
+    if quick_min_free_margin < 0:
+        raise ValueError("QUICK_MIN_FREE_MARGIN must be 0 or greater")
 
     tradingview_webhook_enabled = (
         str(values.get("TRADINGVIEW_WEBHOOK_ENABLED", "false")).strip().lower() in {"1", "true", "yes", "on"}
+    )
+    quick_scalp_enabled = (
+        str(values.get("QUICK_SCALP_ENABLED", "false")).strip().lower() in {"1", "true", "yes", "on"}
     )
     tradingview_webhook_secret = str(values.get("TRADINGVIEW_WEBHOOK_SECRET", "")).strip()
     if tradingview_webhook_enabled and not tradingview_webhook_secret:
@@ -231,6 +272,12 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
         feature_logging_enabled=feature_logging_enabled,
         feature_log_path=feature_log_path,
         equity_log_path=equity_log_path,
+        quick_scalp_enabled=quick_scalp_enabled,
+        quick_trade_lot=quick_trade_lot,
+        quick_max_positions=quick_max_positions,
+        quick_profit_target=quick_profit_target,
+        quick_poll_seconds=quick_poll_seconds,
+        quick_min_free_margin=quick_min_free_margin,
     )
 
 

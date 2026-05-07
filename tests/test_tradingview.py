@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 from src.strategy.breakout import BreakoutDirection
-from src.tradingview import TradingViewAlertStore, parse_tradingview_alert
+from src.tradingview import TradingViewAlertStore, parse_tradingview_alert, start_tradingview_webhook_server
 
 
 def test_parse_tradingview_alert_requires_shared_secret():
@@ -103,3 +103,43 @@ def test_alert_store_ignores_stale_alerts():
     store.put(alert)
 
     assert store.latest_for("XAUUSD", now=now) is None
+
+
+def test_webhook_rejects_oversized_payload_before_reading_body():
+    store = TradingViewAlertStore(max_age_seconds=300)
+    server = start_tradingview_webhook_server(
+        host="127.0.0.1",
+        port=0,
+        expected_secret="correct",
+        store=store,
+        max_body_bytes=10,
+        log_fn=lambda message: None,
+    )
+    try:
+        handler = server.RequestHandlerClass
+
+        class FakeRequest:
+            read_called = False
+
+            def read(self, length):
+                self.read_called = True
+                return b"{}"
+
+        class FakeHandler:
+            path = "/tradingview"
+            headers = {"Content-Length": "11"}
+            rfile = FakeRequest()
+            status = None
+
+            def send_error(self, code, message=None):
+                self.status = code
+
+        fake = FakeHandler()
+
+        handler.do_POST(fake)
+
+        assert fake.status == 413
+        assert fake.rfile.read_called is False
+    finally:
+        server.shutdown()
+        server.server_close()

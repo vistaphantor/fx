@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from src.strategy.breakout import BreakoutDirection
+
+_INITIAL_STOP_CACHE: dict[tuple[object, ...], float] = {}
+_INITIAL_STOP_CACHE_PATH = Path("data") / "initial_stop_cache.json"
 
 
 @dataclass(frozen=True, slots=True)
@@ -13,6 +18,19 @@ class CampaignAction:
     stop_updates: tuple[tuple[int, float], ...] = ()
     add_lot: float | None = None
     metadata: dict[str, object] = field(default_factory=dict)
+
+
+def remember_position_initial_stop_loss(position, stop_loss: float | None = None, entry_price: float | None = None) -> None:
+    resolved_entry_price = float(entry_price) if entry_price is not None else _position_entry_price(position)
+    resolved_stop = stop_loss
+    if resolved_stop is None:
+        if hasattr(position, "initial_stop_loss"):
+            resolved_stop = float(position.initial_stop_loss)
+        else:
+            resolved_stop = _position_current_stop_loss(position)
+    if resolved_stop is None:
+        return
+    _remember_initial_stop_by_key(_position_identity(position, resolved_entry_price), float(resolved_stop))
 
 
 def evaluate_campaign_action(
@@ -218,9 +236,17 @@ def _position_entry_price(position) -> float:
 
 def _position_initial_stop_loss(position, entry_price: float) -> float:
     if hasattr(position, "initial_stop_loss"):
-        return float(position.initial_stop_loss)
+        initial_stop_loss = float(position.initial_stop_loss)
+        _remember_initial_stop_by_key(_position_identity(position, entry_price), initial_stop_loss)
+        return initial_stop_loss
+    position_key = _position_identity(position, entry_price)
+    _load_initial_stop_cache()
+    cached_stop_loss = _INITIAL_STOP_CACHE.get(position_key)
+    if cached_stop_loss is not None:
+        return cached_stop_loss
     current_stop_loss = _position_current_stop_loss(position)
     if current_stop_loss is not None:
+        _remember_initial_stop_by_key(position_key, current_stop_loss)
         return current_stop_loss
     return entry_price
 
@@ -231,3 +257,49 @@ def _position_current_stop_loss(position) -> float | None:
     if hasattr(position, "sl"):
         return float(position.sl)
     return None
+
+
+def _position_identity(position, entry_price: float) -> tuple[object, ...]:
+    ticket = getattr(position, "ticket", None)
+    symbol = getattr(position, "symbol", None)
+    volume = getattr(position, "volume", None)
+    position_type = getattr(position, "type", None)
+    return (ticket, symbol, round(float(entry_price), 10), volume, position_type)
+
+
+def _remember_initial_stop_by_key(position_key: tuple[object, ...], stop_loss: float) -> None:
+    _load_initial_stop_cache()
+    _INITIAL_STOP_CACHE[position_key] = float(stop_loss)
+    _save_initial_stop_cache()
+
+
+def _load_initial_stop_cache() -> None:
+    path = Path(_INITIAL_STOP_CACHE_PATH)
+    if not path.exists():
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return
+    if not isinstance(data, dict):
+        return
+    for encoded_key, stop_loss in data.items():
+        try:
+            key_parts = json.loads(encoded_key)
+            if isinstance(key_parts, list):
+                _INITIAL_STOP_CACHE[tuple(key_parts)] = float(stop_loss)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            continue
+
+
+def _save_initial_stop_cache() -> None:
+    path = Path(_INITIAL_STOP_CACHE_PATH)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            json.dumps(list(position_key), separators=(",", ":")): stop_loss
+            for position_key, stop_loss in _INITIAL_STOP_CACHE.items()
+        }
+        path.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
+    except OSError:
+        return

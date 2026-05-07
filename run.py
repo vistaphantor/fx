@@ -5,21 +5,54 @@ import os
 from pathlib import Path
 import sys
 import ctypes
+from dataclasses import is_dataclass, replace
 
-from src.config import load_settings
-from src.live_trade_loop import run_live_signal_loop
-from src.mt5_client import Mt5Session
-from src.trade_executor import TradeExecutor
-from src.tradingview import TradingViewAlertStore, start_tradingview_webhook_server
+from src.requirements_check import ensure_requirements_satisfied
 
 
 RELOAD_REQUESTED = "reload_requested"
+
+
+def load_settings():
+    from src.config import load_settings as load_app_settings
+
+    return load_app_settings()
 
 
 def create_mt5_module():
     import MetaTrader5 as mt5
 
     return mt5
+
+
+def run_live_signal_loop(**kwargs):
+    from src.live_trade_loop import run_live_signal_loop as run_app_live_signal_loop
+
+    return run_app_live_signal_loop(**kwargs)
+
+
+def Mt5Session(*args, **kwargs):
+    from src.mt5_client import Mt5Session as AppMt5Session
+
+    return AppMt5Session(*args, **kwargs)
+
+
+def TradeExecutor(*args, **kwargs):
+    from src.trade_executor import TradeExecutor as AppTradeExecutor
+
+    return AppTradeExecutor(*args, **kwargs)
+
+
+def TradingViewAlertStore(*args, **kwargs):
+    from src.tradingview import TradingViewAlertStore as AppTradingViewAlertStore
+
+    return AppTradingViewAlertStore(*args, **kwargs)
+
+
+def start_tradingview_webhook_server(**kwargs):
+    from src.tradingview import start_tradingview_webhook_server as start_app_tradingview_webhook_server
+
+    return start_app_tradingview_webhook_server(**kwargs)
 
 
 def configure_logging() -> None:
@@ -65,10 +98,18 @@ def set_keep_awake():
         logging.info("SYSTEM STAY-AWAKE ACTIVE (Windows Power Management Override)")
 
 
+def force_standard_settings(settings):
+    if is_dataclass(settings):
+        return replace(settings, quick_scalp_enabled=False)
+    setattr(settings, "quick_scalp_enabled", False)
+    return settings
+
+
 def main() -> int:
+    ensure_requirements_satisfied()
     configure_logging()
     set_keep_awake()
-    settings = load_settings()
+    settings = force_standard_settings(load_settings())
     code_watcher = build_code_watcher()
 
     mt5 = create_mt5_module()
