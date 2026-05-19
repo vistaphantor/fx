@@ -1,15 +1,22 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from math import exp, sqrt
 from time import sleep
 
 from src.market_data import build_live_strategy_input
+from src.quick_scalp_loop import save_training_snapshot
 from src.strategy.breakout import BreakoutDirection
 from src.strategy.campaign_add import evaluate_campaign_add
 from src.strategy.decision_tree import TopDownNoTrade, TopDownTradePlan, evaluate_top_down_decision_tree
 from src.strategy.execution_cost import assess_market_order_execution
-from src.strategy.management import evaluate_campaign_action, remember_position_initial_stop_loss
+from src.strategy.management import (
+    evaluate_campaign_action,
+    evaluate_fixed_trailing_stop,
+    remember_position_initial_stop_loss,
+)
 from src.strategy.volatility import build_volatility_state
+from src.strategy.session_engine import SessionEngine
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +75,7 @@ def _extract_features_from_strategy(
     spread,
     expected_return_override=None,
     return_std_override=None,
+    orderflow_signal=None,
 ):
     """Extract raw features from strategy outputs and compute z-scores."""
     from src.strategy.features import (
@@ -136,6 +144,45 @@ def _extract_features_from_strategy(
         expected_return = float(expected_return_override)
         return_std = max(float(return_std_override), 1e-9)
 
+    # M5 context signal
+    m5_score_raw = 0.0
+    try:
+        from src.strategy.m5_engine import M5SignalEngine
+        m5_candles = getattr(live_input, "m5_candles", None)
+        if m5_candles and len(m5_candles) >= 50:
+            m5_engine = M5SignalEngine()
+            m5_snap = m5_engine.compute(m5_candles)
+            if m5_snap:
+                m5_score_raw = m5_snap.composite_score
+    except Exception:
+        pass
+
+    # M15 structural signal
+    m15_score_raw = 0.0
+    try:
+        from src.strategy.m15_engine import M15SignalEngine
+        m15_engine = M15SignalEngine()
+        m15_snap = m15_engine.compute(live_input.m15_candles)
+        if m15_snap:
+            m15_score_raw = m15_snap.composite_score
+    except Exception:
+        pass
+
+    # M30/H1 Context signal
+    context_score_raw = 0.0
+    try:
+        from src.strategy.context_engine import ContextEngine
+        context_engine = ContextEngine()
+        context_snap = context_engine.compute(
+            h1_candles=live_input.h1_candles,
+            m30_candles=live_input.m30_candles,
+            d1_candles=live_input.d1_candles,
+        )
+        if context_snap:
+            context_score_raw = context_snap.composite_context
+    except Exception:
+        pass
+
     snapshot = feature_extractor.update(
         momentum_raw=momentum_raw,
         trend_raw=trend_raw,
@@ -144,6 +191,10 @@ def _extract_features_from_strategy(
         volatility_risk_raw=volatility_risk_raw,
         entry_distance_raw=entry_distance_raw,
         spread_danger_raw=spread_danger_raw,
+        orderflow_raw=orderflow_signal,
+        m5_score_raw=m5_score_raw,
+        m15_score_raw=m15_score_raw,
+        context_score_raw=context_score_raw,
         expected_return=expected_return,
         return_std=return_std,
         timestamp=getattr(live_input.m15_candles[-1], "timestamp", None),
@@ -182,11 +233,25 @@ def _clamp(value: float, lower: float, upper: float) -> float:
     return max(lower, min(upper, value))
 
 
-def _normalize_transaction_cost(*, price: float, spread: float) -> float:
+def _normalize_transaction_cost(*, price: float, spread: float, commission_per_lot: float = 0.0, lot: float = 0.01) -> float:
+    """Normalize total round-trip transaction cost into return space.
+
+    Includes:
+    - Spread (bid/ask cost, paid at entry and effectively again at exit)
+    - Estimated slippage (10% of spread as a conservative buffer)
+    - Commission round-trip converted to price units (commission_per_lot / lot_value)
+
+    All divided by price so the result is comparable with expected_return / CVaR.
+    """
     safe_price = max(float(price), 1e-9)
     safe_spread = max(float(spread), 0.0)
-    # Normalize spread into return space so it is comparable with expected_return/CVaR.
-    return safe_spread / safe_price
+    # Slippage estimated at 10% of spread
+    slippage_est = safe_spread * 0.10
+    # Commission: round-trip per lot, converted to price-return units
+    # commission_per_lot is in account currency per lot (e.g. $6 round-trip for HFM)
+    # Approximate lot value = price (works for XAUUSD/forex as crude proxy)
+    commission_cost = max(float(commission_per_lot), 0.0) / max(safe_price * max(float(lot), 0.01), 1e-9)
+    return (safe_spread + slippage_est + commission_cost) / safe_price
 
 
 def _fallback_volatility_state(live_input):
@@ -219,7 +284,7 @@ def _estimate_strategy_trade_statistics(
     from src.strategy.features import extract_expected_return
 
     current_price = float(live_input.m15_candles[-1].close)
-    normalized_cost = _normalize_transaction_cost(price=current_price, spread=spread)
+    normalized_cost = _normalize_transaction_cost(price=current_price, spread=spread, lot=requested_lot)
 
     if not getattr(strategy_result, "is_trade", False):
         expected_return, return_std = extract_expected_return(live_input.m15_candles, lookback=20)
@@ -414,6 +479,137 @@ def _format_quant_metrics(quant_decision, log_fn):
     )
 
 
+def _build_standard_training_state(
+    *,
+    mt5_module,
+    symbol: str,
+    live_input,
+    strategy_result,
+    positions,
+    quant_decision=None,
+) -> dict:
+    account_info = mt5_module.account_info() if hasattr(mt5_module, "account_info") else None
+    latest_candle = (getattr(live_input, "m15_candles", None) or [None])[-1]
+    timestamp = getattr(latest_candle, "timestamp", None)
+    if timestamp is None:
+        timestamp = datetime.now(timezone.utc)
+    elif getattr(timestamp, "tzinfo", None) is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    else:
+        timestamp = timestamp.astimezone(timezone.utc)
+
+    is_trade = bool(getattr(strategy_result, "is_trade", False))
+    direction = getattr(strategy_result, "direction", None)
+    planned_direction = direction.value if direction is not None else "None"
+    reason = str(getattr(strategy_result, "reason", "") or "")
+    metadata = getattr(strategy_result, "metadata", {}) or {}
+    score_decision = metadata.get("score_decision")
+    regime_state = metadata.get("regime_state")
+    volatility_state = metadata.get("volatility_state")
+    tick_data = getattr(live_input, "tick_data", {}) or {}
+    spread = float(getattr(live_input, "spread", 0.0) or 0.0)
+
+    confluence_score = float(metadata.get("pattern_confluence_score", 0.0) or 0.0)
+    quant_payload = {}
+    if quant_decision is not None:
+        quant_payload = {
+            "hurst": 0.0,
+            "reversion": 0.0,
+            "ofi": float(getattr(quant_decision, "omega_t", 0.0) or 0.0),
+            "kelly_lot": float(getattr(quant_decision, "lot_multiplier", 0.0) or 0.0),
+            "z_score": float(getattr(quant_decision, "sharpe_signal", 0.0) or 0.0),
+            "smoothness": float(getattr(quant_decision, "drawdown_dampener", 0.0) or 0.0),
+        }
+
+    return {
+        "timestamp": timestamp.isoformat(),
+        "account": {
+            "balance": float(getattr(account_info, "balance", 0.0) or 0.0),
+            "equity": float(getattr(account_info, "equity", 0.0) or 0.0),
+            "profit": float(getattr(account_info, "profit", 0.0) or 0.0),
+            "currency": str(getattr(account_info, "currency", "")) if account_info is not None else "",
+        },
+        "signals": {
+            "tick_dir": "None",
+            "m1_dir": "None",
+            "fib_dir": planned_direction if is_trade else "None",
+            "fib_zone": reason,
+            "rsi": 0.0,
+            "sar_dir": "None",
+            "quant": quant_payload,
+            "mtf": {
+                "m1": "None",
+                "m5": _latest_candle_direction(getattr(live_input, "m5_candles", [])),
+                "m15": _latest_candle_direction(getattr(live_input, "m15_candles", [])),
+                "h1": _latest_candle_direction(getattr(live_input, "h1_candles", [])),
+            },
+            "confluence": {
+                "fib_ok": is_trade,
+                "sar_ok": bool(regime_state and float(getattr(regime_state, "confidence", 0.0) or 0.0) >= 0.5),
+                "rsi_ok": bool(score_decision and float(getattr(score_decision, "edge", 0.0) or 0.0) > 0.0),
+            },
+        },
+        "market_data": {
+            "m1_candles": [_candle_to_training_dict(candle) for candle in (getattr(live_input, "m15_candles", []) or [])[-50:]],
+            "ticks": [
+                {
+                    "time": int(timestamp.timestamp()),
+                    "bid": float(tick_data.get("bid", 0.0) or 0.0),
+                    "ask": float(tick_data.get("ask", 0.0) or 0.0),
+                }
+            ]
+            if tick_data
+            else [],
+        },
+        "trading": {
+            "symbol": symbol,
+            "strategy_mode": "standard_live",
+            "candle_timeframe": "M15",
+            "positions_count": len(positions),
+            "status": reason,
+            "is_tradeable": is_trade,
+            "decision_reason": reason,
+            "failed_node": str(getattr(strategy_result, "failed_node", "") or ""),
+            "planned_direction": planned_direction,
+            "entry_price": float(getattr(strategy_result, "entry_price", 0.0) or 0.0),
+            "stop_loss": float(getattr(strategy_result, "stop_loss", 0.0) or 0.0),
+            "take_profit": float(getattr(strategy_result, "take_profit", 0.0) or 0.0),
+            "spread": spread,
+            "target_value": float(getattr(strategy_result, "take_profit", 0.0) or 0.0),
+            "target_progress": confluence_score,
+            "volatility_short_atr": float(getattr(volatility_state, "short_atr", 0.0) or 0.0) if volatility_state else 0.0,
+        },
+    }
+
+
+def _latest_candle_direction(candles) -> str:
+    if not candles:
+        return "None"
+    candle = candles[-1]
+    open_price = float(getattr(candle, "open", getattr(candle, "close", 0.0)) or 0.0)
+    close_price = float(getattr(candle, "close", 0.0) or 0.0)
+    if close_price > open_price:
+        return BreakoutDirection.BULLISH.value
+    if close_price < open_price:
+        return BreakoutDirection.BEARISH.value
+    return "None"
+
+
+def _candle_to_training_dict(candle) -> dict:
+    timestamp = getattr(candle, "timestamp", None)
+    if hasattr(timestamp, "timestamp"):
+        candle_time = int(timestamp.timestamp())
+    else:
+        candle_time = 0
+    return {
+        "time": candle_time,
+        "open": float(getattr(candle, "open", getattr(candle, "close", 0.0)) or 0.0),
+        "high": float(getattr(candle, "high", getattr(candle, "close", 0.0)) or 0.0),
+        "low": float(getattr(candle, "low", getattr(candle, "close", 0.0)) or 0.0),
+        "close": float(getattr(candle, "close", 0.0) or 0.0),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Main live loop
 # ---------------------------------------------------------------------------
@@ -431,6 +627,7 @@ def run_live_signal_loop(
     poll_seconds: int,
     max_loops: int | None = None,
     tradingview_alert_store=None,
+    orderflow_signal_store=None,
     strategy_profile=None,
     reload_check_fn=None,
     sleep_fn=sleep,
@@ -462,12 +659,71 @@ def run_live_signal_loop(
         else:
             log_fn("ML REGIME CLASSIFIER DISABLED (rule-based fallback)")
 
+    if orderflow_signal_store is None:
+        try:
+            from src.strategy.orderflow import OrderflowSignalStore
+
+            orderflow_signal_store = OrderflowSignalStore()
+        except Exception:
+            orderflow_signal_store = None
+
+    # MT5-native orderflow engine: computes delta/CVD/VWAP/imbalance
+    # directly from ticks — no external service required.
+    _live_orderflow_engine = None
+    try:
+        from src.strategy.orderflow_engine import LiveOrderflowEngine
+
+        _live_orderflow_engine = LiveOrderflowEngine(symbol, window=500)
+        log_fn(f"ORDERFLOW ENGINE ACTIVE {symbol} (MT5 tick-based, no external feed needed)")
+    except Exception as _oe_err:
+        log_fn(f"ORDERFLOW ENGINE DISABLED {symbol} reason={_oe_err}")
+
     loop_count = 0
     while max_loops is None or loop_count < max_loops:
         live_input = build_live_strategy_input(mt5_module, symbol)
         tradingview_alert = None
         if tradingview_alert_store is not None:
             tradingview_alert = tradingview_alert_store.latest_for(
+                symbol,
+                now=getattr(live_input.m15_candles[-1], "timestamp", None),
+            )
+        # ── MT5 orderflow polling ─────────────────────────────────────────
+        # Fetch latest ticks from MT5 and push into the engine every cycle.
+        # The computed signal is stored in orderflow_signal_store so the
+        # decision tree consumes it exactly as if it arrived via a webhook.
+        if _live_orderflow_engine is not None and orderflow_signal_store is not None:
+            try:
+                from src.quick_scalp_loop import fetch_recent_ticks
+                from src.strategy.orderflow import parse_orderflow_payload
+
+                raw_ticks = fetch_recent_ticks(mt5_module, symbol, count=500)
+                added = _live_orderflow_engine.ingest(raw_ticks)
+                if added > 0:
+                    payload = _live_orderflow_engine.to_signal_payload()
+                    if payload is not None:
+                        sig = parse_orderflow_payload(payload)
+                        orderflow_signal_store.record(sig)
+                        log_fn(
+                            f"ORDERFLOW {symbol} "
+                            f"ticks={len(_live_orderflow_engine._ticks)} "
+                            f"delta={payload['delta']:.2f} "
+                            f"cvd_slope={payload['cvd_slope']:.3f} "
+                            f"vwap={payload.get('vwap', 0):.2f} "
+                            f"vwap_bias={payload['vwap_bias']:.3f} "
+                            f"imbalance={payload['imbalance']:.3f} "
+                            f"profile_osc={payload.get('profile_location', 0):.3f} "
+                            f"POC={payload.get('poc', 0):.2f} "
+                            f"VAH={payload.get('vah', 0):.2f} "
+                            f"VAL={payload.get('val', 0):.2f} "
+                            f"vol_mom={payload.get('volume_momentum', 0):.3f}"
+                        )
+            except Exception as _of_poll_err:
+                log_fn(f"ORDERFLOW POLL WARN {symbol} reason={_of_poll_err}")
+        # ──────────────────────────────────────────────────────────────────
+
+        orderflow_signal = None
+        if orderflow_signal_store is not None:
+            orderflow_signal = orderflow_signal_store.latest_for(
                 symbol,
                 now=getattr(live_input.m15_candles[-1], "timestamp", None),
             )
@@ -483,9 +739,28 @@ def run_live_signal_loop(
             risk_buffer=risk_buffer,
             tradingview_alert=tradingview_alert,
             strategy_profile=strategy_profile,
+            orderflow_signal=orderflow_signal,
         )
 
         campaign_positions = executor.list_bot_positions(symbol)
+        
+        # --- 10-pip Fixed Trailing Stop Logic ---
+        trail_distance = 1.0 # 10 pips in Gold
+        current_price = float(live_input.m15_candles[-1].close)
+        for pos in campaign_positions:
+            new_sl = evaluate_fixed_trailing_stop(
+                position=pos,
+                current_price=current_price,
+                direction=_campaign_direction(pos),
+                trail_distance=trail_distance
+            )
+            if new_sl is not None:
+                try:
+                    executor.update_position_stop_loss(pos, new_sl)
+                    log_fn(f"TRAILING {symbol} ticket={getattr(pos, 'ticket', 'unknown')} new_sl={new_sl:.2f}")
+                except Exception as e:
+                    log_fn(f"TRAILING ERR {symbol} ticket={getattr(pos, 'ticket', 'unknown')} reason={e}")
+
         campaign_margin_snapshot = _build_margin_snapshot(
             mt5_module=getattr(executor, "mt5_module", None),
             symbol=symbol,
@@ -531,6 +806,7 @@ def run_live_signal_loop(
                 spread=spread,
                 expected_return_override=quant_trade_stats["expected_return"],
                 return_std_override=quant_trade_stats["return_std"],
+                orderflow_signal=orderflow_signal,
             )
 
             # Log features if enabled
@@ -544,6 +820,20 @@ def run_live_signal_loop(
 
             # Collect recent returns for CVaR
             recent_returns = list(quant_trade_stats["recent_returns"])
+
+            # Session and DXY Correlation Logic
+            session_eng = SessionEngine()
+            session_score = session_eng.compute_session_score(datetime.now(timezone.utc))
+            
+            dxy_trend = 0.0
+            try:
+                # Fetch USDIndex M15 candles to compute trend
+                from src.market_data import fetch_candles
+                dxy_candles = fetch_candles(mt5_module, "USDIndex", "TIMEFRAME_M15", 5)
+                if dxy_candles and len(dxy_candles) >= 5:
+                    dxy_trend = (dxy_candles[-1].close - dxy_candles[0].close) / dxy_candles[0].close * 1000.0 # Normalized
+            except Exception:
+                pass
 
             # Run master equation
             from src.strategy.quant_engine import evaluate_master_equation
@@ -559,6 +849,8 @@ def run_live_signal_loop(
                 avg_win=float(quant_trade_stats["avg_win"]),
                 avg_loss=float(quant_trade_stats["avg_loss"]),
                 continuation_context=quant_trade_stats.get("continuation_context"),
+                session_score=session_score,
+                dxy_trend=dxy_trend,
             )
 
             # Log quant metrics
@@ -585,7 +877,7 @@ def run_live_signal_loop(
                             stop_loss=float(strategy_result.stop_loss),
                             symbol_info=symbol_info,
                         )
-                        if symbol_info is not None
+                        if symbol_info is not None and getattr(strategy_result, "is_trade", False)
                         else 0.0
                     )
 
@@ -638,6 +930,17 @@ def run_live_signal_loop(
                         )
         else:
             strategy_result_for_execution = strategy_result
+
+        save_training_snapshot(
+            _build_standard_training_state(
+                mt5_module=mt5_module,
+                symbol=symbol,
+                live_input=live_input,
+                strategy_result=strategy_result_for_execution,
+                positions=campaign_positions,
+                quant_decision=quant_decision,
+            )
+        )
 
         if campaign_positions:
             try:

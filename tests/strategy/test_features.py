@@ -19,6 +19,7 @@ from src.strategy.features import (
     extract_spread_danger,
     extract_volume,
 )
+from src.strategy.orderflow import parse_orderflow_payload
 
 
 class TestRollingBuffer:
@@ -116,6 +117,30 @@ class TestFeatureExtractor:
 
         assert extractor.snapshot_count == 1
         assert len(extractor._buffers["momentum"]) == 1
+
+    def test_orderflow_raw_becomes_z_scored_feature(self):
+        extractor = FeatureExtractor(window=10)
+        signal = parse_orderflow_payload(
+            {
+                "symbol": "XAUUSD",
+                "delta": 1200,
+                "buyvolume": 1400,
+                "sellvolume": 200,
+                "cvd_slope": 0.8,
+                "imbalance": "buy_stacked",
+                "vwap_bias": "above",
+            }
+        )
+
+        snapshot = extractor.update(
+            momentum_raw=1.0, trend_raw=1.0, volume_raw=1.0,
+            order_block_raw=0.5, volatility_risk_raw=1.0,
+            entry_distance_raw=0.3, spread_danger_raw=0.1,
+            orderflow_raw=signal,
+        )
+
+        assert snapshot.orderflow_raw > 0.5
+        assert snapshot.orderflow_z == 0.0
 
 
 class TestExtractMomentum:

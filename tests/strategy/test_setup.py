@@ -4,6 +4,7 @@ from src.market_data import Candle
 from src.strategy.breakout import BreakoutDirection
 from src.strategy.context import H4Context
 from src.strategy.direction import DirectionDecision
+from src.strategy.orderflow import parse_orderflow_payload
 from src.strategy.setup import evaluate_m10_setup, evaluate_m30_setup
 from src.strategy.trigger import TriggerDecision
 from src.strategy.tradingview_confluence import TradingViewConfluence
@@ -58,6 +59,50 @@ def test_evaluate_m30_setup_marks_rejection_as_ready():
     assert result.reason == "m30_rejection_ready"
     assert result.setup_state == "rejecting_level"
     assert result.quality_score > 0
+
+
+def test_evaluate_m30_setup_blocks_ready_rejection_when_orderflow_conflicts():
+    direction_decision = DirectionDecision(
+        is_valid=True,
+        direction=BreakoutDirection.BULLISH,
+        reason="h1_bias_bullish",
+        metadata={},
+    )
+    h4_context = H4Context(
+        previous_session_high=110.0,
+        previous_session_low=96.0,
+        demand_zones=((101.0, 104.0),),
+        supply_zones=((112.0, 116.0),),
+        volume_profile_levels=(109.0, 106.0, 103.0),
+    )
+    orderflow = parse_orderflow_payload(
+        {
+            "symbol": "XAUUSD",
+            "delta": -900,
+            "buyvolume": 200,
+            "sellvolume": 1100,
+            "cvd_slope": -0.7,
+            "imbalance": "sell_stacked",
+            "vwap_bias": "below",
+        }
+    )
+
+    result = evaluate_m30_setup(
+        m30_candles=_candles(
+            [
+                (104.5, 105.0, 103.8, 104.0),
+                (104.0, 104.5, 103.6, 103.9),
+                (103.9, 106.4, 103.7, 106.0),
+            ]
+        ),
+        direction_decision=direction_decision,
+        h4_context=h4_context,
+        orderflow_signal=orderflow,
+    )
+
+    assert result.is_ready is False
+    assert result.reason == "m30_orderflow_conflict"
+    assert result.metadata["orderflow_alignment"] < -0.35
 
 
 def test_evaluate_m30_setup_rejects_dirty_midrange_location():

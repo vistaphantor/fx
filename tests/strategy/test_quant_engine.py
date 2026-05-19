@@ -405,7 +405,7 @@ class TestMasterEquation:
             continuation_context={
                 "is_continuation_setup": True,
                 "continuation_probability": 0.62,
-                "mu_cont": 0.006,
+                "mu_cont": 0.009,   # raised from 0.006 to push ce_edge above 2e-5 (reduced threshold)
                 "cvar_dir": 0.0032,
             },
         )

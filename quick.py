@@ -1,12 +1,26 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import is_dataclass, replace
 from typing import TYPE_CHECKING
 
 from src.requirements_check import ensure_requirements_satisfied
 
 from run import RELOAD_REQUESTED, build_code_watcher, configure_logging, create_mt5_module, restart_process, set_keep_awake
+import threading
+import subprocess
+import sys
+
+
+def start_dashboard():
+    """Start the dashboard server in a separate process."""
+    def run_server():
+        subprocess.Popen([sys.executable, "dashboard_server.py"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    
+    thread = threading.Thread(target=run_server, daemon=True)
+    thread.start()
+    logging.info("DASHBOARD SERVER STARTED at http://localhost:8000")
 
 if TYPE_CHECKING:
     from src.config import Settings
@@ -83,7 +97,13 @@ def main() -> int:
     configure_logging()
     set_keep_awake()
     settings = build_quick_runtime_settings(load_settings())
+    # Delete stale state file to prevent dashboard from showing old data
+    if os.path.exists("bot_state.json"):
+        try: os.remove("bot_state.json")
+        except: pass
+    
     code_watcher = build_code_watcher()
+    start_dashboard()
 
     mt5 = create_mt5_module()
     session = Mt5Session(
@@ -103,7 +123,16 @@ def main() -> int:
             password=settings.hfm_password,
             server=settings.hfm_server,
         )
+        # Auto-Correct: Remove Cent suffix if on Demo server
+        if "Demo" in settings.hfm_server and settings.trading_symbol.endswith("c"):
+            logging.info("DEMO SERVER DETECTED: Stripping 'c' from symbol for compatibility")
+            settings = replace(settings, trading_symbol=settings.trading_symbol[:-1])
+            
         logging.info("QUICK SCALPER START %s", format_quick_startup_summary(settings, account_info))
+        
+        # Clear stale state on startup
+        if os.path.exists("bot_state.json"):
+            os.remove("bot_state.json")
 
         executor = TradeExecutor(mt5)
         try:
@@ -118,6 +147,9 @@ def main() -> int:
                 poll_seconds=settings.quick_poll_seconds,
                 min_free_margin=settings.quick_min_free_margin,
                 max_loops=settings.max_live_loops,
+                atr_sl_multiplier=settings.quick_atr_sl_mult,
+                atr_tp_multiplier=settings.quick_atr_tp_mult,
+                max_spread_pips=settings.quick_max_spread_pips,
                 reload_check_fn=code_watcher.has_changes,
                 log_fn=logging.info,
             )

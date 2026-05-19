@@ -9,6 +9,7 @@ from src.strategy.context import build_daily_context, build_h4_context
 from src.strategy.direction import determine_h1_bias
 from src.strategy.gap import evaluate_gap_context
 from src.strategy.patterns import detect_three_drives
+from src.strategy.orderflow import OrderflowSignal
 from src.strategy.regime import classify_regime
 from src.strategy.risk import build_trade_levels
 from src.strategy.scoring import score_market_sides
@@ -52,6 +53,7 @@ def evaluate_top_down_decision_tree(
     risk_buffer: float,
     tradingview_alert: TradingViewAlert | None = None,
     strategy_profile: SymbolStrategyProfile | None = None,
+    orderflow_signal: OrderflowSignal | None = None,
 ) -> TopDownTradePlan | TopDownNoTrade:
     current_price = float((m5_candles or m15_candles)[-1].close)
     profile = strategy_profile or _default_strategy_profile(symbol)
@@ -71,6 +73,7 @@ def evaluate_top_down_decision_tree(
         h4_context=h4_context,
         gap_decision=gap_decision,
         tradingview_confluence=incoming_tradingview_confluence,
+        orderflow_signal=orderflow_signal,
     )
     if not direction_decision.is_valid or direction_decision.direction is None:
         return _no_trade(direction_decision.reason, "h1_direction", **direction_decision.metadata)
@@ -86,6 +89,7 @@ def evaluate_top_down_decision_tree(
         direction_decision=direction_decision,
         h4_context=h4_context,
         tradingview_confluence=tradingview_confluence,
+        orderflow_signal=orderflow_signal,
     )
     if not setup_decision.is_ready:
         return _no_trade(setup_decision.reason, "m30_setup", **setup_decision.metadata)

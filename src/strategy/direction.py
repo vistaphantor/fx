@@ -6,6 +6,7 @@ from src.market_data import Candle
 from src.strategy.breakout import BreakoutDirection
 from src.strategy.context import DailyContext, H4Context
 from src.strategy.gap import GapDecision
+from src.strategy.orderflow import OrderflowSignal, score_orderflow_for_direction
 from src.strategy.tradingview_confluence import TradingViewConfluence
 
 
@@ -26,6 +27,7 @@ def determine_h1_bias(
     h4_context: H4Context,
     gap_decision: GapDecision | None = None,
     tradingview_confluence: TradingViewConfluence | None = None,
+    orderflow_signal: OrderflowSignal | None = None,
 ) -> DirectionDecision:
     _require_timeframe(h1_candles, "H1", minimum=4)
 
@@ -179,6 +181,15 @@ def determine_h1_bias(
             in_context_zone=in_demand_zone,
         )
     ):
+        conflict = _orderflow_conflict_decision(
+            direction=BreakoutDirection.BULLISH,
+            signal=orderflow_signal,
+            metadata=common_metadata,
+            bullish_score=bullish_score,
+            bearish_score=bearish_score,
+        )
+        if conflict is not None:
+            return conflict
         return DirectionDecision(
             is_valid=True,
             direction=BreakoutDirection.BULLISH,
@@ -189,6 +200,15 @@ def determine_h1_bias(
         )
 
     if bullish_reversal_context and current_price < daily_context.objective_high:
+        conflict = _orderflow_conflict_decision(
+            direction=BreakoutDirection.BULLISH,
+            signal=orderflow_signal,
+            metadata=common_metadata,
+            bullish_score=bullish_score,
+            bearish_score=bearish_score,
+        )
+        if conflict is not None:
+            return conflict
         return DirectionDecision(
             is_valid=True,
             direction=BreakoutDirection.BULLISH,
@@ -211,6 +231,15 @@ def determine_h1_bias(
             in_context_zone=in_supply_zone,
         )
     ):
+        conflict = _orderflow_conflict_decision(
+            direction=BreakoutDirection.BEARISH,
+            signal=orderflow_signal,
+            metadata=common_metadata,
+            bullish_score=bullish_score,
+            bearish_score=bearish_score,
+        )
+        if conflict is not None:
+            return conflict
         return DirectionDecision(
             is_valid=True,
             direction=BreakoutDirection.BEARISH,
@@ -221,6 +250,15 @@ def determine_h1_bias(
         )
 
     if bearish_reversal_context:
+        conflict = _orderflow_conflict_decision(
+            direction=BreakoutDirection.BEARISH,
+            signal=orderflow_signal,
+            metadata=common_metadata,
+            bullish_score=bullish_score,
+            bearish_score=bearish_score,
+        )
+        if conflict is not None:
+            return conflict
         return DirectionDecision(
             is_valid=True,
             direction=BreakoutDirection.BEARISH,
@@ -235,6 +273,28 @@ def determine_h1_bias(
         direction=None,
         reason="h1_context_conflict",
         metadata=common_metadata,
+        bullish_contribution=float(bullish_score),
+        bearish_contribution=float(bearish_score),
+    )
+
+
+def _orderflow_conflict_decision(
+    *,
+    direction: BreakoutDirection,
+    signal: OrderflowSignal | None,
+    metadata: dict[str, object],
+    bullish_score: int,
+    bearish_score: int,
+) -> DirectionDecision | None:
+    score = score_orderflow_for_direction(signal, direction)
+    metadata.update(score.metadata)
+    if not score.is_conflicting:
+        return None
+    return DirectionDecision(
+        is_valid=False,
+        direction=None,
+        reason="h1_orderflow_conflict",
+        metadata=metadata,
         bullish_contribution=float(bullish_score),
         bearish_contribution=float(bearish_score),
     )

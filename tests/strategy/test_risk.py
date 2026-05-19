@@ -21,7 +21,7 @@ import pytest
             2351.25,
             0.05,
             2346.95,
-            2364.95,
+            2362.70,   # base 2.5R: entry + risk*2.5 = 2351.45 + 4.50*2.5
         ),
         (
             "BEARISH",
@@ -30,7 +30,7 @@ import pytest
             2328.0,
             0.05,
             2328.05,
-            2306.05,
+            2308.80,   # base 2.5R: entry - risk*2.5 = 2322.55 - 5.50*2.5
         ),
     ],
 )
@@ -62,8 +62,8 @@ def test_build_trade_levels_sets_stop_from_structure_and_target_at_three_r(
     assert levels.stop_loss == pytest.approx(expected_stop_loss)
     assert levels.take_profit == pytest.approx(expected_take_profit)
     assert levels.risk == pytest.approx(abs(entry_price - expected_stop_loss))
-    assert levels.reward == pytest.approx(levels.risk * 3)
-    assert levels.risk_reward_ratio == pytest.approx(3.0)
+    assert levels.reward == pytest.approx(levels.risk * 2.5)
+    assert levels.risk_reward_ratio == pytest.approx(2.5)
 
 
 def test_build_trade_levels_rejects_non_positive_buffer():

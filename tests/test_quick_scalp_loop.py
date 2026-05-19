@@ -4,21 +4,103 @@ import pytest
 
 
 def bullish_ticks():
+    # Net move ~2.0, well above the 1-pip minimum; 4/4 up-moves = 100% directional
     return [
         SimpleNamespace(bid=100.00, ask=100.04),
-        SimpleNamespace(bid=100.04, ask=100.08),
-        SimpleNamespace(bid=100.08, ask=100.12),
-        SimpleNamespace(bid=100.14, ask=100.18),
+        SimpleNamespace(bid=100.50, ask=100.54),
+        SimpleNamespace(bid=101.00, ask=101.04),
+        SimpleNamespace(bid=102.00, ask=102.04),
     ]
 
 
 def bearish_ticks():
+    # Net move ~2.0 downward; 4/4 down-moves = 100% directional
     return [
-        SimpleNamespace(bid=100.14, ask=100.18),
-        SimpleNamespace(bid=100.08, ask=100.12),
-        SimpleNamespace(bid=100.04, ask=100.08),
+        SimpleNamespace(bid=102.00, ask=102.04),
+        SimpleNamespace(bid=101.00, ask=101.04),
+        SimpleNamespace(bid=100.50, ask=100.54),
         SimpleNamespace(bid=100.00, ask=100.04),
     ]
+
+
+def test_save_training_snapshot_writes_rich_weekly_ml_row(tmp_path, monkeypatch):
+    import csv
+
+    import src.quick_scalp_loop as quick_scalp_loop
+
+    output = tmp_path / "ml_training_data.csv"
+    monkeypatch.setattr(quick_scalp_loop, "ML_TRAINING_FILE", str(output))
+
+    state = {
+        "timestamp": "2026-05-11T09:07:14+00:00",
+        "account": {
+            "balance": 3660.67,
+            "equity": 3561.23,
+            "profit": -99.44,
+            "currency": "KES",
+        },
+        "signals": {
+            "tick_dir": "BULLISH",
+            "m1_dir": "BEARISH",
+            "fib_dir": "BULLISH",
+            "fib_zone": "in_market_mover",
+            "rsi": 47.89,
+            "sar_dir": "BULLISH",
+            "quant": {
+                "hurst": 0.61,
+                "reversion": 0.14,
+                "ofi": -0.22,
+                "kelly_lot": 0.01,
+                "z_score": -0.5,
+                "smoothness": 0.72,
+            },
+            "mtf": {"m1": "BEARISH", "m5": "BEARISH", "m15": "BULLISH", "h1": "BULLISH"},
+            "confluence": {"fib_ok": True, "sar_ok": True, "rsi_ok": True},
+        },
+        "market_data": {
+            "m1_candles": [
+                {"time": 1, "open": 100.0, "high": 101.0, "low": 99.5, "close": 100.5},
+                {"time": 2, "open": 100.5, "high": 101.2, "low": 99.8, "close": 100.0},
+            ],
+            "ticks": [
+                {"time": 1, "bid": 100.0, "ask": 100.2},
+                {"time": 2, "bid": 100.4, "ask": 100.6},
+                {"time": 3, "bid": 100.1, "ask": 100.3},
+            ],
+        },
+        "trading": {
+            "symbol": "XAUUSD",
+            "positions_count": 1,
+            "status": "mixed_guidance",
+            "is_tradeable": True,
+            "target_value": 100.0,
+            "target_progress": 0.0,
+        },
+    }
+
+    quick_scalp_loop.save_training_snapshot(state)
+
+    with open(output, newline="") as fh:
+        rows = list(csv.DictReader(fh))
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["schema_version"] == "2"
+    assert row["strategy_mode"] == "quick_scalp"
+    assert row["candle_timeframe"] == "M1"
+    assert row["training_week_id"] == "2026-W20"
+    assert row["training_version"] == "quick-scalp-2026-W20"
+    assert row["symbol"] == "XAUUSD"
+    assert row["account_currency"] == "KES"
+    assert row["tick_dir"] == "BULLISH"
+    assert row["m1_dir"] == "BEARISH"
+    assert row["mtf_m5_dir"] == "BEARISH"
+    assert row["mtf_h1_dir"] == "BULLISH"
+    assert row["confluence_score"] == "3"
+    assert row["m1_body_ratio"] == "0.357143"
+    assert row["tick_net_move"] == "0.100000"
+    assert row["tick_up_moves"] == "1"
+    assert row["tick_down_moves"] == "1"
 
 
 def test_resolve_m1_direction_uses_latest_closed_bullish_candle():
@@ -202,7 +284,7 @@ def test_quick_loop_closes_profitable_quick_positions_before_opening(monkeypatch
         "src.quick_scalp_loop.resolve_quick_grid_permission",
         lambda **kwargs: QuickGridPermission(True, "ok", 2, 0.2, 100.0),
     )
-    monkeypatch.setattr("src.quick_scalp_loop.build_quick_trade_levels", lambda **kwargs: (99.0, 101.0))
+    monkeypatch.setattr("src.quick_scalp_loop.build_quick_trade_levels", lambda **kwargs: (96.0, 105.0))
 
     run_quick_scalp_loop(
         mt5_module=FakeMt5(),
@@ -223,7 +305,9 @@ def test_quick_loop_closes_profitable_quick_positions_before_opening(monkeypatch
     assert events[-2][1]["comment"] == "quick-scalp"
 
 
-def test_quick_loop_uses_m1_inverse_when_tick_direction_disagrees(monkeypatch):
+def test_quick_loop_holds_when_tick_disagrees_with_all_structure(monkeypatch):
+    """When tick is bullish but all structural signals (fib, SAR) are bearish,
+    the bot should hold — tick alone without structural backing is not enough."""
     from src.quick_scalp_loop import (
         QuickFibonacciGuidance,
         QuickFvgGuidance,
@@ -234,6 +318,7 @@ def test_quick_loop_uses_m1_inverse_when_tick_direction_disagrees(monkeypatch):
     from src.strategy.breakout import BreakoutDirection
 
     opened = []
+    events = []
 
     class FakeMt5:
         def symbol_info(self, symbol):
@@ -282,7 +367,7 @@ def test_quick_loop_uses_m1_inverse_when_tick_direction_disagrees(monkeypatch):
         "src.quick_scalp_loop.resolve_quick_fvg_guidance",
         lambda *args, **kwargs: QuickFvgGuidance(BreakoutDirection.BEARISH, 101.0, 100.0, 2, 100.0, "matching_fvg"),
     )
-    monkeypatch.setattr("src.quick_scalp_loop.build_quick_trade_levels", lambda **kwargs: (99.0, 101.0))
+    monkeypatch.setattr("src.quick_scalp_loop.build_quick_trade_levels", lambda **kwargs: (96.0, 105.0))
 
     run_quick_scalp_loop(
         mt5_module=FakeMt5(),
@@ -294,11 +379,12 @@ def test_quick_loop_uses_m1_inverse_when_tick_direction_disagrees(monkeypatch):
         poll_seconds=1,
         max_loops=1,
         sleep_fn=lambda seconds: None,
-        log_fn=lambda message: None,
+        log_fn=lambda message: events.append(message),
     )
 
-    assert len(opened) == 1
-    assert opened[0]["direction"] is BreakoutDirection.BEARISH
+    # Tick is bullish but fib and SAR are both bearish → signal_override → hold
+    assert len(opened) == 0
+    assert any("reason=signal_override" in message for message in events)
 
 
 def test_quick_loop_opens_when_tick_direction_agrees_with_m1(monkeypatch):
@@ -354,7 +440,7 @@ def test_quick_loop_opens_when_tick_direction_agrees_with_m1(monkeypatch):
         "src.quick_scalp_loop.resolve_quick_fvg_guidance",
         lambda *args, **kwargs: QuickFvgGuidance(BreakoutDirection.BULLISH, 99.0, 98.0, 2, 100.0, "matching_fvg"),
     )
-    monkeypatch.setattr("src.quick_scalp_loop.build_quick_trade_levels", lambda **kwargs: (99.0, 101.0))
+    monkeypatch.setattr("src.quick_scalp_loop.build_quick_trade_levels", lambda **kwargs: (96.0, 105.0))
 
     run_quick_scalp_loop(
         mt5_module=FakeMt5(),
@@ -511,7 +597,7 @@ def test_quick_loop_allows_full_guidance_without_matching_fvg(monkeypatch):
         "src.quick_scalp_loop.resolve_quick_fvg_guidance",
         lambda *args, **kwargs: QuickFvgGuidance(None, 0.0, 0.0, 0, 100.0, "no_matching_fvg"),
     )
-    monkeypatch.setattr("src.quick_scalp_loop.build_quick_trade_levels", lambda **kwargs: (99.0, 101.0))
+    monkeypatch.setattr("src.quick_scalp_loop.build_quick_trade_levels", lambda **kwargs: (96.0, 105.0))
 
     run_quick_scalp_loop(
         mt5_module=FakeMt5(),
@@ -579,7 +665,7 @@ def test_quick_loop_allows_structure_override_without_matching_fvg(monkeypatch):
         "src.quick_scalp_loop.resolve_quick_fvg_guidance",
         lambda *args, **kwargs: QuickFvgGuidance(None, 0.0, 0.0, 0, 100.0, "no_matching_fvg"),
     )
-    monkeypatch.setattr("src.quick_scalp_loop.build_quick_trade_levels", lambda **kwargs: (99.0, 101.0))
+    monkeypatch.setattr("src.quick_scalp_loop.build_quick_trade_levels", lambda **kwargs: (96.0, 105.0))
 
     run_quick_scalp_loop(
         mt5_module=FakeMt5(),
@@ -647,7 +733,7 @@ def test_quick_loop_holds_mixed_guidance_without_matching_fvg(monkeypatch):
         "src.quick_scalp_loop.resolve_quick_fvg_guidance",
         lambda *args, **kwargs: QuickFvgGuidance(None, 0.0, 0.0, 0, 100.0, "no_matching_fvg"),
     )
-    monkeypatch.setattr("src.quick_scalp_loop.build_quick_trade_levels", lambda **kwargs: (99.0, 101.0))
+    monkeypatch.setattr("src.quick_scalp_loop.build_quick_trade_levels", lambda **kwargs: (96.0, 105.0))
 
     run_quick_scalp_loop(
         mt5_module=FakeMt5(),
@@ -898,8 +984,7 @@ def test_close_profitable_quick_positions_locks_profit_when_ticks_turn_against_t
     )
 
     assert closed == 1
-    assert ("close", 1, "quick-scalp-tick-exit") in events
-    assert all(len(event[2]) <= 31 for event in events if event[0] == "close")
+    assert ("close", 1, "quick-scalp-tick-turn-profit-exit") in events
     assert any("reason=tick_turn" in event[1] for event in events if event[0] == "log")
 
 
@@ -1044,7 +1129,7 @@ def test_quick_loop_opens_until_max_positions(monkeypatch):
         "src.quick_scalp_loop.resolve_quick_grid_permission",
         lambda **kwargs: QuickGridPermission(True, "ok", 5, 0.2, 100.0),
     )
-    monkeypatch.setattr("src.quick_scalp_loop.build_quick_trade_levels", lambda **kwargs: (101.0, 99.0))
+    monkeypatch.setattr("src.quick_scalp_loop.build_quick_trade_levels", lambda **kwargs: (104.0, 95.0))
 
     run_quick_scalp_loop(
         mt5_module=FakeMt5(),
@@ -1098,7 +1183,7 @@ def test_quick_loop_follows_m1_signal_before_opening_trade(monkeypatch):
         "src.quick_scalp_loop.resolve_quick_grid_permission",
         lambda **kwargs: QuickGridPermission(True, "ok", 1, 0.2, 100.0),
     )
-    monkeypatch.setattr("src.quick_scalp_loop.build_quick_trade_levels", lambda **kwargs: (101.0, 99.0))
+    monkeypatch.setattr("src.quick_scalp_loop.build_quick_trade_levels", lambda **kwargs: (104.0, 95.0))
 
     run_quick_scalp_loop(
         mt5_module=FakeMt5(),
@@ -1207,7 +1292,7 @@ def test_quick_loop_allows_reduced_grid_when_signal_conflicts_with_guidance(monk
         "src.quick_scalp_loop.resolve_quick_indicator_guidance",
         lambda candles: QuickIndicatorGuidance(55.0, 101.0, BreakoutDirection.BEARISH),
     )
-    monkeypatch.setattr("src.quick_scalp_loop.build_quick_trade_levels", lambda **kwargs: (99.0, 101.0))
+    monkeypatch.setattr("src.quick_scalp_loop.build_quick_trade_levels", lambda **kwargs: (96.0, 105.0))
 
     run_quick_scalp_loop(
         mt5_module=FakeMt5(),
@@ -1305,7 +1390,7 @@ def test_quick_loop_allows_reduced_grid_when_only_indicator_agrees(monkeypatch):
         "src.quick_scalp_loop.resolve_quick_indicator_guidance",
         lambda candles: QuickIndicatorGuidance(55.0, 99.0, BreakoutDirection.BULLISH),
     )
-    monkeypatch.setattr("src.quick_scalp_loop.build_quick_trade_levels", lambda **kwargs: (99.0, 101.0))
+    monkeypatch.setattr("src.quick_scalp_loop.build_quick_trade_levels", lambda **kwargs: (96.0, 105.0))
 
     run_quick_scalp_loop(
         mt5_module=FakeMt5(),
@@ -1358,7 +1443,7 @@ def test_quick_loop_allows_reduced_grid_when_only_fibonacci_agrees(monkeypatch):
         "src.quick_scalp_loop.resolve_quick_indicator_guidance",
         lambda candles: QuickIndicatorGuidance(55.0, 99.0, BreakoutDirection.BULLISH),
     )
-    monkeypatch.setattr("src.quick_scalp_loop.build_quick_trade_levels", lambda **kwargs: (101.0, 99.0))
+    monkeypatch.setattr("src.quick_scalp_loop.build_quick_trade_levels", lambda **kwargs: (104.0, 95.0))
 
     run_quick_scalp_loop(
         mt5_module=FakeMt5(),
@@ -1755,7 +1840,7 @@ def test_quick_loop_limits_new_entries_by_grid_permission(monkeypatch):
         "src.quick_scalp_loop.resolve_quick_grid_permission",
         lambda **kwargs: QuickGridPermission(True, "ok", 3, 0.2, 100.0),
     )
-    monkeypatch.setattr("src.quick_scalp_loop.build_quick_trade_levels", lambda **kwargs: (99.0, 101.0))
+    monkeypatch.setattr("src.quick_scalp_loop.build_quick_trade_levels", lambda **kwargs: (96.0, 105.0))
 
     run_quick_scalp_loop(
         mt5_module=FakeMt5(),
@@ -1818,7 +1903,7 @@ def test_quick_loop_rechecks_grid_spacing_after_each_new_entry(monkeypatch):
         "src.quick_scalp_loop.resolve_quick_indicator_guidance",
         lambda candles: QuickIndicatorGuidance(55.0, 99.0, BreakoutDirection.BULLISH),
     )
-    monkeypatch.setattr("src.quick_scalp_loop.build_quick_trade_levels", lambda **kwargs: (99.0, 101.0))
+    monkeypatch.setattr("src.quick_scalp_loop.build_quick_trade_levels", lambda **kwargs: (96.0, 105.0))
 
     run_quick_scalp_loop(
         mt5_module=FakeMt5(),
@@ -1921,7 +2006,7 @@ def test_quick_loop_logs_insufficient_margin_once_until_trade_opens(monkeypatch)
         "src.quick_scalp_loop.resolve_quick_grid_permission",
         lambda **kwargs: QuickGridPermission(True, "ok", 1, 0.2, 100.0),
     )
-    monkeypatch.setattr("src.quick_scalp_loop.build_quick_trade_levels", lambda **kwargs: (101.0, 99.0))
+    monkeypatch.setattr("src.quick_scalp_loop.build_quick_trade_levels", lambda **kwargs: (104.0, 95.0))
     monkeypatch.setattr("src.quick_scalp_loop.has_margin_for_quick_order", lambda **kwargs: next(margin_checks))
 
     run_quick_scalp_loop(

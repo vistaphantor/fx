@@ -5,6 +5,7 @@ from src.strategy.breakout import BreakoutDirection
 from src.strategy.context import DailyContext, H4Context
 from src.strategy.direction import determine_h1_bias
 from src.strategy.gap import GapDecision
+from src.strategy.orderflow import parse_orderflow_payload
 from src.strategy.tradingview_confluence import TradingViewConfluence
 
 
@@ -187,6 +188,46 @@ def test_determine_h1_bias_uses_tradingview_bonus_to_pass_borderline_alignment()
 
     assert result.is_valid is True
     assert result.direction is BreakoutDirection.BULLISH
+
+
+def test_determine_h1_bias_blocks_when_orderflow_strongly_conflicts():
+    daily_context = DailyContext(
+        daily_high=112.0,
+        daily_low=100.0,
+        current_price=106.0,
+        range_position=0.5,
+        objective_high=112.0,
+        objective_low=100.0,
+    )
+    h4_context = H4Context(
+        previous_session_high=110.0,
+        previous_session_low=96.0,
+        demand_zones=((101.0, 104.0),),
+        supply_zones=((108.0, 131.0),),
+        volume_profile_levels=(111.0, 107.0, 103.0),
+    )
+    orderflow = parse_orderflow_payload(
+        {
+            "symbol": "XAUUSD",
+            "delta": -1200,
+            "buyvolume": 300,
+            "sellvolume": 1500,
+            "cvd_slope": -0.8,
+            "imbalance": "sell_stacked",
+            "vwap_bias": "below",
+        }
+    )
+
+    result = determine_h1_bias(
+        h1_candles=_candles([100.0, 101.5, 103.0, 104.0, 106.0]),
+        daily_context=daily_context,
+        h4_context=h4_context,
+        orderflow_signal=orderflow,
+    )
+
+    assert result.is_valid is False
+    assert result.reason == "h1_orderflow_conflict"
+    assert result.metadata["orderflow_alignment"] < -0.35
 
 
 def test_determine_h1_bias_allows_reversal_context_bullish_bias_at_extreme_demand():

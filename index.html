@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HFM Quantum Ultra V2</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+    <script src="https://unpkg.com/lightweight-charts@3.8.0/dist/lightweight-charts.standalone.production.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        :root {
+            --bg: #030508;
+            --card-bg: rgba(10, 15, 25, 0.95);
+            --accent: #00d2ff;
+            --success: #00ff88;
+            --error: #ff3366;
+            --text: #e6edf3;
+            --text-dim: #8b949e;
+            --border: rgba(48, 54, 61, 0.5);
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            background-color: var(--bg); color: var(--text); font-family: 'Inter', sans-serif;
+            background-image: 
+                radial-gradient(circle at 50% 0%, rgba(0, 210, 255, 0.08) 0%, transparent 50%),
+                radial-gradient(circle at 0% 100%, rgba(0, 255, 136, 0.05) 0%, transparent 40%);
+            min-height: 100vh; overflow-x: hidden;
+        }
+
+        .container { max-width: 1800px; margin: 0 auto; padding: 1rem; }
+
+        header {
+            display: flex; justify-content: space-between; align-items: center;
+            margin-bottom: 1rem; padding: 1rem; background: var(--card-bg); border-radius: 1rem; border: 1px solid var(--border);
+        }
+
+        .logo-area h1 {
+            font-size: 1.5rem; font-weight: 800; letter-spacing: 4px;
+            background: linear-gradient(90deg, #00d2ff, #00ff88, #00d2ff);
+            background-size: 200% auto; -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+            animation: shine 8s linear infinite;
+        }
+        @keyframes shine { to { background-position: 200% center; } }
+
+        .grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 1rem; }
+
+        .card { background: var(--card-bg); backdrop-filter: blur(30px); border: 1px solid var(--border); border-radius: 1rem; padding: 1.25rem; transition: transform 0.2s; }
+        .card:hover { border-color: var(--accent); }
+
+        .card-title { font-size: 0.7rem; font-weight: 800; color: var(--text-dim); text-transform: uppercase; letter-spacing: 2px; margin-bottom: 1rem; display: flex; justify-content: space-between; }
+
+        /* Math Pillar Row */
+        .math-pillar-card { grid-column: span 2; text-align: center; background: linear-gradient(180deg, rgba(255,255,255,0.02) 0%, transparent 100%); }
+        .math-val { font-size: 1.75rem; font-weight: 800; color: var(--accent); font-family: 'JetBrains Mono'; margin: 0.25rem 0; }
+        .math-label { font-size: 0.6rem; color: var(--text-dim); font-weight: 700; }
+
+        /* Main Section */
+        .chart-main { grid-column: span 9; height: 550px; }
+        .side-stats { grid-column: span 3; display: flex; flex-direction: column; gap: 1rem; }
+
+        /* MTF & Confluence */
+        .mtf-item { display: flex; justify-content: space-between; padding: 0.75rem; border-radius: 0.5rem; background: rgba(0,0,0,0.3); border: 1px solid var(--border); margin-bottom: 0.5rem; font-size: 0.85rem; }
+        
+        .panic-btn {
+            background: rgba(255, 51, 102, 0.1); border: 1px solid var(--error); color: var(--error);
+            padding: 0.75rem 1.5rem; border-radius: 0.75rem; cursor: pointer; font-weight: 800; font-size: 0.8rem;
+            transition: all 0.3s; text-transform: uppercase;
+        }
+        .panic-btn:hover { background: var(--error); color: white; box-shadow: 0 0 30px rgba(255, 51, 102, 0.5); }
+
+        .gauge-container { width: 100%; height: 14px; background: rgba(0,0,0,0.4); border-radius: 7px; overflow: hidden; margin: 1rem 0; border: 1px solid var(--border); }
+        .gauge-fill { height: 100%; background: linear-gradient(90deg, var(--accent), var(--success)); transition: width 0.5s cubic-bezier(0.175, 0.885, 0.32, 1.275); }
+
+        .history-card { grid-column: span 12; max-height: 250px; overflow-y: auto; border: 1px solid rgba(255,255,255,0.05); }
+        .history-table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+        .history-table th { text-align: left; color: var(--text-dim); padding: 1rem; border-bottom: 1px solid var(--border); background: rgba(0,0,0,0.2); }
+        .history-table td { padding: 1rem; border-bottom: 1px solid rgba(255,255,255,0.02); font-family: 'JetBrains Mono'; }
+
+        .trend-up { color: var(--success); }
+        .trend-down { color: var(--error); }
+        .trend-neutral { color: var(--text-dim); }
+
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="logo-area"><h1>QUANTUM ULTRA V2</h1></div>
+            <div style="display: flex; gap: 1.5rem; align-items: center;">
+                <div id="connection-status" style="font-size: 0.75rem; color: var(--success); font-weight: 800; letter-spacing: 1px;">● STATISTICAL ENGINE ONLINE</div>
+                <button class="panic-btn" onclick="triggerPanic()">Panic: Close All</button>
+            </div>
+        </header>
+
+        <div class="grid">
+            <!-- Math Pillars -->
+            <div class="card math-pillar-card"><div class="math-label">Hurst (Trend)</div><div class="math-val" id="hurst-val">0.50</div></div>
+            <div class="card math-pillar-card"><div class="math-label">Z-Score (Extreme)</div><div class="math-val" id="z-val">0.00</div></div>
+            <div class="card math-pillar-card"><div class="math-label">Smoothness (ACF)</div><div class="math-val" id="smooth-val">0.00</div></div>
+            <div class="card math-pillar-card"><div class="math-label">Reversion (OU)</div><div class="math-val" id="rev-val">0.00</div></div>
+            <div class="card math-pillar-card"><div class="math-label">Order Flow (OFI)</div><div class="math-val" id="ofi-val">0.00</div></div>
+            <div class="card math-pillar-card"><div class="math-label">Kelly Lot</div><div class="math-val" id="kelly-val">0.01</div></div>
+
+            <!-- Charts -->
+            <div class="card chart-main">
+                <div class="card-title">Live Quantum Feed (M1)</div>
+                <div id="m1Chart" style="height: 100%; width: 100%;"></div>
+            </div>
+
+            <!-- Side Stats -->
+            <div class="side-stats">
+                <div class="card">
+                    <div class="card-title">Account Pulse</div>
+                    <div class="mtf-item"><span>Equity</span><b id="equity">SYNCING...</b></div>
+                    <div class="mtf-item"><span>Balance</span><b id="balance">SYNCING...</b></div>
+                    <div class="mtf-item"><span>Profit</span><b id="profit">0.00</b></div>
+                </div>
+
+                <div class="card">
+                    <div class="card-title">Target Goal <span id="gauge-pct">0%</span></div>
+                    <div class="gauge-container"><div id="gauge-fill" class="gauge-fill" style="width: 0%"></div></div>
+                    <div style="text-align: center; font-size: 0.6rem; color: var(--text-dim)">TARGET: +$0.75 USD</div>
+                </div>
+
+                <div class="card">
+                    <div class="card-title">MTF Correlation</div>
+                    <div class="mtf-item"><span>M1 Trend</span><b id="mtf-m1">--</b></div>
+                    <div class="mtf-item"><span>M5 Trend</span><b id="mtf-m5">--</b></div>
+                    <div class="mtf-item"><span>M15 Trend</span><b id="mtf-m15">--</b></div>
+                    <div class="mtf-item"><span>H1 Trend</span><b id="mtf-h1">--</b></div>
+                </div>
+            </div>
+
+            <!-- History -->
+            <div class="card history-card">
+                <div class="card-title">Execution History</div>
+                <table class="history-table">
+                    <thead><tr><th>Time</th><th>Ticket</th><th>Reason</th><th>Profit (USD)</th></tr></thead>
+                    <tbody id="history-body"></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let m1Chart, m1Series;
+
+        function initCharts() {
+            const m1Options = {
+                layout: { backgroundColor: 'transparent', textColor: '#8b949e' },
+                grid: { vertLines: { color: 'rgba(48, 54, 61, 0.05)' }, horzLines: { color: 'rgba(48, 54, 61, 0.05)' } },
+                leftPriceScale: { visible: true, borderColor: 'rgba(48, 54, 61, 0.4)' },
+                rightPriceScale: { visible: false },
+                timeScale: { borderColor: 'rgba(48, 54, 61, 0.4)', timeVisible: true },
+            };
+            m1Chart = LightweightCharts.createChart(document.getElementById('m1Chart'), m1Options);
+            m1Series = m1Chart.addCandlestickSeries({ upColor: '#00ff88', downColor: '#ff3366', borderVisible: false });
+        }
+
+        async function triggerPanic() {
+            if (confirm("LIQUIDATE ALL? Warning: Instant market exit.")) {
+                await fetch('/api/panic');
+                alert("Signal transmitted.");
+            }
+        }
+
+        async function updateDashboard() {
+            try {
+                const res = await fetch('/api/state');
+                const data = await res.json();
+                if (data.status === "waiting_for_bot") return;
+
+                // Math Row
+                if (data.signals.quant) {
+                    document.getElementById('hurst-val').innerText = data.signals.quant.hurst.toFixed(2);
+                    document.getElementById('z-val').innerText = data.signals.quant.z_score.toFixed(2);
+                    document.getElementById('smooth-val').innerText = data.signals.quant.smoothness.toFixed(2);
+                    document.getElementById('rev-val').innerText = data.signals.quant.reversion.toFixed(2);
+                    document.getElementById('ofi-val').innerText = data.signals.quant.ofi.toFixed(2);
+                    document.getElementById('kelly-val').innerText = data.signals.quant.kelly_lot.toFixed(2);
+                    
+                    // Z-Score Warning
+                    const z = Math.abs(data.signals.quant.z_score);
+                    document.getElementById('z-val').className = 'math-val ' + (z > 2.0 ? 'trend-up' : '');
+                }
+
+                document.getElementById('equity').innerText = data.account.equity.toFixed(2);
+                document.getElementById('balance').innerText = data.account.balance.toFixed(2);
+                document.getElementById('profit').innerText = data.account.profit.toFixed(2);
+                document.getElementById('profit').className = data.account.profit >= 0 ? 'trend-up' : 'trend-down';
+
+                const pct = data.trading.target_progress || 0;
+                document.getElementById('gauge-pct').innerText = pct + '%';
+                document.getElementById('gauge-fill').style.width = pct + '%';
+                
+                if (data.account.currency) {
+                    const targetVal = data.trading.target_value || 0;
+                    document.getElementById('target-label').innerText = `TARGET: +${targetVal.toFixed(2)} ${data.account.currency}`;
+                }
+
+                if (data.signals.mtf) {
+                    updateTrend('mtf-m1', data.signals.mtf.m1);
+                    updateTrend('mtf-m5', data.signals.mtf.m5);
+                    updateTrend('mtf-m15', data.signals.mtf.m15);
+                    updateTrend('mtf-h1', data.signals.mtf.h1);
+                }
+
+                if (data.market_data && data.market_data.m1_candles) m1Series.setData(data.market_data.m1_candles);
+
+                const hist = document.getElementById('history-body');
+                if (data.trading && data.trading.history) {
+                    hist.innerHTML = data.trading.history.slice().reverse().map(t => `
+                        <tr>
+                            <td>${new Date(t.time).toLocaleTimeString()}</td>
+                            <td>${t.ticket}</td>
+                            <td>${t.reason}</td>
+                            <td class="${t.profit >= 0 ? 'trend-up' : 'trend-down'}">${t.profit >= 0 ? '+' : ''}${t.profit.toFixed(2)}</td>
+                        </tr>
+                    `).join('');
+                }
+            } catch (e) {}
+        }
+
+        function updateTrend(id, val) {
+            const el = document.getElementById(id);
+            el.innerText = val;
+            el.className = (val === 'BULLISH' ? 'trend-up' : val === 'BEARISH' ? 'trend-down' : 'trend-neutral');
+        }
+
+        initCharts();
+        setInterval(updateDashboard, 1000);
+    </script>
+</body>
+</html>

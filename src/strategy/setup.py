@@ -7,6 +7,7 @@ from src.market_data import Candle
 from src.strategy.breakout import BreakoutDirection
 from src.strategy.context import H4Context
 from src.strategy.direction import DirectionDecision
+from src.strategy.orderflow import OrderflowSignal, score_orderflow_for_direction
 from src.strategy.tradingview_confluence import TradingViewConfluence
 
 if TYPE_CHECKING:
@@ -28,6 +29,7 @@ def evaluate_m30_setup(
     direction_decision: DirectionDecision,
     h4_context: H4Context,
     tradingview_confluence: TradingViewConfluence | None = None,
+    orderflow_signal: OrderflowSignal | None = None,
 ) -> SetupDecision:
     _require_timeframe(m30_candles, "M30", minimum=3)
     if not direction_decision.is_valid or direction_decision.direction is None:
@@ -68,6 +70,16 @@ def evaluate_m30_setup(
             "best_state_score": best_state_score,
             **continuation_metadata,
         }
+        orderflow_score = score_orderflow_for_direction(orderflow_signal, BreakoutDirection.BULLISH)
+        state_metadata.update(orderflow_score.metadata)
+        if orderflow_score.is_conflicting:
+            return SetupDecision(
+                is_ready=False,
+                reason="m30_orderflow_conflict",
+                setup_state="blocked",
+                metadata=state_metadata,
+                quality_score=0.0,
+            )
         if latest.close > latest.open and latest.low <= demand_upper:
             return SetupDecision(
                 is_ready=True,
@@ -173,6 +185,16 @@ def evaluate_m30_setup(
             "best_state_score": best_state_score,
             **continuation_metadata,
         }
+        orderflow_score = score_orderflow_for_direction(orderflow_signal, BreakoutDirection.BEARISH)
+        state_metadata.update(orderflow_score.metadata)
+        if orderflow_score.is_conflicting:
+            return SetupDecision(
+                is_ready=False,
+                reason="m30_orderflow_conflict",
+                setup_state="blocked",
+                metadata=state_metadata,
+                quality_score=0.0,
+            )
         if latest.close < latest.open and latest.high >= supply_lower:
             return SetupDecision(
                 is_ready=True,

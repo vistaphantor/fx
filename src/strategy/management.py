@@ -20,6 +20,26 @@ class CampaignAction:
     metadata: dict[str, object] = field(default_factory=dict)
 
 
+def evaluate_fixed_trailing_stop(*, position, current_price: float, direction: BreakoutDirection, trail_distance: float = 1.0) -> float | None:
+    """Computes a new stop loss based on a fixed distance from the peak price."""
+    entry_price = _position_entry_price(position)
+    current_sl = _position_current_stop_loss(position)
+    
+    if direction is BreakoutDirection.BULLISH:
+        # For BUYS: SL = CurrentPrice - Distance
+        # We only trail if the new SL is tighter than the current SL
+        candidate_sl = current_price - trail_distance
+        if current_sl is None or candidate_sl > current_sl:
+            return candidate_sl
+    else:
+        # For SELLS: SL = CurrentPrice + Distance
+        candidate_sl = current_price + trail_distance
+        if current_sl is None or candidate_sl < current_sl:
+            return candidate_sl
+            
+    return None
+
+
 def remember_position_initial_stop_loss(position, stop_loss: float | None = None, entry_price: float | None = None) -> None:
     resolved_entry_price = float(entry_price) if entry_price is not None else _position_entry_price(position)
     resolved_stop = stop_loss
@@ -104,7 +124,7 @@ def evaluate_campaign_action(
             metadata={"campaign_exposure_pct": campaign_exposure_pct},
         )
 
-    if latest_trade_r_multiple >= 1.0:
+    if latest_trade_r_multiple >= 1.5:
         latest_position = positions[-1]
         entry_price = _position_entry_price(latest_position)
         initial_stop_loss = _position_initial_stop_loss(latest_position, entry_price)
@@ -186,7 +206,7 @@ def _build_stop_updates(*, positions, current_price: float, direction: BreakoutD
 
 
 def _breakeven_trigger_r(*, breakeven_distance: float, risk: float) -> float:
-    return min(breakeven_distance, risk) / risk
+    return float(breakeven_distance)
 
 
 def _locked_r_multiple(progress_r: float) -> int:

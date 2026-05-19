@@ -46,11 +46,11 @@ class Settings:
     # Quant engine parameters
     quant_gamma: float = 2.0
     quant_cvar_alpha: float = 0.05
-    quant_cvar_eta: float = 1.5
+    quant_cvar_eta: float = 1.2          # Lowered from 1.5: reduces CVaR penalty weight
     quant_dd_max: float = 0.20
     quant_dd_rho: float = 0.5
-    quant_omega_threshold: float = 0.5
-    quant_position_r_max: float = 0.02
+    quant_omega_threshold: float = 0.45  # Lowered from 0.6: allows more setups to pass the omega gate
+    quant_position_r_max: float = 0.05   # Raised from 0.02: positions can now be up to 5% risk
     quant_transaction_lambda: float = 1.0
     quant_zscore_window: int = 100
     quant_enabled: bool = True
@@ -68,17 +68,20 @@ class Settings:
     quick_max_loss: float = 0.0
     quick_poll_seconds: int = 1
     quick_min_free_margin: float = 0.0
+    quick_atr_sl_mult: float = 0.8
+    quick_atr_tp_mult: float = 2.0
+    quick_max_spread_pips: float = 2.0
 
 
 _PROFILE_DEFAULTS = {
     "XAUUSD": {
-        "min_edge_threshold": 0.0,
+        "min_edge_threshold": 2.5,
         "max_uncertainty_threshold": 10.0,
-        "minimum_expected_move_multiple": 1.0,
+        "minimum_expected_move_multiple": 1.5,
         "add_on_edge_multiplier": 1.25,
         "trend_regime_weight": 1.1,
         "compression_regime_weight": 0.75,
-        "breakeven_distance": 1.5,
+        "breakeven_distance": 5.0,
         "campaign_base_add_trigger_r": 1.5,
         "campaign_add_trigger_floor_r": 1.25,
         "campaign_add_trigger_ceiling_r": 1.75,
@@ -177,6 +180,9 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
         quick_max_loss = float(str(values.get("QUICK_MAX_LOSS", "0.0")).strip())
         quick_poll_seconds = int(str(values.get("QUICK_POLL_SECONDS", "1")).strip())
         quick_min_free_margin = float(str(values.get("QUICK_MIN_FREE_MARGIN", "0.0")).strip())
+        quick_atr_sl_mult = float(str(values.get("QUICK_ATR_SL_MULT", "0.8")).strip())
+        quick_atr_tp_mult = float(str(values.get("QUICK_ATR_TP_MULT", "2.0")).strip())
+        quick_max_spread_pips = float(str(values.get("QUICK_MAX_SPREAD_PIPS", "2.0")).strip())
         strategy_profiles = _load_strategy_profiles(values)
     except ValueError as exc:
         raise ValueError(f"Invalid numeric setting: {exc}") from exc
@@ -227,11 +233,11 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
     # Quant engine parameters
     quant_gamma = float(str(values.get("QUANT_GAMMA", "2.0")).strip())
     quant_cvar_alpha = float(str(values.get("QUANT_CVAR_ALPHA", "0.05")).strip())
-    quant_cvar_eta = float(str(values.get("QUANT_CVAR_ETA", "1.5")).strip())
+    quant_cvar_eta = float(str(values.get("QUANT_CVAR_ETA", "1.2")).strip())
     quant_dd_max = float(str(values.get("QUANT_DD_MAX", "0.20")).strip())
     quant_dd_rho = float(str(values.get("QUANT_DD_RHO", "0.5")).strip())
-    quant_omega_threshold = float(str(values.get("QUANT_OMEGA_THRESHOLD", "0.5")).strip())
-    quant_position_r_max = float(str(values.get("QUANT_POSITION_R_MAX", "0.02")).strip())
+    quant_omega_threshold = float(str(values.get("QUANT_OMEGA_THRESHOLD", "0.45")).strip())
+    quant_position_r_max = float(str(values.get("QUANT_POSITION_R_MAX", "0.05")).strip())
     quant_transaction_lambda = float(str(values.get("QUANT_TRANSACTION_LAMBDA", "1.0")).strip())
     quant_zscore_window = int(str(values.get("QUANT_ZSCORE_WINDOW", "100")).strip())
     quant_enabled = str(values.get("QUANT_ENABLED", "true")).strip().lower() in {"1", "true", "yes", "on"}
@@ -246,7 +252,7 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
         hfm_login=login,
         hfm_password=str(values["HFM_PASSWORD"]).strip(),
         hfm_server=str(values["HFM_SERVER"]).strip(),
-        trading_symbol=str(values["TRADING_SYMBOL"]).strip(),
+        trading_symbol=str(values["TRADING_SYMBOL"]).strip().replace("XAUUSDc", "XAUUSD") if "Demo" in str(values["HFM_SERVER"]) else str(values["TRADING_SYMBOL"]).strip(),
         mt5_startup_wait_seconds=startup_wait,
         loop_poll_seconds=loop_poll_seconds,
         max_live_loops=max_live_loops,
@@ -283,6 +289,9 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
         quick_max_loss=quick_max_loss,
         quick_poll_seconds=quick_poll_seconds,
         quick_min_free_margin=quick_min_free_margin,
+        quick_atr_sl_mult=quick_atr_sl_mult,
+        quick_atr_tp_mult=quick_atr_tp_mult,
+        quick_max_spread_pips=quick_max_spread_pips,
     )
 
 

@@ -70,6 +70,226 @@ def test_live_loop_opens_entry_when_decision_tree_returns_trade(monkeypatch):
     assert ("log", "LIVE TRADE OPENED XAUUSD ticket=99 direction=BULLISH entry=2350.0 sl=2345.0 tp=2365.0") in events
 
 
+def test_live_loop_writes_standard_mode_training_snapshot(monkeypatch):
+    from src.live_trade_loop import run_live_signal_loop
+    from src.strategy.breakout import BreakoutDirection
+    from src.strategy.decision_tree import TopDownNoTrade
+
+    snapshots = []
+    candle = SimpleNamespace(
+        timestamp=datetime(2026, 5, 11, 9, 15, tzinfo=timezone.utc),
+        open=2348.0,
+        high=2352.0,
+        low=2347.5,
+        close=2350.0,
+    )
+    live_input = SimpleNamespace(
+        d1_candles=[candle],
+        h4_candles=[candle],
+        h1_candles=[candle],
+        m30_candles=[candle],
+        m15_candles=[candle],
+        spread=0.25,
+        tick_data={"bid": 2349.9, "ask": 2350.15},
+    )
+    no_trade = TopDownNoTrade(
+        is_trade=False,
+        reason="m15_setup_not_ready",
+        failed_node="m15_setup",
+        metadata={},
+    )
+
+    class FakeMt5:
+        def account_info(self):
+            return SimpleNamespace(balance=3660.67, equity=3601.25, profit=-59.42, currency="KES")
+
+    class FakeExecutor:
+        def list_bot_positions(self, symbol):
+            return []
+
+    monkeypatch.setattr("src.live_trade_loop.build_live_strategy_input", lambda mt5_module, symbol: live_input)
+    monkeypatch.setattr("src.live_trade_loop.evaluate_top_down_decision_tree", lambda **kwargs: no_trade)
+    monkeypatch.setattr("src.live_trade_loop.save_training_snapshot", lambda state: snapshots.append(state))
+
+    run_live_signal_loop(
+        mt5_module=FakeMt5(),
+        executor=FakeExecutor(),
+        symbol="XAUUSD",
+        lot=0.01,
+        risk_buffer=0.05,
+        max_candles_since_breakout=3,
+        poll_seconds=10,
+        max_loops=1,
+        sleep_fn=lambda seconds: None,
+        log_fn=lambda message: None,
+    )
+
+    assert len(snapshots) == 1
+    snapshot = snapshots[0]
+    assert snapshot["trading"]["strategy_mode"] == "standard_live"
+    assert snapshot["trading"]["candle_timeframe"] == "M15"
+    assert snapshot["trading"]["decision_reason"] == "m15_setup_not_ready"
+    assert snapshot["trading"]["failed_node"] == "m15_setup"
+    assert snapshot["trading"]["planned_direction"] == "None"
+    assert snapshot["market_data"]["m1_candles"][-1]["close"] == 2350.0
+
+    from src.quick_scalp_loop import build_training_snapshot_row
+
+    row = build_training_snapshot_row(snapshot)
+    assert row["strategy_mode"] == "standard_live"
+    assert row["training_version"] == "standard-live-2026-W20"
+
+
+def test_live_loop_passes_orderflow_signal_to_strategy_and_quant(monkeypatch):
+    from src.live_trade_loop import run_live_signal_loop
+    from src.strategy.decision_tree import TopDownNoTrade
+    from src.strategy.features import FeatureSnapshot
+    from src.strategy.orderflow import parse_orderflow_payload
+    from src.strategy.quant_engine import QuantDecision
+
+    captured = {}
+    signal = parse_orderflow_payload(
+        {
+            "symbol": "GC",
+            "target_symbol": "XAUUSD",
+            "delta": -900,
+            "cvd_slope": -0.6,
+            "imbalance": "sell_stacked",
+            "vwap_bias": "below",
+        }
+    )
+    candle = SimpleNamespace(
+        timestamp=datetime(2026, 5, 13, 9, 15, tzinfo=timezone.utc),
+        open=2350.0,
+        high=2351.0,
+        low=2348.0,
+        close=2349.0,
+    )
+    live_input = SimpleNamespace(
+        d1_candles=[candle],
+        h4_candles=[candle],
+        h1_candles=[candle],
+        m30_candles=[candle],
+        m15_candles=[candle],
+        spread=0.25,
+        tick_data={},
+    )
+    settings = SimpleNamespace(
+        quant_enabled=True,
+        quant_gamma=2.0,
+        quant_cvar_alpha=0.05,
+        quant_cvar_eta=1.2,
+        quant_dd_max=0.20,
+        quant_dd_rho=0.5,
+        quant_omega_threshold=0.45,
+        quant_position_r_max=0.05,
+        quant_transaction_lambda=1.0,
+        quant_zscore_window=100,
+        ml_enabled=False,
+        feature_logging_enabled=False,
+    )
+
+    class FakeOrderflowStore:
+        def latest_for(self, symbol, now=None):
+            captured["store_symbol"] = symbol
+            captured["store_now"] = now
+            return signal
+
+    class FakeEquityTracker:
+        drawdown_ratio = 0.0
+
+        def update(self, equity):
+            return None
+
+    class FakeExecutor:
+        def list_bot_positions(self, symbol):
+            return []
+
+    def fake_tree(**kwargs):
+        captured["tree_orderflow"] = kwargs["orderflow_signal"]
+        return TopDownNoTrade(False, "m30_orderflow_conflict", "m30_setup", {})
+
+    def fake_extract(**kwargs):
+        captured["extract_orderflow"] = kwargs["orderflow_signal"]
+        return (
+            FeatureSnapshot(
+                timestamp=candle.timestamp,
+                momentum_raw=0.0,
+                trend_raw=0.0,
+                volume_raw=1.0,
+                order_block_raw=0.0,
+                volatility_risk_raw=1.0,
+                entry_distance_raw=0.0,
+                spread_danger_raw=0.0,
+                momentum_z=0.0,
+                trend_z=0.0,
+                volume_z=0.0,
+                order_block_z=0.0,
+                volatility_risk_z=0.0,
+                entry_distance_z=0.0,
+                spread_danger_z=0.0,
+                expected_return=0.0,
+                return_std=1.0,
+            ),
+            0.0,
+            1.0,
+        )
+
+    monkeypatch.setattr("src.live_trade_loop.build_live_strategy_input", lambda mt5_module, symbol: live_input)
+    monkeypatch.setattr("src.live_trade_loop.evaluate_top_down_decision_tree", fake_tree)
+    monkeypatch.setattr("src.live_trade_loop._build_feature_extractor", lambda settings: SimpleNamespace(snapshot_count=5))
+    monkeypatch.setattr("src.live_trade_loop._build_equity_tracker", lambda settings: FakeEquityTracker())
+    monkeypatch.setattr("src.live_trade_loop._estimate_strategy_trade_statistics", lambda **kwargs: {
+        "win_rate": 0.5,
+        "avg_win": 1.0,
+        "avg_loss": 1.0,
+        "expected_return": 0.0,
+        "return_std": 1.0,
+        "recent_returns": [],
+        "transaction_cost": 0.0,
+        "continuation_context": None,
+    })
+    monkeypatch.setattr("src.live_trade_loop._extract_features_from_strategy", fake_extract)
+    monkeypatch.setattr("src.live_trade_loop.save_training_snapshot", lambda state: None)
+    monkeypatch.setattr(
+        "src.strategy.quant_engine.evaluate_master_equation",
+        lambda **kwargs: QuantDecision(
+            action=0,
+            omega_t=0.0,
+            position_size_fraction=0.0,
+            expected_return=0.0,
+            cvar=0.0,
+            drawdown_ratio=0.0,
+            drawdown_dampener=1.0,
+            utility_scores={-1: 0.0, 0: 0.0, 1: 0.0},
+            sharpe_signal=0.0,
+            reason="master_equation_flat",
+            is_trade=False,
+            metadata={},
+        ),
+    )
+
+    run_live_signal_loop(
+        mt5_module=SimpleNamespace(account_info=lambda: SimpleNamespace(equity=10000.0)),
+        executor=FakeExecutor(),
+        symbol="XAUUSD",
+        lot=0.01,
+        risk_buffer=0.05,
+        max_candles_since_breakout=3,
+        poll_seconds=10,
+        max_loops=1,
+        orderflow_signal_store=FakeOrderflowStore(),
+        sleep_fn=lambda seconds: None,
+        log_fn=lambda message: None,
+        settings=settings,
+    )
+
+    assert captured["store_symbol"] == "XAUUSD"
+    assert captured["store_now"] == candle.timestamp
+    assert captured["tree_orderflow"] is signal
+    assert captured["extract_orderflow"] is signal
+
+
 def test_live_loop_logs_order_rejection_without_crashing(monkeypatch):
     from src.live_trade_loop import run_live_signal_loop
     from src.strategy.breakout import BreakoutDirection

@@ -42,7 +42,7 @@ def test_top_down_strategy_builds_bullish_plan_from_htf_bias_and_m15_velocity():
     assert result.reason == "top_down_trade_plan_ready"
     assert result.entry_price == pytest.approx(108)
     assert result.stop_loss == pytest.approx(100.95)
-    assert result.take_profit == pytest.approx(129.15)
+    assert result.take_profit == pytest.approx(125.625)  # 2.5R base: entry + risk*2.5 = 108 + 7.05*2.5
     assert result.metadata["daily_objective"] == pytest.approx(111.0)
 
 

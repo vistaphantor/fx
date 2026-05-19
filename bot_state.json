@@ -1,0 +1,753 @@
+{
+  "timestamp": "2026-05-14T19:18:28.883016+00:00",
+  "account": {
+    "balance": 4429.29,
+    "equity": 4429.29,
+    "profit": 0.0,
+    "currency": "KES"
+  },
+  "signals": {
+    "tick_dir": "None",
+    "m1_dir": "BEARISH",
+    "fib_dir": "None",
+    "fib_zone": "None",
+    "rsi": 0.0,
+    "sar_dir": "None",
+    "confluence": {
+      "fib_ok": false,
+      "sar_ok": false,
+      "rsi_ok": false
+    }
+  },
+  "market_data": {
+    "m1_candles": [
+      {
+        "time": 1778795280,
+        "open": 4669.55,
+        "high": 4669.83,
+        "low": 4669.16,
+        "close": 4669.69
+      },
+      {
+        "time": 1778795340,
+        "open": 4669.68,
+        "high": 4669.69,
+        "low": 4668.73,
+        "close": 4669.52
+      },
+      {
+        "time": 1778795400,
+        "open": 4669.58,
+        "high": 4670.18,
+        "low": 4669.16,
+        "close": 4669.91
+      },
+      {
+        "time": 1778795460,
+        "open": 4669.92,
+        "high": 4670.22,
+        "low": 4669.35,
+        "close": 4669.35
+      },
+      {
+        "time": 1778795520,
+        "open": 4669.33,
+        "high": 4669.54,
+        "low": 4669.04,
+        "close": 4669.29
+      },
+      {
+        "time": 1778795580,
+        "open": 4669.23,
+        "high": 4669.47,
+        "low": 4668.25,
+        "close": 4668.97
+      },
+      {
+        "time": 1778795640,
+        "open": 4669.07,
+        "high": 4669.14,
+        "low": 4668.12,
+        "close": 4668.12
+      },
+      {
+        "time": 1778795700,
+        "open": 4668.13,
+        "high": 4670.17,
+        "low": 4667.97,
+        "close": 4669.74
+      },
+      {
+        "time": 1778795760,
+        "open": 4669.72,
+        "high": 4670.0,
+        "low": 4669.38,
+        "close": 4669.45
+      },
+      {
+        "time": 1778795820,
+        "open": 4669.47,
+        "high": 4669.49,
+        "low": 4668.68,
+        "close": 4668.78
+      },
+      {
+        "time": 1778795880,
+        "open": 4668.77,
+        "high": 4671.09,
+        "low": 4668.77,
+        "close": 4670.97
+      },
+      {
+        "time": 1778795940,
+        "open": 4670.95,
+        "high": 4671.76,
+        "low": 4670.82,
+        "close": 4671.55
+      },
+      {
+        "time": 1778796000,
+        "open": 4671.66,
+        "high": 4671.79,
+        "low": 4669.87,
+        "close": 4671.0
+      },
+      {
+        "time": 1778796060,
+        "open": 4671.01,
+        "high": 4671.38,
+        "low": 4670.29,
+        "close": 4670.3
+      },
+      {
+        "time": 1778796120,
+        "open": 4670.3,
+        "high": 4670.75,
+        "low": 4669.86,
+        "close": 4669.92
+      },
+      {
+        "time": 1778796180,
+        "open": 4669.94,
+        "high": 4669.95,
+        "low": 4668.51,
+        "close": 4669.04
+      },
+      {
+        "time": 1778796240,
+        "open": 4669.07,
+        "high": 4669.23,
+        "low": 4668.24,
+        "close": 4668.76
+      },
+      {
+        "time": 1778796300,
+        "open": 4668.77,
+        "high": 4669.04,
+        "low": 4667.46,
+        "close": 4667.46
+      },
+      {
+        "time": 1778796360,
+        "open": 4667.39,
+        "high": 4667.6,
+        "low": 4667.15,
+        "close": 4667.24
+      },
+      {
+        "time": 1778796420,
+        "open": 4667.25,
+        "high": 4668.09,
+        "low": 4666.79,
+        "close": 4668.05
+      },
+      {
+        "time": 1778796480,
+        "open": 4668.05,
+        "high": 4668.69,
+        "low": 4667.92,
+        "close": 4668.69
+      },
+      {
+        "time": 1778796540,
+        "open": 4668.72,
+        "high": 4668.97,
+        "low": 4668.52,
+        "close": 4668.97
+      },
+      {
+        "time": 1778796600,
+        "open": 4668.95,
+        "high": 4669.2,
+        "low": 4668.6,
+        "close": 4668.65
+      },
+      {
+        "time": 1778796660,
+        "open": 4668.63,
+        "high": 4668.98,
+        "low": 4668.25,
+        "close": 4668.4
+      },
+      {
+        "time": 1778796720,
+        "open": 4668.39,
+        "high": 4668.62,
+        "low": 4668.04,
+        "close": 4668.61
+      },
+      {
+        "time": 1778796780,
+        "open": 4668.62,
+        "high": 4668.69,
+        "low": 4666.83,
+        "close": 4666.9
+      },
+      {
+        "time": 1778796840,
+        "open": 4666.92,
+        "high": 4667.96,
+        "low": 4666.89,
+        "close": 4667.4
+      },
+      {
+        "time": 1778796900,
+        "open": 4667.42,
+        "high": 4667.83,
+        "low": 4667.31,
+        "close": 4667.68
+      },
+      {
+        "time": 1778796960,
+        "open": 4667.69,
+        "high": 4667.96,
+        "low": 4667.52,
+        "close": 4667.81
+      },
+      {
+        "time": 1778797020,
+        "open": 4667.8,
+        "high": 4667.82,
+        "low": 4667.13,
+        "close": 4667.13
+      }
+    ],
+    "ticks": [
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      },
+      {
+        "time": 0,
+        "bid": 0,
+        "ask": 0
+      }
+    ]
+  },
+  "trading": {
+    "symbol": "XAUUSD",
+    "strategy_mode": "quick_scalp",
+    "candle_timeframe": "M1",
+    "positions_count": 0,
+    "status": "Scanning/Waiting",
+    "is_tradeable": false,
+    "history": [
+      {
+        "time": "2026-05-14T16:19:23.936785+00:00",
+        "ticket": 101194662,
+        "profit": 103.35,
+        "reason": "profit_target"
+      },
+      {
+        "time": "2026-05-14T16:23:41.792664+00:00",
+        "ticket": 101195796,
+        "profit": 108.52,
+        "reason": "profit_target"
+      },
+      {
+        "time": "2026-05-14T16:33:17.525716+00:00",
+        "ticket": 101199079,
+        "profit": 103.35,
+        "reason": "profit_target"
+      },
+      {
+        "time": "2026-05-14T16:36:14.921782+00:00",
+        "ticket": 101201479,
+        "profit": 121.44,
+        "reason": "profit_target"
+      },
+      {
+        "time": "2026-05-14T16:39:48.261299+00:00",
+        "ticket": 101203290,
+        "profit": 142.11,
+        "reason": "profit_target"
+      },
+      {
+        "time": "2026-05-14T16:45:45.417073+00:00",
+        "ticket": 101204511,
+        "profit": 161.49,
+        "reason": "profit_target"
+      },
+      {
+        "time": "2026-05-14T16:56:14.279055+00:00",
+        "ticket": 101208456,
+        "profit": 170.54,
+        "reason": "profit_target"
+      },
+      {
+        "time": "2026-05-14T17:01:44.575114+00:00",
+        "ticket": 101210413,
+        "profit": 144.65,
+        "reason": "profit_target"
+      },
+      {
+        "time": "2026-05-14T17:08:56.013078+00:00",
+        "ticket": 101211730,
+        "profit": 109.78,
+        "reason": "profit_target"
+      },
+      {
+        "time": "2026-05-14T17:22:02.714999+00:00",
+        "ticket": 101214033,
+        "profit": 134.32,
+        "reason": "profit_target"
+      },
+      {
+        "time": "2026-05-14T17:23:16.838785+00:00",
+        "ticket": 101214207,
+        "profit": 102.03,
+        "reason": "profit_target"
+      },
+      {
+        "time": "2026-05-14T17:25:28.591466+00:00",
+        "ticket": 101214365,
+        "profit": 126.57,
+        "reason": "profit_target"
+      },
+      {
+        "time": "2026-05-14T17:26:16.972105+00:00",
+        "ticket": 101214811,
+        "profit": 111.07,
+        "reason": "profit_target"
+      },
+      {
+        "time": "2026-05-14T17:26:26.401961+00:00",
+        "ticket": 101214848,
+        "profit": 131.74,
+        "reason": "profit_target"
+      },
+      {
+        "time": "2026-05-14T17:45:40.581548+00:00",
+        "ticket": 101217275,
+        "profit": 116.24,
+        "reason": "profit_target"
+      },
+      {
+        "time": "2026-05-14T17:46:46.027381+00:00",
+        "ticket": 101217348,
+        "profit": 105.91,
+        "reason": "profit_target"
+      },
+      {
+        "time": "2026-05-14T17:53:00.567316+00:00",
+        "ticket": 101218631,
+        "profit": 109.78,
+        "reason": "profit_target"
+      },
+      {
+        "time": "2026-05-14T17:54:34.864222+00:00",
+        "ticket": 101218944,
+        "profit": 116.24,
+        "reason": "profit_target"
+      },
+      {
+        "time": "2026-05-14T18:01:28.326377+00:00",
+        "ticket": 101220541,
+        "profit": 346.14,
+        "reason": "profit_target"
+      },
+      {
+        "time": "2026-05-14T18:03:05.021159+00:00",
+        "ticket": 101221093,
+        "profit": 148.53,
+        "reason": "profit_target"
+      },
+      {
+        "time": "2026-05-14T18:04:20.360959+00:00",
+        "ticket": 101221425,
+        "profit": 112.37,
+        "reason": "profit_target"
+      },
+      {
+        "time": "2026-05-14T18:09:25.803928+00:00",
+        "ticket": 101222459,
+        "profit": 113.66,
+        "reason": "profit_target"
+      },
+      {
+        "time": "2026-05-14T18:23:23.279924+00:00",
+        "ticket": 101224747,
+        "profit": 126.57,
+        "reason": "profit_target"
+      },
+      {
+        "time": "2026-05-14T18:28:01.332061+00:00",
+        "ticket": 101225224,
+        "profit": 118.82,
+        "reason": "profit_target"
+      },
+      {
+        "time": "2026-05-14T18:30:34.501372+00:00",
+        "ticket": 101226131,
+        "profit": 130.45,
+        "reason": "profit_target"
+      },
+      {
+        "time": "2026-05-14T18:37:06.398960+00:00",
+        "ticket": 101226680,
+        "profit": 103.32,
+        "reason": "profit_target"
+      },
+      {
+        "time": "2026-05-14T18:39:13.375323+00:00",
+        "ticket": 101226953,
+        "profit": 123.99,
+        "reason": "profit_target"
+      },
+      {
+        "time": "2026-05-14T18:43:33.432162+00:00",
+        "ticket": 101227583,
+        "profit": 237.65,
+        "reason": "profit_target"
+      },
+      {
+        "time": "2026-05-14T18:45:31.552319+00:00",
+        "ticket": 101227893,
+        "profit": 126.57,
+        "reason": "profit_target"
+      },
+      {
+        "time": "2026-05-14T18:55:29.176403+00:00",
+        "ticket": 101229836,
+        "profit": 109.78,
+        "reason": "profit_target"
+      },
+      {
+        "time": "2026-05-14T18:57:37.991543+00:00",
+        "ticket": 101230139,
+        "profit": 104.62,
+        "reason": "profit_target"
+      },
+      {
+        "time": "2026-05-14T19:00:31.160743+00:00",
+        "ticket": 101230690,
+        "profit": 102.03,
+        "reason": "profit_target"
+      },
+      {
+        "time": "2026-05-14T19:03:48.398393+00:00",
+        "ticket": 101231060,
+        "profit": 118.91,
+        "reason": "profit_target"
+      },
+      {
+        "time": "2026-05-14T19:06:01.323674+00:00",
+        "ticket": 101231275,
+        "profit": 107.28,
+        "reason": "profit_target"
+      }
+    ],
+    "target_value": 100.0
+  }
+}

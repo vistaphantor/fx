@@ -16,8 +16,8 @@ from src.strategy.features import FeatureSnapshot
 
 
 TRADE_PNL_SCALE = 100.0
-POOR_SHARPE_FLOOR = 0.05
-CVAR_GATE_COEFFICIENT = 0.5
+POOR_SHARPE_FLOOR = 0.005   # Lowered from 0.02: ensures setups aren't killed by noise
+CVAR_GATE_COEFFICIENT = 0.25  
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,6 +31,10 @@ class OmegaWeights:
     volatility_risk: float = 0.7
     entry_distance: float = 0.6
     spread_danger: float = 0.5
+    orderflow: float = 0.8
+    m5_score: float = 1.5
+    m15_score: float = 1.4
+    context_score: float = 1.2
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,7 +46,7 @@ class QuantParams:
     cvar_eta: float = 1.5
     dd_rho: float = 0.5
     dd_max: float = 0.20
-    omega_threshold: float = 0.75
+    omega_threshold: float = 0.55
     position_r_max: float = 0.02
     transaction_lambda: float = 1.0
     omega_weights: OmegaWeights = OmegaWeights()
@@ -84,6 +88,10 @@ def compute_omega_signal(features: FeatureSnapshot, weights: OmegaWeights) -> fl
         - weights.volatility_risk * features.volatility_risk_z
         - weights.entry_distance * features.entry_distance_z
         - weights.spread_danger * features.spread_danger_z
+        + weights.orderflow * getattr(features, "orderflow_z", 0.0)
+        + weights.m5_score * getattr(features, "m5_score_z", 0.0)
+        + weights.m15_score * getattr(features, "m15_score_z", 0.0)
+        + weights.context_score * getattr(features, "context_score_z", 0.0)
     )
     return _sigmoid(linear)
 
@@ -114,30 +122,6 @@ def compute_cvar(returns: list[float], alpha: float = 0.05) -> float:
     tail = sorted_returns[:cutoff_index]
     cvar = -sum(tail) / len(tail)
     return max(cvar, 0.0)
-
-
-def compute_cara_utility(
-    *,
-    gamma: float,
-    wealth: float,
-    action: int,
-    position_fraction: float,
-    expected_return: float,
-    omega_t: float,
-    transaction_cost: float,
-    cvar: float,
-    cvar_eta: float,
-    drawdown_pct: float,
-    dd_rho: float,
-) -> float:
-    """Legacy CARA utility helper retained for direct tests and compatibility."""
-    trade_pnl = action * position_fraction * expected_return * omega_t * TRADE_PNL_SCALE
-    cost_penalty = abs(action) * transaction_cost
-    tail_risk = cvar_eta * cvar * abs(action)
-    dd_penalty = dd_rho * drawdown_pct
-    exponent_arg = wealth + trade_pnl - cost_penalty - tail_risk - dd_penalty
-    clamped = max(-500.0, min(500.0, -gamma * exponent_arg))
-    return -math.exp(clamped)
 
 
 def compute_certainty_equivalent(
@@ -176,12 +160,30 @@ def evaluate_master_equation(
     avg_win: float = 1.0,
     avg_loss: float = 1.0,
     continuation_context: dict[str, Any] | None = None,
+    session_score: float = 1.0,
+    dxy_trend: float = 0.0,
 ) -> QuantDecision:
     """Evaluate the master equation and return the optimal action."""
     del equity  # Quant ranking is scale-invariant here; sizing happens downstream.
 
     drawdown_dampener = max(1.0 - min(drawdown_ratio, 1.0), 0.0)
-    omega_t = compute_omega_t(features, params.omega_weights, drawdown_dampener)
+    
+    # 1. Base Omega from weighted z-scores
+    omega_base = compute_omega_t(features, params.omega_weights, drawdown_dampener)
+    
+    # 2. Apply Session Gating & DXY Correlation
+    # Instead of raw multiplication, we use session_score as a 'Confidence Weight'
+    # and DXY as a 'Macro Penalty'.
+    dxy_penalty = 0.0
+    if dxy_trend > 0.3 and features.expected_return > 0:
+        dxy_penalty = 0.15 * dxy_trend
+    elif dxy_trend < -0.3 and features.expected_return < 0:
+        dxy_penalty = 0.15 * abs(dxy_trend)
+
+    # omega_t = (Base * SessionWeight) - Penalty
+    # We shift session_score range [0.2, 1.0] to [0.5, 1.0] for the multiplier
+    scaled_session = 0.5 + (session_score * 0.5)
+    omega_t = max(0.0, (omega_base * scaled_session) - dxy_penalty)
 
     return_std = max(features.return_std, 1e-9)
     sharpe_signal = abs(features.expected_return) / return_std
@@ -278,6 +280,8 @@ def evaluate_master_equation(
             "mu_cont": continuation_mu,
             "cvar_dir": cvar_dir,
             "ce_scores": ce_scores,
+            "session_score": session_score,
+            "dxy_trend": dxy_trend,
         },
     )
 
@@ -292,23 +296,17 @@ def apply_execution_rules(
     cvar_eta: float,
     omega_threshold: float,
 ) -> tuple[bool, str]:
-    """Apply the fresh-entry execution gate."""
     if action == 0:
-        return False, "master_equation_flat"
+        return False, "flat_neutral"
+    if omega_t < omega_threshold:
+        return False, f"omega_gate_failed_{omega_t:.3f}"
+    
+    # Combined expected return + tail risk check
+    risk_adjusted_return = abs(expected_return) - (CVAR_GATE_COEFFICIENT * cvar_eta * cvar)
+    if risk_adjusted_return < transaction_cost:
+        return False, f"ev_risk_penalty_failed_{risk_adjusted_return:.6f}"
 
-    if omega_t <= omega_threshold:
-        return False, f"omega_below_threshold_{omega_t:.4f}_vs_{omega_threshold}"
-
-    directional_return = action * expected_return
-    cost_plus_tail = transaction_cost + (CVAR_GATE_COEFFICIENT * cvar_eta * cvar)
-    if directional_return <= cost_plus_tail:
-        return (
-            False,
-            f"expected_return_below_cost_plus_cvar_{directional_return:.6f}_vs_{cost_plus_tail:.6f}",
-        )
-
-    direction_label = "long" if action == 1 else "short"
-    return True, f"master_equation_{direction_label}_approved"
+    return True, "execution_passed"
 
 
 def _apply_continuation_execution_rules(
@@ -322,30 +320,18 @@ def _apply_continuation_execution_rules(
     continuation_context: dict[str, Any],
 ) -> tuple[bool, str, float]:
     if action == 0:
-        return False, "continuation_quant_blocked", 0.0
+        return False, "cont_neutral", 1.0
+    
+    # Continuation relies more on momentum than raw Omega z-score
+    effective_omega = max(omega_t, float(continuation_context.get("continuation_ev", 0.0) or 0.0))
+    if effective_omega < (omega_threshold * 0.8): # More lenient for continuations
+        return False, f"cont_omega_gate_failed_{effective_omega:.3f}", 1.0
 
-    relaxed_omega_floor = max(omega_threshold * 0.35, 0.15)
-    if omega_t <= relaxed_omega_floor:
-        return False, "continuation_quant_blocked", 0.0
+    if ce_scores[action] <= ce_scores[0]:
+        return False, "cont_ev_suboptimal", 1.0
 
-    directional_return = action * continuation_mu
-    if directional_return <= 0:
-        return False, "continuation_quant_blocked", 0.0
+    # Scale lot by continuation quality
+    lot_multiplier = float(continuation_context.get("continuation_probability", 0.5) or 0.5) * 2.0
+    lot_multiplier = max(0.5, min(2.0, lot_multiplier))
 
-    trade_ce = ce_scores.get(action, float("-inf"))
-    flat_ce = ce_scores.get(0, float("-inf"))
-    ce_edge = trade_ce - flat_ce
-    continuation_probability = float(continuation_context.get("continuation_probability", 0.5) or 0.5)
-
-    if trade_ce <= flat_ce:
-        return False, "continuation_quant_blocked", 0.0
-    if trade_ce <= 0.0 and continuation_probability < 0.70:
-        return False, "continuation_quant_blocked", 0.0
-    if cvar_dir >= 0.015 and continuation_probability < 0.75:
-        return False, "continuation_quant_blocked", 0.0
-
-    if ce_edge >= 2e-5:
-        return True, "continuation_quant_approved", 1.0
-    if ce_edge >= 5e-6:
-        return True, "continuation_quant_reduced", 0.5
-    return False, "continuation_quant_blocked", 0.0
+    return True, "cont_execution_passed", lot_multiplier

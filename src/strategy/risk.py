@@ -53,9 +53,10 @@ def build_trade_levels(
     retest_structure_high = float(retest_structure_high)
     buffer = float(buffer)
 
-    # Dynamic R:R based on trade quality
+    # Dynamic R:R based on trade quality.
+    # Base 2.5R ensures a positive-expectancy floor; bonus kicks in above omega_t=0.60.
     omega_clamped = max(0.0, min(1.0, omega_t))
-    reward_multiplier = 3.0 + 2.0 * max(0.0, (omega_clamped - 0.75) / 0.25)
+    reward_multiplier = 2.5 + 2.5 * max(0.0, (omega_clamped - 0.60) / 0.40)
     reward_multiplier = min(reward_multiplier, 5.0)
 
     if direction is BreakoutDirection.BULLISH:
@@ -75,8 +76,9 @@ def build_trade_levels(
     reward = risk * reward_multiplier
     risk_reward_ratio = reward / risk
 
-    # Transaction cost estimate (spread + small commission estimate)
-    transaction_cost = max(float(spread), 0.0) + risk * 0.001
+    # Transaction cost: spread (round-trip) + 10% slippage buffer on top.
+    # Commission is accounted for separately in the live execution layer.
+    transaction_cost = max(float(spread), 0.0) * 1.10
 
     # Breakeven probability: minimum win rate needed to break even
     breakeven_probability = transaction_cost / (reward + transaction_cost) if reward > 0 else 1.0

@@ -22,6 +22,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from src.strategy.breakout import BreakoutDirection
+
 
 @dataclass(frozen=True, slots=True)
 class FeatureSnapshot:
@@ -50,6 +52,14 @@ class FeatureSnapshot:
     # Derived
     expected_return: float = 0.0
     return_std: float = 1.0
+    orderflow_raw: float = 0.0
+    orderflow_z: float = 0.0
+    m5_score_raw: float = 0.0
+    m5_score_z: float = 0.0
+    m15_score_raw: float = 0.0
+    m15_score_z: float = 0.0
+    context_score_raw: float = 0.0
+    context_score_z: float = 0.0
 
 
 class RollingBuffer:
@@ -120,6 +130,10 @@ class FeatureExtractor:
         "volatility_risk",
         "entry_distance",
         "spread_danger",
+        "orderflow",
+        "m5_score",
+        "m15_score",
+        "context_score",
     )
 
     def __init__(self, window: int = 100) -> None:
@@ -148,6 +162,10 @@ class FeatureExtractor:
         volatility_risk_raw: float,
         entry_distance_raw: float,
         spread_danger_raw: float,
+        orderflow_raw: Any = 0.0,
+        m5_score_raw: float = 0.0,
+        m15_score_raw: float = 0.0,
+        context_score_raw: float = 0.0,
         expected_return: float = 0.0,
         return_std: float = 1.0,
         timestamp: datetime | None = None,
@@ -162,6 +180,10 @@ class FeatureExtractor:
             "volatility_risk": volatility_risk_raw,
             "entry_distance": entry_distance_raw,
             "spread_danger": spread_danger_raw,
+            "orderflow": _coerce_orderflow_raw(orderflow_raw),
+            "m5_score": float(m5_score_raw),
+            "m15_score": float(m15_score_raw),
+            "context_score": float(context_score_raw),
         }
 
         should_push = self._last_timestamp is None or ts != self._last_timestamp
@@ -187,6 +209,7 @@ class FeatureExtractor:
             volatility_risk_raw=volatility_risk_raw,
             entry_distance_raw=entry_distance_raw,
             spread_danger_raw=spread_danger_raw,
+            orderflow_raw=raw_values["orderflow"],
             momentum_z=z_scores["momentum"],
             trend_z=z_scores["trend"],
             volume_z=z_scores["volume"],
@@ -194,9 +217,31 @@ class FeatureExtractor:
             volatility_risk_z=z_scores["volatility_risk"],
             entry_distance_z=z_scores["entry_distance"],
             spread_danger_z=z_scores["spread_danger"],
+            orderflow_z=z_scores["orderflow"],
+            m5_score_raw=raw_values["m5_score"],
+            m5_score_z=z_scores["m5_score"],
+            m15_score_raw=raw_values["m15_score"],
+            m15_score_z=z_scores["m15_score"],
+            context_score_raw=raw_values["context_score"],
+            context_score_z=z_scores["context_score"],
             expected_return=expected_return,
             return_std=max(return_std, 1e-9),
         )
+
+
+def _coerce_orderflow_raw(value: Any) -> float:
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return max(-1.0, min(1.0, float(value)))
+    try:
+        from src.strategy.orderflow import score_orderflow_for_direction
+
+        bullish = score_orderflow_for_direction(value, BreakoutDirection.BULLISH).alignment_score
+        bearish = score_orderflow_for_direction(value, BreakoutDirection.BEARISH).alignment_score
+        return max(-1.0, min(1.0, bullish if abs(bullish) >= abs(bearish) else -bearish))
+    except Exception:
+        return 0.0
 
 
 # ---------------------------------------------------------------------------

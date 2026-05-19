@@ -56,7 +56,7 @@ def test_evaluate_break_and_retest_setup_returns_trade_plan():
     assert result.direction.value == "BULLISH"
     assert result.entry_price == 2351.45
     assert result.stop_loss == 2346.95
-    assert result.take_profit == 2364.95
+    assert result.take_profit == 2362.70  # 2.5R base: entry + risk*2.5 = 2351.45 + 4.50*2.5
     assert result.reason == "trade_plan_ready"
     assert result.metadata["confirmation_reason"] == "rejection_candle_confirmed"
 
