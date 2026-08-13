@@ -74,6 +74,8 @@ def evaluate_top_down_decision_tree(
         gap_decision=gap_decision,
         tradingview_confluence=incoming_tradingview_confluence,
         orderflow_signal=orderflow_signal,
+        h4_candles=h4_candles,
+        m15_candles=m15_candles,
     )
     if not direction_decision.is_valid or direction_decision.direction is None:
         return _no_trade(direction_decision.reason, "h1_direction", **direction_decision.metadata)
@@ -205,12 +207,13 @@ def evaluate_top_down_decision_tree(
     execution_candles = m5_candles
     structure_low = min(candle.low for candle in execution_candles[-3:])
     structure_high = max(candle.high for candle in execution_candles[-3:])
+    effective_risk_buffer = profile.risk_buffer if strategy_profile is not None else risk_buffer
     levels = build_trade_levels(
         entry_price=execution_decision.entry_price,
         direction=direction_decision.direction,
         retest_structure_low=structure_low,
         retest_structure_high=structure_high,
-        buffer=risk_buffer,
+        buffer=effective_risk_buffer,
         candle_timestamp=execution_candles[-1].timestamp,
     )
 
@@ -299,6 +302,8 @@ def _default_strategy_profile(symbol: str) -> SymbolStrategyProfile:
             campaign_base_add_trigger_r=1.5,
             campaign_add_trigger_floor_r=1.25,
             campaign_add_trigger_ceiling_r=1.75,
+            risk_buffer=0.05,
+            trail_distance=0.20,
         )
     return SymbolStrategyProfile(
         symbol="XAUUSD",
@@ -312,6 +317,8 @@ def _default_strategy_profile(symbol: str) -> SymbolStrategyProfile:
         campaign_base_add_trigger_r=1.5,
         campaign_add_trigger_floor_r=1.25,
         campaign_add_trigger_ceiling_r=1.75,
+        risk_buffer=2.0,
+        trail_distance=10.0,
     )
 
 

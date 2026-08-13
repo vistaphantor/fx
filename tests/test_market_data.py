@@ -166,7 +166,15 @@ def test_build_live_strategy_input_fetches_mt5_candles():
             self.calls.append((symbol, timeframe, start_pos, count))
             if timeframe == self.TIMEFRAME_D1:
                 return [
-                    {"time": 1712220000, "open": 2330, "high": 2360, "low": 2320, "close": 2349, "tick_volume": 1},
+                    {
+                        "time": 1712220000 + (index * 86400),
+                        "open": 2330 + index,
+                        "high": 2360 + index,
+                        "low": 2320 + index,
+                        "close": 2349 + index,
+                        "tick_volume": 1,
+                    }
+                    for index in range(count)
                 ]
             if timeframe == self.TIMEFRAME_H4:
                 return [
@@ -244,13 +252,13 @@ def test_build_live_strategy_input_fetches_mt5_candles():
     live_input = build_live_strategy_input(fake_mt5, "XAUUSD")
 
     assert live_input.symbol == "XAUUSD"
-    assert len(live_input.d1_candles) == 1
-    assert len(live_input.h4_candles) == 6
-    assert len(live_input.h1_candles) == 5
-    assert len(live_input.m30_candles) == 5
+    assert len(live_input.d1_candles) == 10
+    assert len(live_input.h4_candles) == 14
+    assert len(live_input.h1_candles) == 24
+    assert len(live_input.m30_candles) == 20
     assert len(live_input.m10_candles) == 8
-    assert len(live_input.m5_candles) == 30
+    assert len(live_input.m5_candles) == 60
     assert live_input.breakout_candle.timeframe == "M5"
     assert live_input.retest_candle.timeframe == "M5"
-    assert len(live_input.m15_candles) == 50
+    assert len(live_input.m15_candles) == 100
     assert len(fake_mt5.calls) == 7

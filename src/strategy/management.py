@@ -170,23 +170,50 @@ def _build_stop_updates(*, positions, current_price: float, direction: BreakoutD
         progress_by_index[index] = progress_r
         target_stop_loss = None
 
+        # --- Dynamic Profit-Trailing Ladder ---
+        # 1. Early risk reduction: at +0.5 R profit, cut risk by 50%
+        if progress_r >= 0.5:
+            half_risk_sl = entry_price + (0.5 * (initial_stop_loss - entry_price))
+            target_stop_loss = _more_protective_stop_loss(
+                existing_stop=target_stop_loss,
+                candidate_stop=half_risk_sl,
+                direction=direction,
+            )
+
+        # 2. Breakeven lock: at +1.0 R profit (or breakeven_trigger_r), move SL to entry
         breakeven_trigger_r = _breakeven_trigger_r(breakeven_distance=breakeven_distance, risk=risk)
-        if progress_r >= breakeven_trigger_r:
-            target_stop_loss = entry_price
+        if progress_r >= min(1.0, breakeven_trigger_r):
+            target_stop_loss = _more_protective_stop_loss(
+                existing_stop=target_stop_loss,
+                candidate_stop=entry_price,
+                direction=direction,
+            )
             breakeven_any = True
 
+        # 3. Profit locking: at +1.5 R profit, lock +0.5 R profit
+        if progress_r >= 1.5:
+            lock_05_sl = entry_price + (0.5 * risk) if direction is BreakoutDirection.BULLISH else entry_price - (0.5 * risk)
+            target_stop_loss = _more_protective_stop_loss(
+                existing_stop=target_stop_loss,
+                candidate_stop=lock_05_sl,
+                direction=direction,
+            )
+            profit_lock_any = True
+
+        # 4. Dynamic trailing: at >= +2.0 R profit, trail SL in integer R step increments behind peak
         if progress_r >= 2.0:
             locked_r = _locked_r_multiple(progress_r)
             locked_r_by_index[index] = locked_r
             if locked_r > 0:
+                dynamic_sl = _locked_stop_loss(
+                    entry_price=entry_price,
+                    direction=direction,
+                    risk=risk,
+                    locked_r=locked_r,
+                )
                 target_stop_loss = _more_protective_stop_loss(
                     existing_stop=target_stop_loss,
-                    candidate_stop=_locked_stop_loss(
-                        entry_price=entry_price,
-                        direction=direction,
-                        risk=risk,
-                        locked_r=locked_r,
-                    ),
+                    candidate_stop=dynamic_sl,
                     direction=direction,
                 )
                 profit_lock_any = True
@@ -206,7 +233,7 @@ def _build_stop_updates(*, positions, current_price: float, direction: BreakoutD
 
 
 def _breakeven_trigger_r(*, breakeven_distance: float, risk: float) -> float:
-    return float(breakeven_distance)
+    return float(breakeven_distance) / risk
 
 
 def _locked_r_multiple(progress_r: float) -> int:

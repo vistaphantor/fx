@@ -1178,3 +1178,103 @@ def test_decision_tree_requires_true_m10_and_m5_inputs():
     assert result.is_trade is False
     assert result.reason == "m10_data_missing"
     assert result.failed_node == "m10_setup"
+
+
+def test_decision_tree_uses_asset_specific_risk_buffer():
+    from src.config import SymbolStrategyProfile
+
+    profile = SymbolStrategyProfile(
+        symbol="XAUUSD",
+        min_edge_threshold=0.0,
+        max_uncertainty_threshold=10.0,
+        minimum_expected_move_multiple=1.0,
+        add_on_edge_multiplier=1.25,
+        trend_regime_weight=1.1,
+        compression_regime_weight=0.75,
+        breakeven_distance=1.5,
+        campaign_base_add_trigger_r=1.5,
+        campaign_add_trigger_floor_r=1.25,
+        campaign_add_trigger_ceiling_r=1.75,
+        risk_buffer=5.5,
+        trail_distance=15.0,
+    )
+
+    result = evaluate_top_down_decision_tree(
+        d1_candles=_candles(
+            "D1",
+            [
+                (101.0, 108.0, 99.0, 105.0, 1000),
+                (105.0, 112.0, 100.0, 109.0, 1200),
+            ],
+        ),
+        h4_candles=_candles(
+            "H4",
+            [
+                (100.0, 104.0, 98.0, 103.0, 80),
+                (103.0, 110.0, 96.0, 108.0, 95),
+                (108.0, 109.0, 101.0, 102.0, 70),
+                (102.0, 117.0, 100.0, 116.0, 150),
+                (116.0, 131.0, 114.0, 128.0, 210),
+                (128.0, 129.0, 120.0, 123.0, 130),
+                (123.0, 126.0, 119.0, 124.0, 90),
+            ],
+        ),
+        h1_candles=_candles(
+            "H1",
+            [
+                (99.0, 101.0, 98.0, 100.0, 100),
+                (100.0, 102.0, 99.5, 101.5, 101),
+                (101.5, 104.0, 101.0, 103.0, 102),
+                (103.0, 105.0, 102.5, 104.0, 103),
+                (104.0, 107.0, 103.5, 106.0, 104),
+            ],
+        ),
+        m30_candles=_candles(
+            "M30",
+            [
+                (104.5, 105.0, 103.4, 104.0, 100),
+                (104.0, 104.5, 103.2, 103.9, 101),
+                (103.9, 106.4, 103.0, 106.0, 102),
+            ],
+        ),
+        m15_candles=_candles(
+            "M15",
+            [
+                (104.0, 104.5, 103.8, 104.1, 100),
+                (104.1, 104.4, 103.9, 104.0, 101),
+                (104.0, 106.2, 103.95, 105.9, 102),
+                (105.9, 106.3, 104.8, 105.5, 103),
+                (105.5, 106.0, 104.7, 105.7, 104),
+                (105.7, 106.4, 104.5, 106.1, 105),
+            ],
+        ),
+        m10_candles=_candles(
+            "M10",
+            [
+                (105.4, 105.7, 105.1, 105.5, 100),
+                (105.5, 105.9, 105.2, 105.7, 101),
+                (105.7, 106.1, 105.5, 105.95, 102),
+            ],
+        ),
+        m5_candles=_candles(
+            "M5",
+            [
+                (105.9, 106.0, 105.7, 105.95, 100),
+                (105.95, 106.2, 105.8, 106.05, 101),
+                (106.05, 106.8, 105.9, 106.4, 102),
+            ],
+        ),
+        risk_buffer=0.05,
+        strategy_profile=profile,
+    )
+
+    # Let's check the trade plan stop loss matches our 5.5 buffer
+    import pytest
+    assert result.is_trade is True
+    # The structure low is 105.7 on M5. With 5.5 buffer, stop loss should be 105.7 - 5.5 = 100.2
+    assert result.stop_loss == pytest.approx(100.2)
+
+    from src.strategy.decision_tree import _default_strategy_profile
+    xau_def = _default_strategy_profile("XAUUSD")
+    assert xau_def.risk_buffer == 2.0
+    assert xau_def.trail_distance == 10.0

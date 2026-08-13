@@ -1,6 +1,11 @@
+import warnings
+
 import numpy as np
 from dataclasses import dataclass
 from typing import List, Optional
+
+# RankWarning moved to np.exceptions in NumPy 2.x
+_RankWarning = getattr(getattr(np, "exceptions", np), "RankWarning", UserWarning)
 
 @dataclass
 class QuantMetrics:
@@ -16,27 +21,45 @@ def calculate_hurst_exponent(prices: List[float]) -> float:
     """Calculate the Hurst Exponent to determine trend persistence."""
     if len(prices) < 20:
         return 0.5
-    
+
     lags = range(2, 20)
     tau = [np.sqrt(np.std(np.subtract(prices[lag:], prices[:-lag]))) for lag in lags]
-    
-    # Use polyfit to find the slope of log(tau) vs log(lags)
-    # The slope is the Hurst Exponent
-    poly = np.polyfit(np.log(lags), np.log(tau), 1)
-    return poly[0] * 2.0
+
+    # Filter out zero/negative tau values before log to avoid divide-by-zero
+    valid = [(lag, t) for lag, t in zip(lags, tau) if t > 0]
+    if len(valid) < 2:
+        return 0.5  # Not enough data — assume random walk
+
+    log_lags = np.log([lag for lag, _ in valid])
+    log_tau  = np.log([t   for _, t  in valid])
+
+    # Guard against poorly-conditioned fit (all lags identical after filtering)
+    if np.ptp(log_lags) < 1e-10:
+        return 0.5
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", _RankWarning)
+        poly = np.polyfit(log_lags, log_tau, 1)
+    return float(np.clip(poly[0] * 2.0, 0.0, 2.0))
 
 def calculate_ou_params(prices: List[float]):
     """Estimate Ornstein-Uhlenbeck parameters (Reversion Speed)."""
     if len(prices) < 20:
         return 0.0
-    
+
     # Simple linear regression on the differences
     # dP = lambda * (mu - P) * dt + sigma * dW
-    p = np.array(prices)
+    p = np.array(prices, dtype=np.float64)
     x = p[:-1]
     y = p[1:]
-    
-    poly = np.polyfit(x, y, 1)
+
+    # Guard: polyfit is poorly conditioned when x has near-zero variance
+    if np.std(x) < 1e-10:
+        return 0.0
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", _RankWarning)
+        poly = np.polyfit(x, y, 1)
     # The 'reversion speed' (lambda) is related to the slope
     # slope = 1 - lambda * dt
     reversion_speed = 1 - poly[0]

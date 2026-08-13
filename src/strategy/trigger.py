@@ -6,9 +6,11 @@ from typing import TYPE_CHECKING
 from src.market_data import Candle
 from src.strategy.breakout import BreakoutDirection
 from src.strategy.direction import DirectionDecision
+from src.strategy.patterns import detect_candlestick_patterns
 
 if TYPE_CHECKING:
     from src.strategy.setup import SetupDecision
+    from src.strategy.orderflow import OrderflowSignal
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +54,12 @@ def evaluate_m15_trigger(
 
     newest_index = len(m15_candles) - 1
     oldest_candidate_index = max(1, len(m15_candles) - 3)
+
+    swing_candles = m15_candles[-50:] if len(m15_candles) > 50 else m15_candles
+    swing_high = max(float(c.high) for c in swing_candles)
+    swing_low = min(float(c.low) for c in swing_candles)
+    swing_range = max(swing_high - swing_low, 1e-9)
+
     for index in range(newest_index, oldest_candidate_index - 1, -1):
         candidate = m15_candles[index]
         previous = m15_candles[index - 1]
@@ -62,6 +70,29 @@ def evaluate_m15_trigger(
         )
         if candidate_trigger is None:
             continue
+
+        retracement_level = (float(candidate.close) - swing_low) / swing_range
+        if len(m15_candles) >= 15:
+            if direction_decision.direction is BreakoutDirection.BULLISH and retracement_level > 0.618:
+                return TriggerDecision(
+                    is_ready=False,
+                    reason="m15_fibo_retracement_not_in_sweet_spot",
+                    entry_price=None,
+                    invalidation_price=None,
+                    metadata={"retracement_level": retracement_level},
+                    quality_score=0.0,
+                    expected_move_multiple=0.0,
+                )
+            if direction_decision.direction is BreakoutDirection.BEARISH and retracement_level < 0.382:
+                return TriggerDecision(
+                    is_ready=False,
+                    reason="m15_fibo_retracement_not_in_sweet_spot",
+                    entry_price=None,
+                    invalidation_price=None,
+                    metadata={"retracement_level": retracement_level},
+                    quality_score=0.0,
+                    expected_move_multiple=0.0,
+                )
         if _trigger_invalidated(
             direction=direction_decision.direction,
             invalidation_price=candidate_trigger.invalidation_price,
@@ -101,6 +132,7 @@ def evaluate_m5_trigger(
     setup_decision: SetupDecision,
     direction_decision: DirectionDecision,
     confirmation_decision: TriggerDecision | None = None,
+    orderflow_signal: OrderflowSignal | None = None,
 ) -> TriggerDecision:
     _require_timeframe(m5_candles, "M5", minimum=3)
     if confirmation_decision is not None and not confirmation_decision.is_ready:
@@ -133,6 +165,23 @@ def evaluate_m5_trigger(
             quality_score=0.0,
             expected_move_multiple=0.0,
         )
+
+    if orderflow_signal is not None:
+        try:
+            from src.strategy.orderflow import score_orderflow_for_direction
+            of_score = score_orderflow_for_direction(orderflow_signal, direction_decision.direction)
+            if of_score.is_conflicting:
+                return TriggerDecision(
+                    is_ready=False,
+                    reason="m5_orderflow_conflicting",
+                    entry_price=None,
+                    invalidation_price=None,
+                    metadata=of_score.metadata,
+                    quality_score=0.0,
+                    expected_move_multiple=0.0,
+                )
+        except Exception:
+            pass
 
     latest = m5_candles[-1]
     previous = m5_candles[-2]
@@ -207,33 +256,41 @@ def _evaluate_m15_trigger_candidate(
     direction: BreakoutDirection,
 ) -> TriggerDecision | None:
     midpoint = (float(previous.high) + float(previous.low)) / 2.0
+    candlestick_pattern = detect_candlestick_patterns([previous, candidate])
+    is_pattern_match = (
+        candlestick_pattern.is_present
+        and candlestick_pattern.metadata.get("direction") == ("BULLISH" if direction is BreakoutDirection.BULLISH else "BEARISH")
+    )
+
     if direction is BreakoutDirection.BULLISH:
-        if candidate.close > midpoint:
+        if candidate.close > midpoint or is_pattern_match:
             invalidation_price = float(candidate.low)
             risk = max(float(candidate.close) - invalidation_price, 1e-9)
             expected_move_multiple = max((float(candidate.high) - float(previous.low)) / risk, 0.0)
+            trigger_kind = f"bullish_{candlestick_pattern.reason}" if is_pattern_match else "bullish_aggressive"
             return TriggerDecision(
                 is_ready=True,
                 reason="m15_trigger_ready",
                 entry_price=float(candidate.close),
                 invalidation_price=invalidation_price,
-                metadata={"trigger_kind": "bullish_aggressive"},
-                quality_score=1.0,
+                metadata={"trigger_kind": trigger_kind, "pattern": candlestick_pattern.reason},
+                quality_score=1.0 if not is_pattern_match else min(1.0, 0.8 + (candlestick_pattern.confluence_score * 0.1)),
                 expected_move_multiple=expected_move_multiple,
             )
         return None
 
-    if candidate.close < midpoint:
+    if candidate.close < midpoint or is_pattern_match:
         invalidation_price = float(candidate.high)
         risk = max(invalidation_price - float(candidate.close), 1e-9)
         expected_move_multiple = max((float(previous.high) - float(candidate.low)) / risk, 0.0)
+        trigger_kind = f"bearish_{candlestick_pattern.reason}" if is_pattern_match else "bearish_aggressive"
         return TriggerDecision(
             is_ready=True,
             reason="m15_trigger_ready",
             entry_price=float(candidate.close),
             invalidation_price=invalidation_price,
-            metadata={"trigger_kind": "bearish_aggressive"},
-            quality_score=1.0,
+            metadata={"trigger_kind": trigger_kind, "pattern": candlestick_pattern.reason},
+            quality_score=1.0 if not is_pattern_match else min(1.0, 0.8 + (candlestick_pattern.confluence_score * 0.1)),
             expected_move_multiple=expected_move_multiple,
         )
     return None

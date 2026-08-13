@@ -28,6 +28,25 @@ def _candles(closes: list[float]) -> list[Candle]:
     return candles
 
 
+def _h4_candles(closes: list[float]) -> list[Candle]:
+    start = datetime(2026, 4, 6, 8, 0, tzinfo=timezone.utc)
+    candles = []
+    for index, close in enumerate(closes):
+        open_price = closes[index - 1] if index else close - 1.0
+        candles.append(
+            Candle(
+                timestamp=start + timedelta(hours=index * 4),
+                open=open_price,
+                high=max(open_price, close) + 1.0,
+                low=min(open_price, close) - 1.0,
+                close=close,
+                volume=100 + index,
+                timeframe="H4",
+            )
+        )
+    return candles
+
+
 def test_determine_h1_bias_returns_bullish_when_context_and_reaction_align():
     daily_context = DailyContext(
         daily_high=112.0,
@@ -308,3 +327,33 @@ def test_determine_h1_bias_flips_bearish_when_live_price_breaks_below_demand():
     assert result.is_valid is True
     assert result.direction is BreakoutDirection.BEARISH
     assert result.reason == "h1_bias_bearish"
+
+
+def test_determine_h1_bias_allows_strong_sell_pressure_against_h4_trend():
+    daily_context = DailyContext(
+        daily_high=120.0,
+        daily_low=100.0,
+        current_price=116.0,
+        range_position=0.80,
+        objective_high=120.0,
+        objective_low=100.0,
+    )
+    h4_context = H4Context(
+        previous_session_high=119.0,
+        previous_session_low=101.0,
+        demand_zones=((100.0, 102.0),),
+        supply_zones=((115.0, 117.0),),
+        volume_profile_levels=(102.0, 108.0, 116.5),
+    )
+
+    result = determine_h1_bias(
+        h1_candles=_candles([118.0, 119.0, 120.0, 119.0, 116.0]),
+        h4_candles=_h4_candles([104.0, 107.0, 110.0, 113.0, 116.0]),
+        daily_context=daily_context,
+        h4_context=h4_context,
+    )
+
+    assert result.is_valid is True
+    assert result.direction is BreakoutDirection.BEARISH
+    assert result.reason == "h1_bias_bearish"
+    assert result.metadata["bearish_override_pressure"] is True

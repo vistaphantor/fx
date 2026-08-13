@@ -36,6 +36,30 @@ def Mt5Session(*args, **kwargs):
     return AppMt5Session(*args, **kwargs)
 
 
+def Mt4FallbackSession(*args, **kwargs):
+    from src.mt5_client import Mt4FallbackSession as AppMt4FallbackSession
+
+    return AppMt4FallbackSession(*args, **kwargs)
+
+
+def install_mt4_bridge_ea(*args, **kwargs):
+    from src.mt4_bridge import install_bridge_ea
+
+    return install_bridge_ea(*args, **kwargs)
+
+
+def mt4_bridge_client(*args, **kwargs):
+    from src.mt4_bridge import Mt4FileBridgeClient
+
+    return Mt4FileBridgeClient(*args, **kwargs)
+
+
+def mt4_bridge_module(*args, **kwargs):
+    from src.mt4_bridge import Mt4BridgeModule
+
+    return Mt4BridgeModule(*args, **kwargs)
+
+
 def TradeExecutor(*args, **kwargs):
     from src.trade_executor import TradeExecutor as AppTradeExecutor
 
@@ -66,7 +90,13 @@ NGROK_LOCAL_PORT = 8000
 def start_dashboard():
     """Start the dashboard server in a separate process."""
     def run_server():
-        subprocess.Popen([sys.executable, "dashboard_server.py"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        app_dir = Path(__file__).resolve().parent
+        subprocess.Popen(
+            [sys.executable, str(app_dir / "dashboard_server.py")],
+            cwd=str(app_dir),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
     
     thread = threading.Thread(target=run_server, daemon=True)
     thread.start()
@@ -162,10 +192,64 @@ def force_standard_settings(settings):
     return settings
 
 
-def run_backtest_mode(mt5, settings, days):
+def launch_mt4_fallback(settings):
+    if not getattr(settings, "mt4_fallback_enabled", False):
+        return None
+    mt4_login = getattr(settings, "mt4_login", None) or getattr(settings, "hfm_login")
+    mt4_password = getattr(settings, "mt4_password", "") or getattr(settings, "hfm_password")
+    mt4_server = getattr(settings, "mt4_server", "") or getattr(settings, "hfm_server")
+    mt4_path = getattr(settings, "mt4_terminal_path", "")
+    if not mt4_path:
+        logging.error("MT4 fallback is enabled but MT4_TERMINAL_PATH is not set")
+        return None
+
+    common_files_dir = None
+    try:
+        install = install_mt4_bridge_ea(
+            Path(__file__).resolve().parent,
+            getattr(settings, "mt4_data_path", ""),
+        )
+        common_files_dir = install.common_files_dir
+        logging.warning("Installed MT4 bridge EA: %s", install.destination)
+        logging.warning("MT4 bridge shared files folder: %s", install.common_files_dir)
+    except Exception as exc:
+        logging.warning("Could not install MT4 bridge EA automatically: %s", exc)
+
+    logging.warning("MT5 terminal is not available; launching MT4 fallback terminal")
+    session = Mt4FallbackSession(
+        terminal_path=mt4_path,
+        startup_wait_seconds=settings.mt5_startup_wait_seconds,
+    )
+    session.launch_terminal(
+        login=mt4_login,
+        password=mt4_password,
+        server=mt4_server,
+        symbol=getattr(settings, "mt4_chart_symbol", getattr(settings, "trading_symbol", "")),
+        period=getattr(settings, "mt4_chart_period", "M1"),
+        expert="FxPythonBridge",
+    )
+    if common_files_dir is not None:
+        client = mt4_bridge_client(common_files_dir)
+        for _ in range(max(1, int(settings.mt5_startup_wait_seconds))):
+            if client.is_alive(max_age_seconds=10.0):
+                logging.warning("FxPythonBridge heartbeat detected; MT4 bridge EA is running")
+                return mt4_bridge_module(common_files_dir)
+            time.sleep(1)
+        logging.warning("MT4 launched and FxPythonBridge auto-attach was requested, but no bridge heartbeat was detected")
+    else:
+        logging.warning("MT4 launched with configured account details and requested FxPythonBridge auto-attach")
+    return None
+
+
+def run_backtest_mode(mt5, settings, days, starting_equity=10000.0):
     """Run a high-fidelity backtest with Session Gating, DXY Correlation, and Trailing Stop."""
     symbol = settings.trading_symbol
-    logging.info("STARTING ADVANCED MACRO BACKTEST: symbol=%s days=%s", symbol, days)
+    logging.info(
+        "STARTING ADVANCED MACRO BACKTEST: symbol=%s days=%s starting_equity=%.2f",
+        symbol,
+        days,
+        starting_equity,
+    )
     
     from src.market_data import fetch_candles, Candle
     from src.strategy.m5_engine import M5SignalEngine
@@ -203,14 +287,18 @@ def run_backtest_mode(mt5, settings, days):
         omega: float
         peak_price: float
 
-    count = int(days * 1440)
+    count = int(days * 1440) + 100
     logging.info("Fetching %s M1 candles for %s and USDIndex...", count, symbol)
     try:
         candles = fetch_candles(mt5, symbol, "TIMEFRAME_M1", count)
+    except Exception as e:
+        logging.error("Failed to fetch backtest data for %s: %s", symbol, e)
+        return
+    try:
         dxy_candles = fetch_candles(mt5, "USDIndex", "TIMEFRAME_M1", count)
     except Exception as e:
-        logging.error("Failed to fetch backtest data: %s", e)
-        return
+        logging.warning("USDIndex backtest data unavailable; continuing with neutral DXY trend: %s", e)
+        dxy_candles = candles
 
     m5_eng = M5SignalEngine()
     m15_eng = M15SignalEngine()
@@ -221,12 +309,11 @@ def run_backtest_mode(mt5, settings, days):
     
     closed_pnls = []
     active_trade = None
-    start_idx = 4320 
+    start_idx = min(4320, max(300, len(candles) // 3))
     
-    if len(candles) <= start_idx or len(dxy_candles) <= start_idx:
-        logging.error("Not enough history for backtest")
+    if len(candles) <= start_idx + 1:
+        logging.error("Not enough history for backtest: candles=%s warmup=%s", len(candles), start_idx)
         return
-
     # Sync DXY and Gold by timestamp
     dxy_map = {c.timestamp: c.close for c in dxy_candles}
 
@@ -262,11 +349,23 @@ def run_backtest_mode(mt5, settings, days):
         
         if active_trade: continue
         
-        m5_c = aggregate_candles(candles[i-300:i+1], 5, "M5")
-        m15_c = aggregate_candles(candles[i-900:i+1], 15, "M15")
-        m30_c = aggregate_candles(candles[i-1800:i+1], 30, "M30")
-        h1_c = aggregate_candles(candles[i-3600:i+1], 60, "H1")
-        d1_c = aggregate_candles(candles[i-4320:i+1], 1440, "D1")
+        m5_c = aggregate_candles(candles[max(0, i-300):i+1], 5, "M5")
+        m15_c = aggregate_candles(candles[max(0, i-900):i+1], 15, "M15")
+        m30_c = aggregate_candles(candles[max(0, i-1800):i+1], 30, "M30")
+        h1_c = aggregate_candles(candles[max(0, i-3600):i+1], 60, "H1")
+        d1_c = aggregate_candles(candles[max(0, i-4320):i+1], 1440, "D1")
+        
+        # Safe Context padding to prevent ValueError on short history
+        if m5_c:
+            if len(m5_c) < 50: m5_c = [m5_c[0]] * (50 - len(m5_c)) + m5_c
+        if m15_c:
+            if len(m15_c) < 50: m15_c = [m15_c[0]] * (50 - len(m15_c)) + m15_c
+        if m30_c:
+            if len(m30_c) < 6: m30_c = [m30_c[0]] * (6 - len(m30_c)) + m30_c
+        if h1_c:
+            if len(h1_c) < 6: h1_c = [h1_c[0]] * (6 - len(h1_c)) + h1_c
+        if d1_c:
+            if len(d1_c) < 2: d1_c = [d1_c[0]] * (2 - len(d1_c)) + d1_c
         
         m5_s = m5_eng.compute(m5_c)
         m15_s = m15_eng.compute(m15_c)
@@ -308,22 +407,50 @@ def run_backtest_mode(mt5, settings, days):
         decision = evaluate_master_equation(
             features=feat_snap,
             params=quant_params,
-            equity=10000,
+            equity=float(starting_equity),
             drawdown_ratio=0.0,
             recent_returns=returns,
             transaction_cost=0.0001,
             session_score=s_score,
-            dxy_trend=0.0 # Temporarily zeroed for diagnostic
+            dxy_trend=dxy_trend,
         )
-        
-        if decision.omega_t > 0.4:
-            logging.debug("Signal Check: %s Omega=%.3f session=%.2f", dt.strftime("%H:%M"), decision.omega_t, s_score)
 
-        if decision.omega_t >= 0.45:
+        # High-Fidelity Confluence Gating and Fusion
+        m10_c = aggregate_candles(candles[max(0, i-600):i+1], 10, "M10")
+        h4_c = aggregate_candles(candles[max(0, i-14400):i+1], 240, "H4")
+        if m10_c:
+            if len(m10_c) < 15: m10_c = [m10_c[0]] * (15 - len(m10_c)) + m10_c
+        if h4_c:
+            if len(h4_c) < 6: h4_c = [h4_c[0]] * (6 - len(h4_c)) + h4_c
+
+        from src.strategy.decision_tree import evaluate_top_down_decision_tree
+        strategy_result = evaluate_top_down_decision_tree(
+            symbol=symbol,
+            d1_candles=d1_c,
+            h4_candles=h4_c,
+            h1_candles=h1_c,
+            m30_candles=m30_c,
+            m15_candles=m15_c,
+            m10_candles=m10_c,
+            m5_candles=m5_c,
+            risk_buffer=0.05,
+            dxy_trend=dxy_trend,
+        )
+
+        from src.strategy.decision_fusion import fuse_decision
+        fusion_decision = fuse_decision(
+            strategy_result=strategy_result,
+            quant_decision=decision,
+            local_edge_probability=0.65,  # Standard proxy
+            settings=settings,
+            live_input=False,
+        )
+
+        if fusion_decision.action in {"BUY", "SELL"}:
             atr = (max(c.high for c in candles[i-14:i+1]) - min(c.low for c in candles[i-14:i+1])) / 2.0
             if atr <= 0: continue
             entry = nxt.open
-            direction = "BUY" if decision.action == 1 else "SELL"
+            direction = fusion_decision.action
             active_trade = Trade(direction, entry, entry - atr*1.5 if direction=="BUY" else entry+atr*1.5, 
                                  entry + atr*3.0 if direction=="BUY" else entry-atr*3.0, decision.omega_t, entry)
 
@@ -331,7 +458,6 @@ def run_backtest_mode(mt5, settings, days):
     if not closed_pnls:
         logging.info("No trades executed.")
         return
-
     net = sum(closed_pnls)
     wins = sum(1 for p in closed_pnls if p > 0)
     wr = wins / len(closed_pnls) * 100
@@ -342,6 +468,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--backtest", action="store_true", help="Run in backtest mode")
     parser.add_argument("--days", type=int, default=15, help="Number of days to backtest")
+    parser.add_argument("--backtest-equity", type=float, default=10000.0, help="Starting account equity for run.py backtest")
     args = parser.parse_args()
 
     ensure_requirements_satisfied()
@@ -383,19 +510,28 @@ def main() -> int:
             )
 
         logging.info("Launching MT5 terminal")
-        session.launch_terminal()
-
-        logging.info("Initializing MT5 and logging into HFM")
-        account_info = session.initialize_and_login(
-            login=settings.hfm_login,
-            password=settings.hfm_password,
-            server=settings.hfm_server,
-        )
-        if account_info is not None:
-            logging.info("Connected account login=%s", getattr(account_info, "login", "unknown"))
+        try:
+            session.launch_terminal()
+        except FileNotFoundError:
+            mt4 = launch_mt4_fallback(settings)
+            if mt4 is None:
+                if getattr(settings, "mt4_fallback_enabled", False):
+                    return 0
+                raise
+            mt5 = mt4
+            session = None
+        else:
+            logging.info("Initializing MT5 and logging into HFM")
+            account_info = session.initialize_and_login(
+                login=settings.hfm_login,
+                password=settings.hfm_password,
+                server=settings.hfm_server,
+            )
+            if account_info is not None:
+                logging.info("Connected account login=%s", getattr(account_info, "login", "unknown"))
 
         if args.backtest:
-            run_backtest_mode(mt5, settings, args.days)
+            run_backtest_mode(mt5, settings, args.days, starting_equity=args.backtest_equity)
             return 0
 
         logging.info(
@@ -416,7 +552,7 @@ def main() -> int:
             poll_seconds=settings.loop_poll_seconds,
             max_loops=settings.max_live_loops,
             tradingview_alert_store=tradingview_alert_store,
-            strategy_profile=settings.strategy_profiles.get(settings.trading_symbol.strip().upper()),
+            strategy_profile=settings.strategy_profiles.get(settings.trading_symbol.split(",")[0].strip().upper()) if getattr(settings, "strategy_profiles", None) else None,
             reload_check_fn=code_watcher.has_changes,
             log_fn=logging.info,
             settings=settings,
@@ -426,7 +562,8 @@ def main() -> int:
     finally:
         if "tradingview_server" in locals() and tradingview_server is not None:
             tradingview_server.shutdown()
-        session.shutdown()
+        if session is not None:
+            session.shutdown()
         if reload_requested:
             logging.info("RELOADING BOT")
             restart_process()

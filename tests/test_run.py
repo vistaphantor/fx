@@ -26,6 +26,14 @@ def test_main_always_starts_live_signal_loop(monkeypatch):
         hfm_login=123456,
         hfm_password="secret",
         hfm_server="HFMarketsGlobal-Demo",
+        mt4_fallback_enabled=False,
+        mt4_terminal_path="",
+        mt4_data_path="",
+        mt4_chart_symbol="XAUUSD",
+        mt4_chart_period="M1",
+        mt4_login=None,
+        mt4_password="",
+        mt4_server="",
         trading_symbol="XAUUSD",
         mt5_startup_wait_seconds=5,
         loop_poll_seconds=60,
@@ -39,6 +47,7 @@ def test_main_always_starts_live_signal_loop(monkeypatch):
         strategy_profiles={"XAUUSD": SimpleNamespace(symbol="XAUUSD", min_edge_threshold=2.0)},
     )
 
+    monkeypatch.setattr("sys.argv", ["run.py"])
     monkeypatch.setattr(run, "load_settings", lambda: settings)
     monkeypatch.setattr(run, "ensure_requirements_satisfied", lambda: events.append("requirements"))
     monkeypatch.setattr(run, "Mt5Session", FakeSession)
@@ -106,6 +115,14 @@ def test_main_starts_tradingview_server_when_enabled(monkeypatch):
         hfm_login=123456,
         hfm_password="secret",
         hfm_server="HFMarketsGlobal-Demo",
+        mt4_fallback_enabled=False,
+        mt4_terminal_path="",
+        mt4_data_path="",
+        mt4_chart_symbol="XAUUSD",
+        mt4_chart_period="M1",
+        mt4_login=None,
+        mt4_password="",
+        mt4_server="",
         trading_symbol="XAUUSD",
         mt5_startup_wait_seconds=5,
         loop_poll_seconds=60,
@@ -123,6 +140,7 @@ def test_main_starts_tradingview_server_when_enabled(monkeypatch):
         strategy_profiles={"XAUUSD": SimpleNamespace(symbol="XAUUSD", min_edge_threshold=2.0)},
     )
 
+    monkeypatch.setattr("sys.argv", ["run.py"])
     monkeypatch.setattr(run, "load_settings", lambda: settings)
     monkeypatch.setattr(run, "Mt5Session", FakeSession)
     monkeypatch.setattr(run, "create_mt5_module", lambda: "mt5")
@@ -168,6 +186,14 @@ def test_main_restarts_process_when_live_loop_requests_reload(monkeypatch):
         hfm_login=123456,
         hfm_password="secret",
         hfm_server="HFMarketsGlobal-Demo",
+        mt4_fallback_enabled=False,
+        mt4_terminal_path="",
+        mt4_data_path="",
+        mt4_chart_symbol="XAUUSD",
+        mt4_chart_period="M1",
+        mt4_login=None,
+        mt4_password="",
+        mt4_server="",
         trading_symbol="XAUUSD",
         mt5_startup_wait_seconds=5,
         loop_poll_seconds=60,
@@ -181,6 +207,7 @@ def test_main_restarts_process_when_live_loop_requests_reload(monkeypatch):
         strategy_profiles={"XAUUSD": SimpleNamespace(symbol="XAUUSD", min_edge_threshold=2.0)},
     )
 
+    monkeypatch.setattr("sys.argv", ["run.py"])
     monkeypatch.setattr(run, "load_settings", lambda: settings)
     monkeypatch.setattr(run, "Mt5Session", FakeSession)
     monkeypatch.setattr(run, "create_mt5_module", lambda: "mt5")
@@ -193,3 +220,68 @@ def test_main_restarts_process_when_live_loop_requests_reload(monkeypatch):
 
     assert exit_code == 0
     assert events[-2:] == ["shutdown", "restart"]
+
+
+def test_main_launches_mt4_fallback_when_mt5_terminal_missing(monkeypatch):
+    events = []
+
+    class MissingMt5Session:
+        def __init__(self, terminal_path, startup_wait_seconds, subprocess_module=None, sleep_fn=None, mt5_module=None):
+            events.append(("mt5_session_init", terminal_path, startup_wait_seconds))
+
+        def launch_terminal(self):
+            raise FileNotFoundError("missing mt5")
+
+        def shutdown(self):
+            events.append("mt5_shutdown")
+
+    class FakeMt4Session:
+        def __init__(self, terminal_path, startup_wait_seconds):
+            events.append(("mt4_session_init", terminal_path, startup_wait_seconds))
+
+        def launch_terminal(self, login, password, server, symbol="", period="M1", expert=""):
+            events.append(("mt4_launch", login, password, server, symbol, period, expert))
+
+    settings = SimpleNamespace(
+        mt5_terminal_path=str(Path("C:/MT5/terminal64.exe")),
+        hfm_login=123456,
+        hfm_password="secret",
+        hfm_server="HFMarketsGlobal-Demo",
+        mt4_fallback_enabled=True,
+        mt4_terminal_path=str(Path("C:/MT4/terminal.exe")),
+        mt4_data_path="",
+        mt4_chart_symbol="XAUUSD",
+        mt4_chart_period="M1",
+        mt4_login=654321,
+        mt4_password="mt4-secret",
+        mt4_server="HFMarketsKE-Demo Server 2",
+        trading_symbol="XAUUSD",
+        mt5_startup_wait_seconds=5,
+        loop_poll_seconds=60,
+        max_live_loops=1,
+        risk_buffer=0.05,
+        max_candles_since_breakout=3,
+        default_trade_lot=0.01,
+        add_on_lot_increment=0.01,
+        campaign_max_exposure_pct=10.0,
+        tradingview_webhook_enabled=False,
+        strategy_profiles={"XAUUSD": SimpleNamespace(symbol="XAUUSD", min_edge_threshold=2.0)},
+    )
+
+    monkeypatch.setattr("sys.argv", ["run.py"])
+    monkeypatch.setattr(run, "load_settings", lambda: settings)
+    monkeypatch.setattr(run, "ensure_requirements_satisfied", lambda: events.append("requirements"))
+    monkeypatch.setattr(run, "Mt5Session", MissingMt5Session)
+    monkeypatch.setattr(run, "Mt4FallbackSession", FakeMt4Session)
+    monkeypatch.setattr(run, "install_mt4_bridge_ea", lambda *args, **kwargs: SimpleNamespace(
+        destination=Path("C:/MT4/MQL4/Experts/FxPythonBridge.mq4"),
+        common_files_dir=Path("C:/MT4/Common/Files"),
+    ))
+    monkeypatch.setattr(run, "create_mt5_module", lambda: "mt5")
+    monkeypatch.setattr(run, "run_live_signal_loop", lambda **kwargs: events.append("live_loop"))
+
+    exit_code = run.main()
+
+    assert exit_code == 0
+    assert ("mt4_launch", 654321, "mt4-secret", "HFMarketsKE-Demo Server 2", "XAUUSD", "M1", "FxPythonBridge") in events
+    assert "live_loop" not in events

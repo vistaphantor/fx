@@ -222,21 +222,38 @@ class LiveOrderflowEngine:
     def _accumulate(self, t: dict[str, float]) -> None:
         bid = t["bid"]
         ask = t["ask"]
-        last = t.get("last") or ((bid + ask) / 2.0 if bid > 0 and ask > 0 else 0.0)
+        last = t.get("last") or 0.0
         vol = t.get("volume") or t.get("volume_real") or 1.0
+        mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else 0.0
 
-        if ask > 0 and last >= ask:
-            buy_vol, sell_vol = vol, 0.0
-        elif bid > 0 and last <= bid:
-            buy_vol, sell_vol = 0.0, vol
+        if last > 0:
+            # Trade-price classification (when last price is available)
+            if ask > 0 and last >= ask:
+                buy_vol, sell_vol = vol, 0.0
+            elif bid > 0 and last <= bid:
+                buy_vol, sell_vol = 0.0, vol
+            else:
+                buy_vol = sell_vol = vol / 2.0
+        elif mid > 0 and self._ticks:
+            # Uptick/downtick rule for bid/ask-only ticks (XAUUSD, FX pairs)
+            prev_mid = (self._ticks[-1]["bid"] + self._ticks[-1]["ask"]) / 2.0
+            if mid > prev_mid:
+                buy_vol, sell_vol = vol, 0.0
+            elif mid < prev_mid:
+                buy_vol, sell_vol = 0.0, vol
+            else:
+                buy_vol = sell_vol = vol / 2.0
         else:
             buy_vol = sell_vol = vol / 2.0
+
+        # Use mid as the effective price when no last trade price exists
+        effective_last = last if last > 0 else mid
 
         delta = buy_vol - sell_vol
         self._cumulative_delta += delta
 
         self._ticks.append({
-            "bid": bid, "ask": ask, "last": last,
+            "bid": bid, "ask": ask, "last": effective_last,
             "volume": vol, "buy_vol": buy_vol, "sell_vol": sell_vol,
             "delta": delta, "time": t["time"],
         })
@@ -515,7 +532,7 @@ def _extract_tick(tick: Any) -> dict[str, float] | None:
         else:
             try:
                 v = tick[name]
-            except (KeyError, IndexError, TypeError):
+            except (KeyError, IndexError, TypeError, ValueError):
                 return default
         try:
             return float(v or 0.0)

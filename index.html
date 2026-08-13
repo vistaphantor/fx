@@ -121,7 +121,7 @@
                 <div class="card">
                     <div class="card-title">Target Goal <span id="gauge-pct">0%</span></div>
                     <div class="gauge-container"><div id="gauge-fill" class="gauge-fill" style="width: 0%"></div></div>
-                    <div style="text-align: center; font-size: 0.6rem; color: var(--text-dim)">TARGET: +$0.75 USD</div>
+                    <div id="target-label" style="text-align: center; font-size: 0.6rem; color: var(--text-dim)">TARGET: SYNCING...</div>
                 </div>
 
                 <div class="card">
@@ -146,8 +146,21 @@
 
     <script>
         let m1Chart, m1Series;
+        const $ = (id) => document.getElementById(id);
+        const numberOrZero = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
+        const setText = (id, value) => {
+            const el = $(id);
+            if (el) el.innerText = value;
+        };
 
         function initCharts() {
+            if (!window.LightweightCharts) {
+                const chart = $('m1Chart');
+                if (chart) {
+                    chart.innerHTML = '<canvas id="fallbackChart" style="width:100%;height:100%;display:block;"></canvas>';
+                }
+                return;
+            }
             const m1Options = {
                 layout: { backgroundColor: 'transparent', textColor: '#8b949e' },
                 grid: { vertLines: { color: 'rgba(48, 54, 61, 0.05)' }, horzLines: { color: 'rgba(48, 54, 61, 0.05)' } },
@@ -155,7 +168,7 @@
                 rightPriceScale: { visible: false },
                 timeScale: { borderColor: 'rgba(48, 54, 61, 0.4)', timeVisible: true },
             };
-            m1Chart = LightweightCharts.createChart(document.getElementById('m1Chart'), m1Options);
+            m1Chart = LightweightCharts.createChart($('m1Chart'), m1Options);
             m1Series = m1Chart.addCandlestickSeries({ upColor: '#00ff88', downColor: '#ff3366', borderVisible: false });
         }
 
@@ -170,66 +183,141 @@
             try {
                 const res = await fetch('/api/state');
                 const data = await res.json();
-                if (data.status === "waiting_for_bot") return;
+                if (data.status === "waiting_for_bot") {
+                    setText('connection-status', 'WAITING FOR BOT STATE');
+                    return;
+                }
+                setText('connection-status', `LIVE ${data.trading?.symbol || 'BOT'} ${data.trading?.status || ''}`);
 
                 // Math Row
-                if (data.signals.quant) {
-                    document.getElementById('hurst-val').innerText = data.signals.quant.hurst.toFixed(2);
-                    document.getElementById('z-val').innerText = data.signals.quant.z_score.toFixed(2);
-                    document.getElementById('smooth-val').innerText = data.signals.quant.smoothness.toFixed(2);
-                    document.getElementById('rev-val').innerText = data.signals.quant.reversion.toFixed(2);
-                    document.getElementById('ofi-val').innerText = data.signals.quant.ofi.toFixed(2);
-                    document.getElementById('kelly-val').innerText = data.signals.quant.kelly_lot.toFixed(2);
+                if (data.signals && data.signals.quant) {
+                    const quant = data.signals.quant;
+                    setText('hurst-val', numberOrZero(quant.hurst).toFixed(2));
+                    setText('z-val', numberOrZero(quant.z_score).toFixed(2));
+                    setText('smooth-val', numberOrZero(quant.smoothness).toFixed(2));
+                    setText('rev-val', numberOrZero(quant.reversion).toFixed(2));
+                    setText('ofi-val', numberOrZero(quant.ofi).toFixed(2));
+                    setText('kelly-val', numberOrZero(quant.kelly_lot).toFixed(2));
                     
                     // Z-Score Warning
-                    const z = Math.abs(data.signals.quant.z_score);
-                    document.getElementById('z-val').className = 'math-val ' + (z > 2.0 ? 'trend-up' : '');
+                    const z = Math.abs(numberOrZero(quant.z_score));
+                    $('z-val').className = 'math-val ' + (z > 2.0 ? 'trend-up' : '');
                 }
 
-                document.getElementById('equity').innerText = data.account.equity.toFixed(2);
-                document.getElementById('balance').innerText = data.account.balance.toFixed(2);
-                document.getElementById('profit').innerText = data.account.profit.toFixed(2);
-                document.getElementById('profit').className = data.account.profit >= 0 ? 'trend-up' : 'trend-down';
+                const account = data.account || {};
+                const trading = data.trading || {};
+                setText('equity', numberOrZero(account.equity).toFixed(2));
+                setText('balance', numberOrZero(account.balance).toFixed(2));
+                setText('profit', numberOrZero(account.profit).toFixed(2));
+                $('profit').className = numberOrZero(account.profit) >= 0 ? 'trend-up' : 'trend-down';
 
-                const pct = data.trading.target_progress || 0;
-                document.getElementById('gauge-pct').innerText = pct + '%';
-                document.getElementById('gauge-fill').style.width = pct + '%';
+                const pct = Math.max(0, Math.min(100, numberOrZero(trading.target_progress)));
+                setText('gauge-pct', pct.toFixed(1) + '%');
+                $('gauge-fill').style.width = pct + '%';
                 
-                if (data.account.currency) {
-                    const targetVal = data.trading.target_value || 0;
-                    document.getElementById('target-label').innerText = `TARGET: +${targetVal.toFixed(2)} ${data.account.currency}`;
-                }
+                const targetVal = numberOrZero(trading.target_value);
+                setText('target-label', `TARGET: +${targetVal.toFixed(2)} ${account.currency || 'USD'}`);
 
-                if (data.signals.mtf) {
+                if (data.signals && data.signals.mtf) {
                     updateTrend('mtf-m1', data.signals.mtf.m1);
                     updateTrend('mtf-m5', data.signals.mtf.m5);
                     updateTrend('mtf-m15', data.signals.mtf.m15);
                     updateTrend('mtf-h1', data.signals.mtf.h1);
                 }
 
-                if (data.market_data && data.market_data.m1_candles) m1Series.setData(data.market_data.m1_candles);
+                if (m1Series && data.market_data && data.market_data.m1_candles) {
+                    const candles = data.market_data.m1_candles
+                        .filter(c => c && Number(c.time) > 0)
+                        .map(c => ({
+                            time: Number(c.time),
+                            open: numberOrZero(c.open),
+                            high: numberOrZero(c.high),
+                            low: numberOrZero(c.low),
+                            close: numberOrZero(c.close),
+                        }));
+                    if (candles.length) m1Series.setData(candles);
+                } else if (data.market_data && data.market_data.m1_candles) {
+                    drawFallbackChart(data.market_data.m1_candles);
+                }
 
-                const hist = document.getElementById('history-body');
-                if (data.trading && data.trading.history) {
-                    hist.innerHTML = data.trading.history.slice().reverse().map(t => `
+                const hist = $('history-body');
+                if (hist && trading.history) {
+                    hist.innerHTML = trading.history.slice().reverse().map(t => `
                         <tr>
                             <td>${new Date(t.time).toLocaleTimeString()}</td>
                             <td>${t.ticket}</td>
                             <td>${t.reason}</td>
-                            <td class="${t.profit >= 0 ? 'trend-up' : 'trend-down'}">${t.profit >= 0 ? '+' : ''}${t.profit.toFixed(2)}</td>
+                            <td class="${numberOrZero(t.profit) >= 0 ? 'trend-up' : 'trend-down'}">${numberOrZero(t.profit) >= 0 ? '+' : ''}${numberOrZero(t.profit).toFixed(2)}</td>
                         </tr>
                     `).join('');
                 }
-            } catch (e) {}
+            } catch (e) {
+                setText('connection-status', `DASHBOARD ERROR: ${e.message}`);
+            }
         }
 
         function updateTrend(id, val) {
-            const el = document.getElementById(id);
-            el.innerText = val;
+            const el = $(id);
+            if (!el) return;
+            el.innerText = val || 'None';
             el.className = (val === 'BULLISH' ? 'trend-up' : val === 'BEARISH' ? 'trend-down' : 'trend-neutral');
         }
 
+        function drawFallbackChart(rawCandles) {
+            const canvas = $('fallbackChart');
+            if (!canvas) return;
+            const candles = rawCandles
+                .filter(c => c && Number(c.time) > 0)
+                .slice(-60)
+                .map(c => ({
+                    open: numberOrZero(c.open),
+                    high: numberOrZero(c.high),
+                    low: numberOrZero(c.low),
+                    close: numberOrZero(c.close),
+                }));
+            if (!candles.length) return;
+            const rect = canvas.getBoundingClientRect();
+            const dpr = window.devicePixelRatio || 1;
+            canvas.width = Math.max(1, Math.floor(rect.width * dpr));
+            canvas.height = Math.max(1, Math.floor(rect.height * dpr));
+            const ctx = canvas.getContext('2d');
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            ctx.clearRect(0, 0, rect.width, rect.height);
+            const highs = candles.map(c => c.high);
+            const lows = candles.map(c => c.low);
+            const maxPrice = Math.max(...highs);
+            const minPrice = Math.min(...lows);
+            const range = Math.max(maxPrice - minPrice, 0.0001);
+            const pad = 18;
+            const plotH = Math.max(rect.height - pad * 2, 1);
+            const y = (price) => pad + ((maxPrice - price) / range) * plotH;
+            const step = rect.width / candles.length;
+            ctx.strokeStyle = 'rgba(139, 148, 158, 0.18)';
+            ctx.lineWidth = 1;
+            for (let i = 0; i < 4; i++) {
+                const gy = pad + (plotH / 3) * i;
+                ctx.beginPath();
+                ctx.moveTo(0, gy);
+                ctx.lineTo(rect.width, gy);
+                ctx.stroke();
+            }
+            candles.forEach((c, i) => {
+                const x = i * step + step / 2;
+                const up = c.close >= c.open;
+                ctx.strokeStyle = up ? '#00ff88' : '#ff3366';
+                ctx.fillStyle = up ? '#00ff88' : '#ff3366';
+                ctx.beginPath();
+                ctx.moveTo(x, y(c.high));
+                ctx.lineTo(x, y(c.low));
+                ctx.stroke();
+                const bodyTop = y(Math.max(c.open, c.close));
+                const bodyBottom = y(Math.min(c.open, c.close));
+                ctx.fillRect(x - Math.max(step * 0.28, 2), bodyTop, Math.max(step * 0.56, 3), Math.max(bodyBottom - bodyTop, 2));
+            });
+        }
+
         initCharts();
+        updateDashboard();
         setInterval(updateDashboard, 1000);
     </script>
 </body>

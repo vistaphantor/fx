@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from src.mt5_client import Mt5Session
+from src.mt5_client import Mt4FallbackSession, Mt5Session
 
 
 class FakeSubprocess:
@@ -72,3 +72,30 @@ def test_initialize_and_login_calls_mt5_after_launch(tmp_path):
     assert fake_subprocess.calls == [[str(terminal)]]
     assert fake_mt5.initialize_calls == [True]
     assert fake_mt5.login_calls == [(123, "pw", "demo")]
+
+
+def test_mt4_fallback_launch_writes_login_config_and_starts_terminal(tmp_path):
+    terminal = tmp_path / "terminal.exe"
+    terminal.write_text("", encoding="utf-8")
+    config_path = tmp_path / "mt4-login.ini"
+    fake_subprocess = FakeSubprocess()
+    session = Mt4FallbackSession(
+        terminal_path=terminal,
+        startup_wait_seconds=1,
+        config_path=config_path,
+        subprocess_module=fake_subprocess,
+        sleep_fn=lambda _: None,
+    )
+
+    session.launch_terminal(login=123, password="pw", server="demo", symbol="XAUUSD", period="M1")
+
+    assert fake_subprocess.calls == [[str(terminal), str(config_path.resolve())]]
+    config_text = config_path.read_text(encoding="utf-8")
+    assert "Login=123" in config_text
+    assert "Password=pw" in config_text
+    assert "Server=demo" in config_text
+    assert "ExpertsEnable=true" in config_text
+    assert "ExpertsTrades=true" in config_text
+    assert "Symbol=XAUUSD" in config_text
+    assert "Period=M1" in config_text
+    assert "Expert=FxPythonBridge" in config_text

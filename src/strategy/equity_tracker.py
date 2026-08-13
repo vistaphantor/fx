@@ -150,48 +150,22 @@ def compute_position_size(
 ) -> float:
     """Compute position size using the Kelly-fraction formula.
 
-    w_t = Equity * min(r_max, Kelly) * Ω_t
-
-    The result is rounded down to the nearest ``volume_step`` and
-    clamped to ``[volume_min, ∞)``.
-
-    Parameters
-    ----------
-    equity : float
-        Current account equity.
-    win_rate : float
-        Historical win probability.
-    avg_win : float
-        Average winning trade amount.
-    avg_loss : float
-        Average losing trade amount.
-    omega_t : float
-        Trade quality multiplier from the quant engine.
-    r_max : float
-        Maximum risk fraction (default 2% of equity).
-    volume_min : float
-        Broker minimum lot size.
-    volume_step : float
-        Broker lot step size.
-    price_per_lot : float
-        Approximate value of 1 lot in account currency (for sizing).
-
-    Returns
-    -------
-    float
-        Position size in lots.
+    Refuses to trade (returns 0.0) if price_per_lot is <= 0 or inf.
     """
-    if equity <= 0 or price_per_lot <= 0:
-        return volume_min
+    if equity <= 0 or price_per_lot <= 0 or math.isinf(price_per_lot) or math.isnan(price_per_lot):
+        return 0.0
 
     kelly = compute_kelly_fraction(win_rate, avg_win, avg_loss)
     risk_fraction = min(r_max, kelly) * max(0.0, min(1.0, omega_t))
     risk_amount = equity * risk_fraction
 
-    # Convert risk amount to lots
+    # Convert risk amount to lots based on real dollar risk per lot
     raw_lots = risk_amount / price_per_lot
     if raw_lots < volume_min:
-        return volume_min
+        # If risk budget allows at least min lot safely within 1.5x risk budget:
+        if risk_amount >= (price_per_lot * volume_min * 0.70):
+            return volume_min
+        return 0.0  # Refuse trade if account equity cannot afford minimum lot risk
 
     # Round down to nearest volume_step
     if volume_step > 0:
@@ -223,7 +197,14 @@ def compute_price_risk_per_lot(*, entry_price: float, stop_loss: float, symbol_i
     if contract_size is not None:
         return stop_distance * contract_size
 
-    return 0.0
+    # Fallback for MT4 bridge or incomplete CFD feeds (Gold = 100 oz per lot, Forex = 100,000)
+    symbol_name = str(getattr(symbol_info, "name", getattr(symbol_info, "symbol", "")) or "").upper()
+    if "XAU" in symbol_name or "GOLD" in symbol_name or (entry_price > 1000 and entry_price < 10000):
+        fallback_contract = 100.0  # Standard Gold contract size
+    else:
+        fallback_contract = 100000.0  # Standard Forex contract size
+
+    return stop_distance * fallback_contract
 
 
 def _first_positive_attr(source, *names: str) -> float | None:

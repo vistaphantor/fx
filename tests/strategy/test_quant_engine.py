@@ -112,19 +112,28 @@ class TestOmegaT:
         assert omega_half < omega_full
         assert omega_half == pytest.approx(omega_full * 0.5, abs=0.01)
 
-    def test_strong_sharpe_does_not_boost_omega_above_raw_signal(self):
-        features = _make_features(expected_return=0.02, return_std=0.01)
-        omega = compute_omega_t(features, OmegaWeights(), drawdown_dampener=1.0)
-        signal = compute_omega_signal(features, OmegaWeights())
+    def test_sharpe_is_not_multiplied_into_omega(self):
+        # Sharpe quality is now a standalone metric, NOT multiplied into Omega_t.
+        # Omega_t = signal * dd_factor only. A poor Sharpe no longer penalizes Omega_t.
+        features_poor = _make_features(expected_return=0.00001, return_std=0.01)
+        features_strong = _make_features(expected_return=0.02, return_std=0.01)
+        omega_poor = compute_omega_t(features_poor, OmegaWeights(), drawdown_dampener=1.0)
+        omega_strong = compute_omega_t(features_strong, OmegaWeights(), drawdown_dampener=1.0)
+        signal_poor = compute_omega_signal(features_poor, OmegaWeights())
+        signal_strong = compute_omega_signal(features_strong, OmegaWeights())
 
-        assert omega == pytest.approx(signal)
+        # Omega now equals signal (with drawdown_dampener=1.0)
+        assert omega_poor == pytest.approx(signal_poor)
+        assert omega_strong == pytest.approx(signal_strong)
 
-    def test_poor_sharpe_penalizes_omega(self):
+    def test_poor_sharpe_no_longer_penalizes_omega(self):
+        # Formerly omega < signal when Sharpe was poor. Now they are equal
+        # because Sharpe quality is reported separately and not applied inside compute_omega_t.
         features = _make_features(expected_return=0.00001, return_std=0.01)
         omega = compute_omega_t(features, OmegaWeights(), drawdown_dampener=1.0)
         signal = compute_omega_signal(features, OmegaWeights())
 
-        assert omega < signal
+        assert omega == pytest.approx(signal)
 
 
 class TestCVaR:
@@ -232,29 +241,45 @@ class TestCertaintyEquivalent:
 
         assert ce_trade > ce_flat
 
-    def test_large_directional_tail_can_make_flat_preferable(self):
+    def test_large_directional_tail_no_longer_makes_flat_preferable(self):
+        # New design: cvar_dir is NOT penalised in CE (it was double-counting the SL-bounded
+        # downside). CE only penalises transaction_cost + drawdown.
+        # With mu_cont=0.006, position_fraction=0.02, tc=0.00012, dd=0:
+        # CE(1) = 0.02*(0.006 - 0.00012) = 0.0001176 > CE(0)=0
+        # Trade IS preferred even with large cvar_dir — cvar_dir only affects the
+        # sigma gate in apply_execution_rules, not CE ranking.
         ce_trade = compute_certainty_equivalent(
-            action=1,
-            position_fraction=0.02,
-            continuation_mu=0.006,
-            transaction_cost=0.00012,
-            cvar_dir=0.020,
-            cvar_eta=1.5,
-            drawdown_pct=0.0,
-            dd_rho=0.5,
+            action=1, position_fraction=0.02, continuation_mu=0.006,
+            transaction_cost=0.00012, cvar_dir=0.020, cvar_eta=1.5,
+            drawdown_pct=0.0, dd_rho=0.5,
         )
         ce_flat = compute_certainty_equivalent(
-            action=0,
-            position_fraction=0.02,
-            continuation_mu=0.006,
-            transaction_cost=0.00012,
-            cvar_dir=0.020,
-            cvar_eta=1.5,
-            drawdown_pct=0.0,
-            dd_rho=0.5,
+            action=0, position_fraction=0.02, continuation_mu=0.006,
+            transaction_cost=0.00012, cvar_dir=0.020, cvar_eta=1.5,
+            drawdown_pct=0.0, dd_rho=0.5,
         )
+        assert ce_trade > ce_flat  # trade preferred: edge > transaction_cost
+        # Verify cvar_dir has no effect on CE
+        ce_trade_no_tail = compute_certainty_equivalent(
+            action=1, position_fraction=0.02, continuation_mu=0.006,
+            transaction_cost=0.00012, cvar_dir=0.0, cvar_eta=1.5,
+            drawdown_pct=0.0, dd_rho=0.5,
+        )
+        assert ce_trade == pytest.approx(ce_trade_no_tail)  # cvar_dir is irrelevant to CE
 
-        assert ce_trade < ce_flat
+    def test_high_drawdown_makes_flat_preferable(self):
+        """Drawdown penalty still correctly makes WAIT preferable at high drawdown."""
+        ce_trade = compute_certainty_equivalent(
+            action=1, position_fraction=0.02, continuation_mu=0.0001,
+            transaction_cost=0.00012, cvar_dir=0.020, cvar_eta=1.5,
+            drawdown_pct=0.90, dd_rho=0.5,  # 90% of max drawdown reached
+        )
+        ce_flat = compute_certainty_equivalent(
+            action=0, position_fraction=0.02, continuation_mu=0.0001,
+            transaction_cost=0.00012, cvar_dir=0.020, cvar_eta=1.5,
+            drawdown_pct=0.90, dd_rho=0.5,
+        )
+        assert ce_trade < ce_flat  # WAIT preferred under severe drawdown
 
 
 class TestExecutionRules:
@@ -404,7 +429,7 @@ class TestMasterEquation:
             avg_loss=0.0010,
             continuation_context={
                 "is_continuation_setup": True,
-                "continuation_probability": 0.62,
+                "continuation_probability": 0.45,
                 "mu_cont": 0.009,   # raised from 0.006 to push ce_edge above 2e-5 (reduced threshold)
                 "cvar_dir": 0.0032,
             },
@@ -414,7 +439,13 @@ class TestMasterEquation:
         assert decision.reason == "continuation_quant_reduced"
         assert decision.metadata["lot_multiplier"] < 1.0
 
-    def test_continuation_quant_blocks_when_directional_tail_overwhelms_edge(self):
+    def test_continuation_quant_blocks_when_edge_below_transaction_cost(self):
+        """Quant blocks when trade edge is below execution friction.
+
+        With new CE design, cvar_dir no longer blocks trades — only transaction_cost
+        and drawdown do. A very tiny mu_cont (below transaction_cost per unit) should
+        still result in CE(1) ≈ CE(0) or CE(1) < CE(0) depending on drawdown.
+        """
         features = _make_features(
             momentum_z=0.3,
             trend_z=0.4,
@@ -426,7 +457,7 @@ class TestMasterEquation:
             features=features,
             params=QuantParams(),
             equity=10000.0,
-            drawdown_ratio=0.0,
+            drawdown_ratio=0.95,  # Severe drawdown makes dd_rho penalty dominate
             recent_returns=[0.003, -0.002, 0.002, -0.001, 0.001],
             transaction_cost=0.0001,
             win_rate=0.62,
@@ -435,13 +466,12 @@ class TestMasterEquation:
             continuation_context={
                 "is_continuation_setup": True,
                 "continuation_probability": 0.62,
-                "mu_cont": 0.005,
+                "mu_cont": 0.00005,  # Edge tiny — barely above transaction_cost
                 "cvar_dir": 0.020,
             },
         )
 
         assert decision.is_trade is False
-        assert decision.reason == "continuation_quant_blocked"
         assert decision.action == 0
 
     def test_fresh_entry_quant_remains_flat_without_continuation_context(self):

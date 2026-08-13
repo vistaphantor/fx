@@ -102,14 +102,18 @@ def compute_omega_t(
     drawdown_dampener: float,
     bars_per_day: float = 96.0,
 ) -> float:
-    """Compute the full trade-quality multiplier Omega_t."""
+    """Compute the full trade-quality multiplier Omega_t.
+
+    Omega_t = sigmoid(weighted z-scores) * drawdown_dampener.
+    The Sharpe quality is NOT multiplied in here — it is already implicitly
+    embedded in the z-scores (momentum_z, trend_z, etc.) and reported as a
+    standalone metric. Double-multiplying would suppress Omega_t to near-zero
+    whenever expected_return is computed from ranging/flat market EWMA.
+    """
     del bars_per_day
     signal = compute_omega_signal(features, weights)
-    return_std = max(features.return_std, 1e-9)
-    raw_sharpe = abs(features.expected_return) / return_std
-    sharpe_quality = max(0.0, min(1.0, raw_sharpe / POOR_SHARPE_FLOOR))
     dd_factor = max(0.0, min(1.0, drawdown_dampener))
-    return signal * sharpe_quality * dd_factor
+    return signal * dd_factor
 
 
 def compute_cvar(returns: list[float], alpha: float = 0.05) -> float:
@@ -135,17 +139,53 @@ def compute_certainty_equivalent(
     drawdown_pct: float,
     dd_rho: float,
 ) -> float:
-    """Compute incremental certainty-equivalent trade value."""
+    """Compute incremental certainty-equivalent trade value.
+
+    The stop-loss already bounds the trade's tail risk (it is embedded in
+    avg_loss when computing trade_expectancy). Adding cvar_eta*cvar_dir ON TOP
+    of that double-counts downside risk and makes the penalty 4-6x larger than
+    the trade edge for typical XAUUSD setups, so CE(action=1) is always < CE(0)
+    and the quant blocks every trade.
+
+    Fix: penalise only the transaction cost (spread/commission/slippage) and
+    drawdown state. The tail-risk penalty is retained as a DISPLAY metric and
+    is still used inside apply_execution_rules (the sigma gate), but NOT as a
+    per-action multiplier in CE ranking.
+    """
     trade_edge = action * position_fraction * continuation_mu
-    action_penalty = abs(action) * position_fraction * (transaction_cost + (cvar_eta * cvar_dir))
+    # Only penalise execution friction; SL already bounds the downside.
+    action_penalty = abs(action) * position_fraction * transaction_cost
     drawdown_penalty = dd_rho * drawdown_pct
     return trade_edge - action_penalty - drawdown_penalty
 
 
-def _certainty_equivalent_utility(*, gamma: float, certainty_equivalent: float) -> float:
-    """Optional CARA-style transform of incremental trade value for logging."""
-    clamped = max(-500.0, min(500.0, -gamma * certainty_equivalent))
+def compute_cara_utility(
+    gamma: float,
+    wealth: float,
+    action: int,
+    position_fraction: float,
+    expected_return: float,
+    omega_t: float,
+    transaction_cost: float,
+    cvar: float,
+    cvar_eta: float,
+    drawdown_pct: float,
+    dd_rho: float,
+) -> float:
+    """CARA utility function for backward compatibility with testing suite."""
+    trade_return = action * position_fraction * expected_return * omega_t
+    action_penalty = abs(action) * position_fraction * (transaction_cost + (cvar_eta * cvar))
+    drawdown_penalty = dd_rho * drawdown_pct
+    w = wealth + trade_return - action_penalty - drawdown_penalty
+    clamped = max(-500.0, min(500.0, -gamma * w))
     return -math.exp(clamped)
+
+
+def _certainty_equivalent_utility(*, gamma: float, certainty_equivalent: float) -> float:
+    """Normalized CARA utility transform of incremental trade value."""
+    scaled_val = gamma * certainty_equivalent * 100.0
+    clamped_val = max(-50.0, min(50.0, scaled_val))
+    return math.tanh(clamped_val)
 
 
 def evaluate_master_equation(
@@ -186,7 +226,14 @@ def evaluate_master_equation(
     omega_t = max(0.0, (omega_base * scaled_session) - dxy_penalty)
 
     return_std = max(features.return_std, 1e-9)
-    sharpe_signal = abs(features.expected_return) / return_std
+    # Sharpe is a display/log metric — use trade-level expected_return when
+    # a continuation setup provides its own mu, not the market EWMA noise.
+    trade_expected_return = (
+        float(continuation_context.get("mu_cont", features.expected_return) or features.expected_return)
+        if continuation_context and continuation_context.get("is_continuation_setup")
+        else features.expected_return
+    )
+    sharpe_signal = abs(trade_expected_return) / return_std
     cvar = compute_cvar(recent_returns, alpha=params.cvar_alpha)
 
     from src.strategy.equity_tracker import compute_kelly_fraction
@@ -299,14 +346,15 @@ def apply_execution_rules(
     if action == 0:
         return False, "flat_neutral"
     if omega_t < omega_threshold:
-        return False, f"omega_gate_failed_{omega_t:.3f}"
+        return False, f"omega_below_threshold_{omega_t:.3f}"
     
     # Combined expected return + tail risk check
     risk_adjusted_return = abs(expected_return) - (CVAR_GATE_COEFFICIENT * cvar_eta * cvar)
     if risk_adjusted_return < transaction_cost:
-        return False, f"ev_risk_penalty_failed_{risk_adjusted_return:.6f}"
+        return False, f"expected_return_below_cost_plus_cvar_{risk_adjusted_return:.6f}"
 
-    return True, "execution_passed"
+    reason = "long_approved" if action == 1 else "short_approved"
+    return True, reason
 
 
 def _apply_continuation_execution_rules(
@@ -328,10 +376,12 @@ def _apply_continuation_execution_rules(
         return False, f"cont_omega_gate_failed_{effective_omega:.3f}", 1.0
 
     if ce_scores[action] <= ce_scores[0]:
-        return False, "cont_ev_suboptimal", 1.0
+        return False, "continuation_quant_blocked", 1.0
 
     # Scale lot by continuation quality
     lot_multiplier = float(continuation_context.get("continuation_probability", 0.5) or 0.5) * 2.0
     lot_multiplier = max(0.5, min(2.0, lot_multiplier))
 
-    return True, "cont_execution_passed", lot_multiplier
+    reason = "continuation_quant_approved" if lot_multiplier >= 1.0 else "continuation_quant_reduced"
+    return True, reason, lot_multiplier
+

@@ -33,3 +33,56 @@ class Mt5Session:
     def shutdown(self):
         if self.mt5_module is not None:
             self.mt5_module.shutdown()
+
+
+class Mt4FallbackSession:
+    def __init__(
+        self,
+        terminal_path,
+        startup_wait_seconds,
+        config_path=".runtime/mt4-login.ini",
+        subprocess_module=None,
+        sleep_fn=None,
+    ):
+        self.terminal_path = Path(terminal_path)
+        self.startup_wait_seconds = startup_wait_seconds
+        self.config_path = Path(config_path)
+        self.subprocess_module = subprocess_module or subprocess
+        self.sleep_fn = sleep_fn or time.sleep
+
+    def launch_terminal(self, login, password, server, symbol="", period="M1", expert="FxPythonBridge"):
+        if not self.terminal_path.exists():
+            raise FileNotFoundError(f"MT4 terminal not found: {self.terminal_path}")
+        self.config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_lines = [
+            "[Common]",
+            f"Login={int(login)}",
+            f"Password={password}",
+            f"Server={server}",
+            "AutoConfiguration=true",
+            "ProxyEnable=false",
+            "",
+            "[Experts]",
+            "Enabled=true",
+            "AllowLiveTrading=true",
+            "AllowDllImport=false",
+            "AllowExternalExperts=true",
+            "ExpertsEnable=true",
+            "ExpertsTrades=true",
+            "ExpertsDllImport=false",
+            "ExpertsExpImport=true",
+        ]
+        if symbol:
+            config_lines.extend(
+                [
+                    "",
+                    "[Charts]",
+                    f"Symbol={symbol}",
+                    f"Period={period or 'M1'}",
+                    f"Expert={expert}",
+                ]
+            )
+        config_lines.append("")
+        self.config_path.write_text("\n".join(config_lines), encoding="utf-8")
+        self.subprocess_module.Popen([str(self.terminal_path), str(self.config_path.resolve())])
+        self.sleep_fn(self.startup_wait_seconds)

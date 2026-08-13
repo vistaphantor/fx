@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from src.trade_executor import build_close_order_request, build_modify_sl_tp_request, build_open_order_request
-from src.trade_executor import normalize_lot_size, resolve_filling_mode, TradeExecutor
+from src.trade_executor import build_strategy_order_request, normalize_lot_size, resolve_filling_mode, TradeExecutor
 from src.strategy.breakout import BreakoutDirection
 
 
@@ -33,6 +33,42 @@ def test_build_open_order_request_for_buy_uses_ask_price():
     assert request["price"] == 2350.5
     assert request["type_filling"] == 0
     assert request["comment"] == "skeleton-test"
+
+
+def test_build_strategy_order_request_maps_direction_to_executable_side():
+    tick = SimpleNamespace(ask=2350.5, bid=2350.1)
+
+    buy = build_strategy_order_request(
+        FakeMt5(),
+        "XAUUSD",
+        BreakoutDirection.BULLISH,
+        0.01,
+        tick,
+        0,
+        2349.5,
+        2351.5,
+        "quick-scalp",
+    )
+    sell = build_strategy_order_request(
+        FakeMt5(),
+        "XAUUSD",
+        BreakoutDirection.BEARISH,
+        0.01,
+        tick,
+        0,
+        2351.1,
+        2349.1,
+        "quick-scalp",
+    )
+
+    assert buy["type"] == FakeMt5.ORDER_TYPE_BUY
+    assert buy["price"] == pytest.approx(2350.5)
+    assert buy["sl"] == pytest.approx(2349.5)
+    assert buy["tp"] == pytest.approx(2351.5)
+    assert sell["type"] == FakeMt5.ORDER_TYPE_SELL
+    assert sell["price"] == pytest.approx(2350.1)
+    assert sell["sl"] == pytest.approx(2351.1)
+    assert sell["tp"] == pytest.approx(2349.1)
 
 
 def test_resolve_filling_mode_maps_symbol_bitmask_to_order_fill_enum():

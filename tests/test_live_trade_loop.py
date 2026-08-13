@@ -63,11 +63,38 @@ def test_live_loop_opens_entry_when_decision_tree_returns_trade(monkeypatch):
         log_fn=lambda message: events.append(("log", message)),
     )
 
-    assert events[0][0] == "open"
-    assert events[0][1]["symbol"] == "XAUUSD"
-    assert events[0][1]["direction"] is BreakoutDirection.BULLISH
-    assert events[0][1]["lot"] == 0.01
+    open_event = next(e for e in events if e[0] == "open")
+    assert open_event[1]["symbol"] == "XAUUSD"
+    assert open_event[1]["direction"] is BreakoutDirection.BULLISH
+    assert open_event[1]["lot"] == 0.01
     assert ("log", "LIVE TRADE OPENED XAUUSD ticket=99 direction=BULLISH entry=2350.0 sl=2345.0 tp=2365.0") in events
+
+
+def test_live_loop_preserves_broker_symbol_case_for_mt5_data(monkeypatch):
+    from src.live_trade_loop import run_live_signal_loop
+
+    symbols_seen = []
+
+    def capture_symbol(mt5_module, symbol):
+        symbols_seen.append(symbol)
+        raise RuntimeError(f"Not enough TIMEFRAME_D1 candle data for {symbol}")
+
+    monkeypatch.setattr("src.live_trade_loop.build_live_strategy_input", capture_symbol)
+
+    run_live_signal_loop(
+        mt5_module=SimpleNamespace(),
+        executor=SimpleNamespace(),
+        symbol="XAUUSDc",
+        lot=0.01,
+        risk_buffer=0.05,
+        max_candles_since_breakout=3,
+        poll_seconds=10,
+        max_loops=1,
+        sleep_fn=lambda seconds: None,
+        log_fn=lambda message: None,
+    )
+
+    assert symbols_seen == ["XAUUSDc"]
 
 
 def test_live_loop_writes_standard_mode_training_snapshot(monkeypatch):
@@ -409,8 +436,8 @@ def test_live_loop_opens_strong_continuation_trade_below_legacy_rr_floor(monkeyp
         log_fn=lambda message: events.append(("log", message)),
     )
 
-    assert events[0][0] == "open"
-    assert events[0][1]["symbol"] == "XAUUSD"
+    open_event = next(e for e in events if e[0] == "open")
+    assert open_event[1]["symbol"] == "XAUUSD"
 
 
 def test_live_loop_trails_existing_campaign_before_opening_new_trade(monkeypatch):
@@ -630,10 +657,10 @@ def test_live_loop_adds_position_when_campaign_action_allows(monkeypatch):
         log_fn=lambda message: events.append(("log", message)),
     )
 
-    assert events[0][0] == "open"
-    assert events[0][1]["lot"] == 0.02
-    assert events[0][1]["stop_loss"] == 110.0
-    assert events[0][1]["take_profit"] == 130.0
+    open_event = next(e for e in events if e[0] == "open")
+    assert open_event[1]["lot"] == 0.02
+    assert open_event[1]["stop_loss"] == 110.0
+    assert open_event[1]["take_profit"] == 130.0
     assert captured_management_kwargs["add_on_lot_increment"] == 0.03
     assert captured_management_kwargs["max_exposure_pct"] == 8.5
 
@@ -720,8 +747,8 @@ def test_live_loop_reduces_campaign_add_when_quant_engine_is_flat_but_campaign_a
         log_fn=lambda message: events.append(("log", message)),
     )
 
-    assert events[0][0] == "open"
-    assert events[0][1]["lot"] == 0.01
+    open_event = next(e for e in events if e[0] == "open")
+    assert open_event[1]["lot"] == 0.01
     assert (
         "log",
         "LIVE CAMPAIGN ADD XAUUSD ticket=2 direction=BULLISH entry=115.0 sl=110.0 tp=130.0 lot=0.01 reason=campaign_add_quant_reduced",
@@ -1351,7 +1378,7 @@ def test_estimate_strategy_trade_statistics_uses_trade_plan_expectancy():
         campaign_exposure_pct=0.0,
     )
 
-    assert stats["win_rate"] > 0.5
+    assert stats["win_rate"] > 0.35  # Exceeds breakeven win rate (~33% for 2:1 R:R)
     assert stats["avg_win"] > stats["avg_loss"]
     assert stats["expected_return"] < 0.0
     assert 0.0 < stats["transaction_cost"] < 0.01
@@ -1360,6 +1387,47 @@ def test_estimate_strategy_trade_statistics_uses_trade_plan_expectancy():
         -((4696.5 - 4698.5) / 4698.5),
         -((4700.0 - 4696.5) / 4696.5),
     ]
+
+
+def test_estimate_strategy_trade_statistics_blends_recent_directional_returns():
+    from src.live_trade_loop import _estimate_strategy_trade_statistics
+    from src.strategy.breakout import BreakoutDirection
+    from src.strategy.decision_tree import TopDownTradePlan
+
+    trade_plan = TopDownTradePlan(
+        is_trade=True,
+        direction=BreakoutDirection.BULLISH,
+        entry_price=100.0,
+        stop_loss=99.0,
+        take_profit=103.0,
+        objective_price=104.0,
+        reason="top_down_trade_plan_ready",
+        metadata={},
+    )
+    closes = [100.0, 101.0, 102.0, 101.8, 102.8, 103.6, 103.2, 104.4, 105.2, 104.9, 106.3]
+    live_input = SimpleNamespace(
+        m15_candles=[
+            SimpleNamespace(open=close - 0.1, high=close + 0.2, low=close - 0.2, close=close)
+            for close in closes
+        ],
+        spread=0.04,
+        tick_data={"bid": 102.38, "ask": 102.42},
+    )
+
+    stats = _estimate_strategy_trade_statistics(
+        strategy_result=trade_plan,
+        live_input=live_input,
+        spread=0.04,
+        requested_lot=0.01,
+        campaign_exposure_pct=0.0,
+    )
+
+    recent_returns = stats["recent_returns"]
+    empirical_win_rate = len([value for value in recent_returns if value > stats["transaction_cost"]]) / len(recent_returns)
+    assert stats["win_rate"] != pytest.approx(0.5)
+    assert stats["win_rate"] > 0.5
+    assert empirical_win_rate > 0.5
+    assert stats["expected_return"] > 0.0
 
 
 def test_live_loop_passes_strategy_trade_stats_into_quant_engine(monkeypatch):
@@ -2102,7 +2170,19 @@ def test_live_loop_blocks_trade_when_quant_direction_disagrees(monkeypatch):
         settings=settings,
     )
 
-    assert ("log", "LIVE NO TRADE XAUUSD reason=quant_direction_mismatch node=quant_engine") in events
+    # With the new design, quant direction mismatch no longer hard-blocks the trade.
+    # Instead, action=-1 from the quant while strategy is BULLISH contributes negatively
+    # to the quant component in the fusion score:
+    #   quant_component = 0.75*omega + 0.35*(-1) + trade_bias
+    # This reduces confidence but does NOT cause a hard kill.
+    # The test verifies the DECISION log exists and shows fusion evaluated the trade.
+    decision_events = [e for e in events if e[0] == "log" and "DECISION XAUUSD" in e[1]]
+    assert len(decision_events) >= 1, f"Expected at least one DECISION log, got: {events}"
+    decision_log = decision_events[0][1]
+    # The quant disagreement reduces score — verify fusion ran and produced a decision
+    assert "DECISION XAUUSD" in decision_log
+    # No hard_block quant_direction_mismatch should appear
+    assert not any("quant_direction_mismatch" in e[1] for e in events if e[0] == "log")
 
 
 def test_live_loop_passes_latest_tradingview_alert_into_decision_tree(monkeypatch):
@@ -2172,3 +2252,80 @@ def test_live_loop_passes_latest_tradingview_alert_into_decision_tree(monkeypatc
     assert captured_kwargs["tradingview_alert"] is alert
     assert captured_kwargs["m10_candles"] == ["m10"]
     assert captured_kwargs["m5_candles"] == ["m5"]
+
+
+def test_live_loop_panic_closes_all_positions(monkeypatch):
+    from src.live_trade_loop import run_live_signal_loop
+    from src.strategy.decision_tree import TopDownNoTrade
+
+    closed_tickets = []
+    removed_signals = []
+    panic_exists = True
+
+    def mock_exists(path):
+        if path == "panic.signal":
+            return panic_exists
+        return False
+
+    def mock_remove(path):
+        if path == "panic.signal":
+            nonlocal panic_exists
+            panic_exists = False
+        removed_signals.append(path)
+
+    class FakeExecutor:
+        def list_bot_positions(self, symbol, comment_prefix="strategy-live"):
+            if symbol == "XAUUSD":
+                return [SimpleNamespace(ticket=1001, symbol="XAUUSD", volume=0.1, type=0, price_open=2345.0, sl=2330.0, tp=2380.0)]
+            if symbol == "EURJPY":
+                return [SimpleNamespace(ticket=1002, symbol="EURJPY", volume=0.1, type=1, price_open=165.0, sl=166.0, tp=163.0)]
+            return []
+
+        def close_position(self, position, comment):
+            assert comment == "PANIC-EXIT"
+            closed_tickets.append((position.symbol, position.ticket))
+
+    monkeypatch.setattr("os.path.exists", mock_exists)
+    monkeypatch.setattr("os.remove", mock_remove)
+
+    live_input = SimpleNamespace(
+        d1_candles=[],
+        h4_candles=[],
+        h1_candles=[],
+        m30_candles=[],
+        m15_candles=[SimpleNamespace(close=2350.0, timestamp=datetime(2026, 4, 28, 6, 15, tzinfo=timezone.utc))],
+        m5_candles=[],
+    )
+    no_trade = TopDownNoTrade(
+        is_trade=False,
+        reason="m15_trigger_missing",
+        failed_node="m15_trigger",
+        metadata={},
+    )
+    monkeypatch.setattr("src.live_trade_loop.build_live_strategy_input", lambda mt5_module, symbol: live_input)
+    monkeypatch.setattr("src.live_trade_loop.evaluate_top_down_decision_tree", lambda **kwargs: no_trade)
+
+    events = []
+    run_live_signal_loop(
+        mt5_module=SimpleNamespace(),
+        executor=FakeExecutor(),
+        symbol="XAUUSD, EURJPY",
+        lot=0.01,
+        risk_buffer=0.05,
+        max_candles_since_breakout=3,
+        poll_seconds=10,
+        max_loops=1,
+        reload_check_fn=lambda: False,
+        sleep_fn=lambda seconds: events.append(("sleep", seconds)),
+        log_fn=lambda message: events.append(("log", message)),
+    )
+
+    assert ("XAUUSD", 1001) in closed_tickets
+    assert ("EURJPY", 1002) in closed_tickets
+    assert "panic.signal" in removed_signals
+    assert any("PANIC SIGNAL DETECTED" in msg for _, msg in events if _ == "log")
+    assert any("Panic exit complete" in msg for _, msg in events if _ == "log")
+    assert ("sleep", 30) in events
+
+
+

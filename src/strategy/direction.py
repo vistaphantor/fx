@@ -7,6 +7,7 @@ from src.strategy.breakout import BreakoutDirection
 from src.strategy.context import DailyContext, H4Context
 from src.strategy.gap import GapDecision
 from src.strategy.orderflow import OrderflowSignal, score_orderflow_for_direction
+from src.strategy.patterns import detect_candlestick_patterns
 from src.strategy.tradingview_confluence import TradingViewConfluence
 
 
@@ -28,6 +29,8 @@ def determine_h1_bias(
     gap_decision: GapDecision | None = None,
     tradingview_confluence: TradingViewConfluence | None = None,
     orderflow_signal: OrderflowSignal | None = None,
+    h4_candles: list[Candle] | None = None,
+    m15_candles: list[Candle] | None = None,
 ) -> DirectionDecision:
     _require_timeframe(h1_candles, "H1", minimum=4)
 
@@ -45,6 +48,22 @@ def determine_h1_bias(
     volume_threshold = max(day_range * 0.03, 1.0)
     zone_break_threshold = max(day_range * 0.01, 0.5)
 
+    h4_trend_direction = 0
+    if h4_candles is not None and len(h4_candles) >= 2:
+        h4_start_close = float(h4_candles[0].close)
+        h4_end_close = float(h4_candles[-1].close)
+        h4_start_low = float(h4_candles[0].low)
+        h4_end_low = float(h4_candles[-1].low)
+        h4_start_high = float(h4_candles[0].high)
+        h4_end_high = float(h4_candles[-1].high)
+        if h4_end_close > h4_start_close and h4_end_low >= h4_start_low:
+            h4_trend_direction = 1
+        elif h4_end_close < h4_start_close and h4_end_high <= h4_start_high:
+            h4_trend_direction = -1
+
+    bullish_override_pressure = (h4_trend_direction == -1) and (momentum > momentum_threshold * 2.0)
+    bearish_override_pressure = (h4_trend_direction == 1) and (momentum < -(momentum_threshold * 2.0))
+
     common_metadata = {
         "current_price": current_price,
         "momentum": momentum,
@@ -55,6 +74,8 @@ def determine_h1_bias(
         "volume_support_distance": volume_support_distance,
         "volume_resistance_distance": volume_resistance_distance,
         "latest_h1_close": latest_h1_close,
+        "bullish_override_pressure": bullish_override_pressure,
+        "bearish_override_pressure": bearish_override_pressure,
     }
 
     in_demand_zone = _is_inside_zone(current_price, h4_context.demand_zones)
@@ -130,8 +151,29 @@ def determine_h1_bias(
             bearish_score += tradingview_confluence.direction_bonus
             bullish_score = max(0, bullish_score - tradingview_confluence.direction_penalty)
 
+    # Evaluate candlestick patterns (Pinbars, Engulfing, Momentum Expansion, Morning/Evening Star)
+    pattern_candles = m15_candles if m15_candles and len(m15_candles) >= 2 else h1_candles
+    candlestick_pattern = detect_candlestick_patterns(pattern_candles)
+    if candlestick_pattern.is_present:
+        pat_dir = candlestick_pattern.metadata.get("direction")
+        if pat_dir == "BULLISH":
+            bullish_score += candlestick_pattern.confluence_score
+        elif pat_dir == "BEARISH":
+            bearish_score += candlestick_pattern.confluence_score
+
+    # Evaluate live orderflow signal support
+    if orderflow_signal is not None:
+        bull_of = score_orderflow_for_direction(orderflow_signal, BreakoutDirection.BULLISH)
+        bear_of = score_orderflow_for_direction(orderflow_signal, BreakoutDirection.BEARISH)
+        if bull_of.is_supportive:
+            bullish_score += 1
+        elif bear_of.is_supportive:
+            bearish_score += 1
+
     common_metadata.update(
         {
+            "candlestick_pattern": candlestick_pattern.reason if candlestick_pattern.is_present else None,
+            "candlestick_pattern_score": candlestick_pattern.confluence_score if candlestick_pattern.is_present else 0,
             "bullish_score": bullish_score,
             "bearish_score": bearish_score,
             "volume_threshold": volume_threshold,
@@ -179,6 +221,8 @@ def determine_h1_bias(
             momentum=momentum,
             momentum_threshold=momentum_threshold,
             in_context_zone=in_demand_zone,
+            candlestick_pattern=candlestick_pattern,
+            orderflow_signal=orderflow_signal,
         )
     ):
         conflict = _orderflow_conflict_decision(
@@ -229,6 +273,8 @@ def determine_h1_bias(
             momentum=momentum,
             momentum_threshold=momentum_threshold,
             in_context_zone=in_supply_zone,
+            candlestick_pattern=candlestick_pattern,
+            orderflow_signal=orderflow_signal,
         )
     ):
         conflict = _orderflow_conflict_decision(
@@ -346,17 +392,39 @@ def _is_above_all_zones(current_price: float, zones: tuple[tuple[float, float], 
     return current_price > (highest_upper + threshold)
 
 
-def _supports_direction(*, direction: BreakoutDirection, latest: Candle, previous: Candle, momentum: float, momentum_threshold: float, in_context_zone: bool) -> bool:
+def _supports_direction(
+    *,
+    direction: BreakoutDirection,
+    latest: Candle,
+    previous: Candle,
+    momentum: float,
+    momentum_threshold: float,
+    in_context_zone: bool,
+    candlestick_pattern: PatternDecision | None = None,
+    orderflow_signal: OrderflowSignal | None = None,
+) -> bool:
     latest_open = float(latest.open)
     latest_close = float(latest.close)
     previous_high = float(previous.high)
     previous_low = float(previous.low)
+
+    pattern_supports = (
+        candlestick_pattern is not None
+        and candlestick_pattern.is_present
+        and candlestick_pattern.metadata.get("direction") == ("BULLISH" if direction is BreakoutDirection.BULLISH else "BEARISH")
+    )
+    of_supports = False
+    if orderflow_signal is not None:
+        of_score = score_orderflow_for_direction(orderflow_signal, direction)
+        of_supports = of_score.is_supportive or of_score.alignment_score > 0.10
 
     if direction is BreakoutDirection.BULLISH:
         return (
             momentum > momentum_threshold
             or latest_close > latest_open
             or latest_close > previous_high
+            or pattern_supports
+            or of_supports
             or (in_context_zone and latest_close >= float(previous.close))
         )
 
@@ -364,6 +432,8 @@ def _supports_direction(*, direction: BreakoutDirection, latest: Candle, previou
         momentum < -momentum_threshold
         or latest_close < latest_open
         or latest_close < previous_low
+        or pattern_supports
+        or of_supports
         or (in_context_zone and latest_close <= float(previous.close))
     )
 

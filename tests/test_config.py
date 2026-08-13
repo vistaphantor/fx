@@ -25,6 +25,12 @@ def test_load_settings_reads_live_only_required_values(tmp_path):
     assert settings.hfm_login == 123456
     assert settings.hfm_password == "secret"
     assert settings.hfm_server == "HFMarketsGlobal-Demo"
+    assert settings.mt4_fallback_enabled is False
+    assert settings.mt4_terminal_path == ""
+    assert settings.mt4_data_path == ""
+    assert settings.mt4_chart_symbol == "XAUUSD"
+    assert settings.mt4_chart_period == "M1"
+    assert settings.mt4_login is None
     assert settings.trading_symbol == "XAUUSD"
     assert settings.mt5_startup_wait_seconds == 10
     assert settings.loop_poll_seconds == 60
@@ -32,6 +38,42 @@ def test_load_settings_reads_live_only_required_values(tmp_path):
     assert settings.default_trade_lot == pytest.approx(0.01)
     assert settings.add_on_lot_increment == pytest.approx(0.01)
     assert settings.campaign_max_exposure_pct == pytest.approx(10.0)
+
+
+def test_load_settings_reads_mt4_fallback_values_without_mt5_path(tmp_path):
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "\n".join(
+            [
+                "HFM_LOGIN=123456",
+                "HFM_PASSWORD=secret",
+                "HFM_SERVER=HFMarketsGlobal-Demo",
+                "TRADING_SYMBOL=XAUUSD",
+                "MT5_STARTUP_WAIT_SECONDS=10",
+                "MT4_FALLBACK_ENABLED=true",
+                "MT4_TERMINAL_PATH=C:\\Program Files (x86)\\HFM Metatrader 4\\terminal.exe",
+                "MT4_DATA_PATH=C:\\Users\\Admin\\AppData\\Roaming\\MetaQuotes\\Terminal\\abc",
+                "MT4_CHART_SYMBOL=EURUSD",
+                "MT4_CHART_PERIOD=M5",
+                "MT4_LOGIN=654321",
+                "MT4_PASSWORD=mt4-secret",
+                "MT4_SERVER=HFMarketsKE-Demo Server 2",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    settings = load_settings(env_path)
+
+    assert settings.mt5_terminal_path == ""
+    assert settings.mt4_fallback_enabled is True
+    assert settings.mt4_terminal_path.endswith("terminal.exe")
+    assert settings.mt4_data_path.endswith("abc")
+    assert settings.mt4_chart_symbol == "EURUSD"
+    assert settings.mt4_chart_period == "M5"
+    assert settings.mt4_login == 654321
+    assert settings.mt4_password == "mt4-secret"
+    assert settings.mt4_server == "HFMarketsKE-Demo Server 2"
 
 
 def test_load_settings_reads_live_loop_and_campaign_values(tmp_path):
@@ -94,6 +136,15 @@ def test_load_settings_reads_quick_scalp_defaults(tmp_path):
     assert settings.quick_max_loss == pytest.approx(0.0)
     assert settings.quick_poll_seconds == 1
     assert settings.quick_min_free_margin == pytest.approx(0.0)
+    assert settings.quick_execution_buffer == pytest.approx(0.02)
+    assert settings.quick_loss_cooldown_seconds == 60
+    assert settings.quick_entry_cooldown_seconds == 10
+    assert settings.quick_shadow_on_daily_halt is True
+    assert settings.quick_shadow_on_unproven_edge is True
+    assert settings.quick_shadow_only is False
+    assert settings.quick_shadow_policy_enabled is False
+    assert settings.quick_shadow_policy_path == "data/quick_shadow_policy.json"
+    assert settings.quick_allow_inverted_shadow_policy is False
 
 
 def test_load_settings_reads_quick_scalp_overrides(tmp_path):
@@ -114,6 +165,15 @@ def test_load_settings_reads_quick_scalp_overrides(tmp_path):
                 "QUICK_MAX_LOSS=12.5",
                 "QUICK_POLL_SECONDS=2",
                 "QUICK_MIN_FREE_MARGIN=5.0",
+                "QUICK_EXECUTION_BUFFER=0.03",
+                "QUICK_LOSS_COOLDOWN_SECONDS=45",
+                "QUICK_ENTRY_COOLDOWN_SECONDS=12",
+                "QUICK_SHADOW_ON_DAILY_HALT=false",
+                "QUICK_SHADOW_ON_UNPROVEN_EDGE=false",
+                "QUICK_SHADOW_ONLY=true",
+                "QUICK_SHADOW_POLICY_ENABLED=true",
+                "QUICK_SHADOW_POLICY_PATH=data/custom_policy.json",
+                "QUICK_ALLOW_INVERTED_SHADOW_POLICY=true",
             ]
         ),
         encoding="utf-8",
@@ -128,6 +188,15 @@ def test_load_settings_reads_quick_scalp_overrides(tmp_path):
     assert settings.quick_max_loss == pytest.approx(12.5)
     assert settings.quick_poll_seconds == 2
     assert settings.quick_min_free_margin == pytest.approx(5.0)
+    assert settings.quick_execution_buffer == pytest.approx(0.03)
+    assert settings.quick_loss_cooldown_seconds == 45
+    assert settings.quick_entry_cooldown_seconds == 12
+    assert settings.quick_shadow_on_daily_halt is False
+    assert settings.quick_shadow_on_unproven_edge is False
+    assert settings.quick_shadow_only is True
+    assert settings.quick_shadow_policy_enabled is True
+    assert settings.quick_shadow_policy_path == "data/custom_policy.json"
+    assert settings.quick_allow_inverted_shadow_policy is True
 
 
 def test_load_settings_reads_equity_log_path(tmp_path):
@@ -366,3 +435,27 @@ def test_load_settings_rejects_non_positive_campaign_add_trigger(tmp_path):
 
     with pytest.raises(ValueError, match="XAUUSD_CAMPAIGN_BASE_ADD_TRIGGER_R"):
         load_settings(env_path)
+
+
+def test_load_settings_reads_symbol_risk_buffer_and_trail_distance(tmp_path):
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "\n".join(
+            [
+                "MT5_TERMINAL_PATH=C:\\Program Files\\MT5\\terminal64.exe",
+                "HFM_LOGIN=123456",
+                "HFM_PASSWORD=secret",
+                "HFM_SERVER=HFMarketsGlobal-Demo",
+                "TRADING_SYMBOL=XAUUSD",
+                "MT5_STARTUP_WAIT_SECONDS=10",
+                "XAUUSD_RISK_BUFFER=3.14",
+                "XAUUSD_TRAIL_DISTANCE=15.5",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    settings = load_settings(env_path)
+    xau_profile = settings.strategy_profiles["XAUUSD"]
+    assert xau_profile.risk_buffer == pytest.approx(3.14)
+    assert xau_profile.trail_distance == pytest.approx(15.5)

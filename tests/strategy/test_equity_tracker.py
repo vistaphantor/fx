@@ -95,18 +95,18 @@ class TestKellyFraction:
 
 
 class TestPositionSize:
-    def test_minimum_lot_floor(self):
+    def test_minimum_lot_refused_when_unaffordable(self):
         size = compute_position_size(
             equity=100.0,
-            win_rate=0.5,
+            win_rate=0.55,
             avg_win=1.0,
             avg_loss=1.0,
-            omega_t=0.9,
+            omega_t=0.5,
             r_max=0.02,
             volume_min=0.01,
-            price_per_lot=100000.0,
+            price_per_lot=100000.0,  # $1000 per min lot risk is unaffordable for $100 equity
         )
-        assert size == 0.01  # Should be at minimum
+        assert size == 0.0  # Refuses trade to prevent account wipeout
 
     def test_positive_sizing(self):
         size = compute_position_size(
@@ -122,7 +122,7 @@ class TestPositionSize:
         )
         assert size >= 0.01
 
-    def test_zero_equity(self):
+    def test_zero_equity_refuses_trade(self):
         size = compute_position_size(
             equity=0.0,
             win_rate=0.6,
@@ -132,9 +132,9 @@ class TestPositionSize:
             r_max=0.02,
             volume_min=0.01,
         )
-        assert size == 0.01  # Falls to minimum
+        assert size == 0.0  # Refuses trade when equity is zero
 
-    def test_omega_zero_gives_minimum(self):
+    def test_omega_zero_refuses_trade(self):
         size = compute_position_size(
             equity=100000.0,
             win_rate=0.6,
@@ -145,7 +145,7 @@ class TestPositionSize:
             volume_min=0.01,
             price_per_lot=100.0,
         )
-        assert size == 0.01
+        assert size == 0.0  # Refuses trade when omega trade quality is zero
 
 
 class TestPriceRiskPerLot:

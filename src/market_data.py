@@ -129,14 +129,27 @@ def fetch_candles(mt5_module, symbol: str, timeframe_attr: str, count: int, mini
     return [candle_from_mt5_rate(rate, timeframe_attr) for rate in rates]
 
 
+def fetch_optional_candles(mt5_module, symbol: str, timeframe_attr: str, count: int) -> list[Candle]:
+    try:
+        return fetch_candles(mt5_module, symbol, timeframe_attr, count)
+    except RuntimeError:
+        return []
+
+
 def build_live_strategy_input(mt5_module, symbol: str) -> LiveStrategyInput:
-    d1_candles = fetch_candles(mt5_module, symbol, "TIMEFRAME_D1", 6, minimum=1)
-    h4_candles = fetch_candles(mt5_module, symbol, "TIMEFRAME_H4", 6)
-    h1_candles = fetch_candles(mt5_module, symbol, "TIMEFRAME_H1", 5)
-    m30_candles = fetch_candles(mt5_module, symbol, "TIMEFRAME_M30", 5)
-    m10_candles = fetch_candles(mt5_module, symbol, "TIMEFRAME_M10", 8)
-    m15_candles = fetch_candles(mt5_module, symbol, "TIMEFRAME_M15", 50)
-    m5_candles = fetch_candles(mt5_module, symbol, "TIMEFRAME_M5", 30)
+    d1_candles = fetch_candles(mt5_module, symbol, "TIMEFRAME_D1", 10, minimum=1)
+    # Fetch 14 H4 candles: build_h4_context needs session_candle_count=6 *completed* bars
+    # plus the live bar, so 7 minimum — use 14 for richer zone history
+    h4_candles = fetch_candles(mt5_module, symbol, "TIMEFRAME_H4", 14)
+    h1_candles = fetch_candles(mt5_module, symbol, "TIMEFRAME_H1", 24)
+    m30_candles = fetch_candles(mt5_module, symbol, "TIMEFRAME_M30", 20)
+    m15_candles = fetch_candles(mt5_module, symbol, "TIMEFRAME_M15", 100)
+    m5_candles = fetch_candles(mt5_module, symbol, "TIMEFRAME_M5", 60)
+    m10_candles = fetch_optional_candles(mt5_module, symbol, "TIMEFRAME_M10", 8)
+    if len(m10_candles) < 8:
+        m10_candles = _aggregate_m5_to_m10(m5_candles, count=8)
+    if len(m10_candles) < 8:
+        m10_candles = _derive_m10_from_m15(m15_candles, count=8)
     breakout_candle = m5_candles[-2]
     retest_candle = m5_candles[-1]
 
@@ -174,3 +187,45 @@ def _build_supply_zone(h1_candle: Candle, m15_candle: Candle) -> dict:
     swing = SwingPoint(timestamp=h1_candle.timestamp, price=h1_candle.high, kind=ZoneKind.SUPPLY)
     bounds = M15RefinementBounds(timestamp=m15_candle.timestamp, low=m15_candle.low, high=m15_candle.high)
     return build_zones([swing], [bounds])[0]
+
+
+def _aggregate_m5_to_m10(m5_candles: list[Candle], *, count: int) -> list[Candle]:
+    if len(m5_candles) < 2:
+        return []
+    pairs = []
+    usable = m5_candles[-(count * 2):]
+    if len(usable) % 2:
+        usable = usable[1:]
+    for index in range(0, len(usable), 2):
+        chunk = usable[index : index + 2]
+        if len(chunk) < 2:
+            continue
+        pairs.append(_combine_candles(chunk, "TIMEFRAME_M10"))
+    return pairs[-count:]
+
+
+def _derive_m10_from_m15(m15_candles: list[Candle], *, count: int) -> list[Candle]:
+    return [
+        Candle(
+            timestamp=candle.timestamp,
+            open=candle.open,
+            high=candle.high,
+            low=candle.low,
+            close=candle.close,
+            volume=candle.volume,
+            timeframe="M10",
+        )
+        for candle in m15_candles[-count:]
+    ]
+
+
+def _combine_candles(candles: list[Candle], timeframe: str) -> Candle:
+    return Candle(
+        timestamp=candles[-1].timestamp,
+        open=candles[0].open,
+        high=max(candle.high for candle in candles),
+        low=min(candle.low for candle in candles),
+        close=candles[-1].close,
+        volume=sum(candle.volume for candle in candles),
+        timeframe=timeframe_label(timeframe),
+    )

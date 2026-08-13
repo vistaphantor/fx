@@ -7,9 +7,23 @@ __pycache__/
 *.py[cod]
 
 data/
+.runtime/
 
 .venv/
 venv/
 env/
 
 qatar.ai
+
+# Runtime / generated state
+.pytest_tmp/
+.pytest_tmp_dashboard3/
+logs/
+scratch/
+orderflow_state.json
+
+# Local environment file without extension
+/env
+bot_state.json
+data/data
+data/models
