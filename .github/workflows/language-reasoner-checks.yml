@@ -52,6 +52,7 @@ jobs:
             tests/test_language_protocol.py \
             tests/test_language_generation.py \
             tests/test_language_epoch_exam.py \
+            tests/test_language_generated_bytes.py \
             tests/test_language_streaming_sources.py \
             tests/test_language_dedup.py \
             tests/test_language_compute_budget.py \
