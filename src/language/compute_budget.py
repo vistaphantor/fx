@@ -62,7 +62,7 @@ def _build_probe_batch(
         raise ValueError("sequences must not be empty")
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
-    dataset = PackedSequenceDataset(sequences, seq_len, tokenizer)
+    dataset = PackedSequenceDataset(sequences, seq_len, tokenizer.pad_id())
     pairs = [dataset[index % len(dataset)] for index in range(batch_size)]
     x = torch.stack([pair[0] for pair in pairs])
     y = torch.stack([pair[1] for pair in pairs])
