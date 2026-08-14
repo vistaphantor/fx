@@ -6,6 +6,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator, Optional
 
+from src.language.canonical_contract import (
+    CanonicalMessage,
+    serialize_document,
+    serialize_messages,
+)
+
 
 @dataclass(frozen=True, slots=True)
 class SourceMetadata:
@@ -69,40 +75,6 @@ class LocalSource(DatasetSource):
         return {"source_type": "local", "path": str(self._path)}
 
 
-def _clean_content(value: object) -> str:
-    if value is None:
-        return ""
-    return str(value).replace("\x00", "").replace("\r\n", "\n").replace("\r", "\n").strip()
-
-
-def _canonical_document(text: str) -> str:
-    value = _clean_content(text)
-    return f"<bos>\n{value}\n<eos>" if value else ""
-
-
-def _canonical_messages(messages: list[tuple[str, str]]) -> str:
-    parts = ["<bos>"]
-    appended = 0
-    for role, raw_content in messages:
-        content = _clean_content(raw_content)
-        if not content:
-            continue
-        normalized_role = role.strip().casefold()
-        if normalized_role in {"human", "user"}:
-            parts.extend(["<user>", content, "</user>"])
-            appended += 1
-        elif normalized_role in {"gpt", "assistant", "ai"}:
-            parts.extend(["<assistant>", content, "</assistant>"])
-            appended += 1
-        elif normalized_role == "system":
-            parts.extend(["<evidence>", content, "</evidence>"])
-            appended += 1
-    if appended == 0:
-        return ""
-    parts.append("<eos>")
-    return "\n".join(parts)
-
-
 class HFSource(DatasetSource):
     """Canonical, bounded-memory Hugging Face streaming adapter."""
 
@@ -146,7 +118,7 @@ class HFSource(DatasetSource):
     @property
     def source_id(self) -> str:
         config = f"/{self._config_name}" if self._config_name else ""
-        revision = f"@{self._revision}" if self._revision else "@main"
+        revision = f"@{self._revision}" if self._revision else "@UNPINNED"
         return f"hf:{self._path}{config}{revision}/{self._split}"
 
     def scan(self) -> SourceMetadata:
@@ -155,7 +127,7 @@ class HFSource(DatasetSource):
             path=self.source_id,
             description=f"{self._path} [{self._split}]",
             extra={
-                "revision": self._revision or "main",
+                "revision": self._revision,
                 "max_examples": self._max_examples,
                 "shuffle_buffer_size": self._shuffle_buffer_size,
                 "seed": self._seed,
@@ -168,45 +140,54 @@ class HFSource(DatasetSource):
                 return prompt_field, response_field
         return None
 
-    def _messages_from_turns(self, turns: object) -> list[tuple[str, str]]:
+    def _messages_from_turns(self, turns: object) -> list[CanonicalMessage]:
         if not isinstance(turns, list):
             return []
-        messages: list[tuple[str, str]] = []
+        messages: list[CanonicalMessage] = []
         for turn in turns:
             if not isinstance(turn, dict):
                 continue
             role = turn.get("from", turn.get("role", ""))
             content = turn.get("value", turn.get("content", ""))
             if role and content is not None:
-                messages.append((str(role), str(content)))
+                messages.append(CanonicalMessage(str(role), str(content)))
         return messages
 
     def _row_to_text(self, row: dict) -> Optional[str]:
         if self._text_fields:
-            parts = [_clean_content(row.get(field)) for field in self._text_fields]
-            document = "\n\n".join(part for part in parts if part)
-            return _canonical_document(document) or None
+            parts = [str(row.get(field, "")) for field in self._text_fields]
+            document = "\n\n".join(part for part in parts if part and part.strip())
+            return serialize_document(document) or None
 
         for key in ("messages", "conversations"):
             messages = self._messages_from_turns(row.get(key))
             if messages:
-                serialized = _canonical_messages(messages)
+                serialized = serialize_messages(messages)
                 return serialized or None
 
         if "text" in row:
-            serialized = _canonical_document(_clean_content(row.get("text")))
+            serialized = serialize_document(row.get("text"))
             return serialized or None
 
         schema = self._detect_schema(row)
         if schema:
             prompt_field, response_field = schema
-            prompt = _clean_content(row.get(prompt_field))
-            response = _clean_content(row.get(response_field))
-            if prompt and response:
-                return _canonical_messages([("user", prompt), ("assistant", response)])
+            prompt = row.get(prompt_field)
+            response = row.get(response_field)
+            if prompt is not None and response is not None:
+                return serialize_messages(
+                    [
+                        CanonicalMessage("user", str(prompt)),
+                        CanonicalMessage("assistant", str(response)),
+                    ]
+                ) or None
         return None
 
     def stream(self) -> Iterator[str]:
+        if not self._revision:
+            raise RuntimeError(
+                f"hf_revision_must_be_pinned:{self._path}:set an immutable commit/tag revision"
+            )
         try:
             from datasets import load_dataset
         except ImportError as exc:
@@ -214,11 +195,13 @@ class HFSource(DatasetSource):
                 "Hugging Face streaming requires the 'datasets' package declared in requirements.txt"
             ) from exc
 
-        kwargs: dict = {"split": self._split, "streaming": True}
+        kwargs: dict = {
+            "split": self._split,
+            "streaming": True,
+            "revision": self._revision,
+        }
         if self._config_name:
             kwargs["name"] = self._config_name
-        if self._revision:
-            kwargs["revision"] = self._revision
         if self._token:
             kwargs["token"] = self._token
 
@@ -243,7 +226,7 @@ class HFSource(DatasetSource):
             "path": self._path,
             "split": self._split,
             "config_name": self._config_name,
-            "revision": self._revision or "main",
+            "revision": self._revision,
             "max_examples": self._max_examples,
             "shuffle_buffer_size": self._shuffle_buffer_size,
             "seed": self._seed,
