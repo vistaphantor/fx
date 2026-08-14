@@ -62,7 +62,7 @@ def _build_probe_batch(
         raise ValueError("sequences must not be empty")
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
-    dataset = PackedSequenceDataset(sequences, seq_len, tokenizer.pad_id())
+    dataset = PackedSequenceDataset(sequences, seq_len, tokenizer)
     pairs = [dataset[index % len(dataset)] for index in range(batch_size)]
     x = torch.stack([pair[0] for pair in pairs])
     y = torch.stack([pair[1] for pair in pairs])
@@ -82,12 +82,7 @@ def benchmark_training_throughput(
     wall_clock_hours: float = DEFAULT_WALL_CLOCK_HOURS,
     reference_tokens_per_parameter: float = REFERENCE_TOKENS_PER_PARAMETER,
 ) -> TrainingThroughputReport:
-    """Measure real forward/backward throughput without mutating training weights.
-
-    A fresh model with the exact requested architecture is used. One warm-up
-    optimizer step is excluded from timing, then `steps` real AdamW updates are
-    measured using actual padded training sequences and useful target tokens.
-    """
+    """Measure real forward/backward throughput on gradient-bearing tokens."""
     if steps <= 0:
         raise ValueError("steps must be positive")
     if wall_clock_hours <= 0:
@@ -115,7 +110,6 @@ def benchmark_training_throughput(
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
-    # Warm up PyTorch kernels and allocator before measuring.
     update()
     started = time.perf_counter()
     for _ in range(steps):
