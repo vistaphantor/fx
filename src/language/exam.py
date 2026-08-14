@@ -1,4 +1,4 @@
-"""Deterministic, held-out diagnostics for Vista language-model training.
+"""Deterministic held-out diagnostics for Vista language-model training.
 
 The exam is never used for gradient updates. It exists to answer a practical
 question after every expensive epoch: is the model becoming more coherent and
@@ -56,6 +56,7 @@ class EpochExamResult:
     mean_quality_percent: float
     gibberish_answers: int
     mean_generated_tokens: float
+    training_signal: str
     answers: tuple[ExamAnswer, ...]
 
 
@@ -67,7 +68,7 @@ FOUNDATION_EXAM: tuple[ExamQuestion, ...] = (
         "language_bullish",
         "market_language",
         "In trading, what does bullish mean?",
-        expected_any=("rise", "rising", "up", "higher", "increase", "buyers", "buying"),
+        expected_any=("rise", "rising", "higher", "increase", "buyers", "buying", "upward"),
     ),
     ExamQuestion(
         "language_risk",
@@ -122,7 +123,10 @@ TRADING_EXTENSION: tuple[ExamQuestion, ...] = (
     ),
 )
 
-CONTROL_TOKEN_RE = re.compile(r"</?(?:bos|eos|sep|user|assistant|think|market|account|position|evidence|hypothesis|countercase|tool|tool_result|decision|confidence|invalidation)>", re.IGNORECASE)
+CONTROL_TOKEN_RE = re.compile(
+    r"</?(?:bos|eos|sep|user|assistant|think|market|account|position|evidence|hypothesis|countercase|tool|tool_result|decision|confidence|invalidation)>",
+    re.IGNORECASE,
+)
 WORD_RE = re.compile(r"[A-Za-z0-9]+(?:[._'-][A-Za-z0-9]+)*")
 
 
@@ -134,7 +138,6 @@ def exam_questions(training_stage: str) -> tuple[ExamQuestion, ...]:
 
 
 def build_exam_prompt(question: str) -> str:
-    """Use the exact same conversational grammar as training and chat."""
     return (
         "<bos>\n"
         "<user>\n"
@@ -172,8 +175,8 @@ def _quality(text: str) -> tuple[float, float, tuple[str, ...]]:
         flags.append("unk_token")
     if repetition >= 0.50 and len(words) >= 6:
         flags.append("high_repetition")
-    if len(words) < 2:
-        flags.append("too_few_words")
+    if normalized and not words:
+        flags.append("no_lexical_content")
     if normalized and sum(ch.isalnum() for ch in normalized) / max(len(normalized), 1) < 0.35:
         flags.append("low_alphanumeric_density")
     if text.count("<think>") > 2 or text.count("</think>") > 2:
@@ -184,7 +187,7 @@ def _quality(text: str) -> tuple[float, float, tuple[str, ...]]:
         "empty": 1.0,
         "unk_token": 0.30,
         "high_repetition": 0.50,
-        "too_few_words": 0.35,
+        "no_lexical_content": 0.70,
         "low_alphanumeric_density": 0.35,
         "control_token_loop": 0.50,
     }
@@ -193,11 +196,35 @@ def _quality(text: str) -> tuple[float, float, tuple[str, ...]]:
     return max(0.0, min(1.0, score)), repetition, tuple(flags)
 
 
+def _contains_keyword(value: str, keyword: str) -> bool:
+    escaped = re.escape(keyword.casefold())
+    if " " in keyword:
+        return keyword.casefold() in value
+    return bool(re.search(rf"(?<![a-z0-9]){escaped}(?![a-z0-9])", value))
+
+
 def _is_correct(question: ExamQuestion, normalized: str) -> bool:
     value = normalized.casefold()
-    regex_ok = bool(question.expected_regex and re.search(question.expected_regex, normalized, flags=re.IGNORECASE))
-    keyword_ok = bool(question.expected_any and any(keyword.casefold() in value for keyword in question.expected_any))
+    regex_ok = bool(
+        question.expected_regex
+        and re.search(question.expected_regex, normalized, flags=re.IGNORECASE)
+    )
+    keyword_ok = bool(
+        question.expected_any
+        and any(_contains_keyword(value, keyword) for keyword in question.expected_any)
+    )
     return regex_ok or keyword_ok
+
+
+def _training_signal(correctness: float, quality: float, gibberish_answers: int, total: int) -> str:
+    gibberish_ratio = gibberish_answers / max(total, 1)
+    if correctness == 0.0 and gibberish_ratio >= 0.75:
+        return "GIBBERISH"
+    if correctness < 25.0:
+        return "EARLY_SIGNAL"
+    if correctness < 60.0:
+        return "LEARNING"
+    return "FUNCTIONAL"
 
 
 def run_epoch_exam(
@@ -210,17 +237,13 @@ def run_epoch_exam(
     validation_loss: float | None,
     max_new_tokens: int = 64,
 ) -> EpochExamResult:
-    """Run deterministic greedy diagnostics without touching model weights."""
     if epoch < 0:
         raise ValueError("epoch must be >= 0")
     if max_new_tokens <= 0:
         raise ValueError("max_new_tokens must be positive")
 
     questions = exam_questions(training_stage)
-    stop_ids = {
-        tokenizer.vocab[ENDASSISTANT],
-        tokenizer.vocab[EOS],
-    }
+    stop_ids = {tokenizer.vocab[ENDASSISTANT], tokenizer.vocab[EOS]}
     answers: list[ExamAnswer] = []
 
     model.eval()
@@ -264,6 +287,8 @@ def run_epoch_exam(
     gibberish = sum(1 for answer in answers if answer.gibberish_flags)
     mean_quality = sum(answer.quality_score for answer in answers) / len(answers)
     mean_tokens = sum(answer.generated_tokens for answer in answers) / len(answers)
+    correctness = 100.0 * correct / len(answers)
+    quality_percent = 100.0 * mean_quality
     return EpochExamResult(
         exam_version=EXAM_VERSION,
         epoch=epoch,
@@ -272,10 +297,11 @@ def run_epoch_exam(
         validation_loss=validation_loss,
         total_questions=len(answers),
         correct_questions=correct,
-        correctness_percent=100.0 * correct / len(answers),
-        mean_quality_percent=100.0 * mean_quality,
+        correctness_percent=correctness,
+        mean_quality_percent=quality_percent,
         gibberish_answers=gibberish,
         mean_generated_tokens=mean_tokens,
+        training_signal=_training_signal(correctness, quality_percent, gibberish, len(answers)),
         answers=tuple(answers),
     )
 
@@ -294,6 +320,7 @@ def render_exam_text(result: EpochExamResult, previous: EpochExamResult | None =
         f"Exam version     : {result.exam_version}",
         f"Epoch            : {result.epoch}",
         f"Training stage   : {result.training_stage}",
+        f"Training signal  : {result.training_signal}",
         f"Train loss       : {_fmt_loss(result.train_loss)}",
         f"Validation loss  : {_fmt_loss(result.validation_loss)}",
         f"Correct          : {result.correct_questions}/{result.total_questions} ({result.correctness_percent:.1f}%)",
