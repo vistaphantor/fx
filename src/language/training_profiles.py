@@ -29,6 +29,34 @@ PROFILES: dict[str, dict[str, int | float | str | None]] = {
         "hf_preflight_sample_examples": 1000,
         "checkpoint_every_steps": 50,
     },
+    "2m_dense": {
+        "vocab_size": 2048,
+        "d_model": 160,
+        "n_heads": 8,
+        "n_kv_heads": 2,
+        "n_layers": 5,
+        "ffn_dim": 512,
+        "ffn_type": "dense",
+        "num_experts": 1,
+        "experts_per_token": 1,
+        "moe_ffn_dim": 512,
+        "shared_expert_ffn_dim": 0,
+        "router_aux_loss_coef": 0.0,
+        "router_jitter": 0.0,
+        "rope_theta": 10000.0,
+        "seq_len": 192,
+        "batch_size": 4,
+        "lr": 4e-4,
+        "dropout": 0.04,
+        "max_examples": None,
+        "tokenizer_chars": 3_000_000,
+        "early_stop_patience": 6,
+        "early_stop_min_delta": 0.004,
+        "early_stop_min_tokens_per_parameter": 3.0,
+        "exam_max_new_tokens": 64,
+        "hf_preflight_sample_examples": 2500,
+        "checkpoint_every_steps": 100,
+    },
     "2m": {
         "vocab_size": 2048,
         "d_model": 128,
@@ -46,7 +74,7 @@ PROFILES: dict[str, dict[str, int | float | str | None]] = {
         "rope_theta": 10000.0,
         "seq_len": 192,
         "batch_size": 4,
-        "lr": 5e-4,
+        "lr": 4e-4,
         "dropout": 0.04,
         "max_examples": None,
         "tokenizer_chars": 3_000_000,
@@ -74,7 +102,7 @@ PROFILES: dict[str, dict[str, int | float | str | None]] = {
         "rope_theta": 10000.0,
         "seq_len": 256,
         "batch_size": 2,
-        "lr": 4.5e-4,
+        "lr": 4e-4,
         "dropout": 0.06,
         "max_examples": None,
         "tokenizer_chars": 4_000_000,
@@ -102,7 +130,7 @@ PROFILES: dict[str, dict[str, int | float | str | None]] = {
         "rope_theta": 10000.0,
         "seq_len": 256,
         "batch_size": 2,
-        "lr": 4e-4,
+        "lr": 3.5e-4,
         "dropout": 0.07,
         "max_examples": None,
         "tokenizer_chars": 4_000_000,
@@ -149,9 +177,13 @@ DEFAULT_STAGE_TOKENS_PER_PARAMETER = {
     "trading_reasoning": 8.0,
 }
 
+# Foundation is deliberately pure language-model pretraining when an HF
+# foundation source is configured. Mixing the local math/reasoning corpus into
+# TinyStories produced the observed baby/cream <-> equation/LaTeX attractors.
+# Protocol/reasoning replay begins only after the language foundation exists.
 DEFAULT_LOCAL_REPLAY_WEIGHTS = {
-    "foundation": 0.10,
-    "reasoning": 0.30,
+    "foundation": 0.0,
+    "reasoning": 0.25,
     "trading_reasoning": 0.35,
 }
 
