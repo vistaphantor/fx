@@ -2,89 +2,140 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Optional
+
+_STRUCTURAL_TOKEN_RE = re.compile(
+    r"</?(?:bos|eos|sep|user|assistant|think|market|account|position|evidence|"
+    r"hypothesis|countercase|tool|tool_result|decision|confidence|invalidation)>",
+    flags=re.IGNORECASE,
+)
+_WORD_RE = re.compile(r"[A-Za-z0-9]+")
 
 
-@dataclass
+@dataclass(frozen=True)
 class QualityScore:
     accepted: bool
     score: float
-    reasons: list[str] = field(default_factory=list)
+    reasons: tuple[str, ...] = field(default_factory=tuple)
 
 
 class QualityFilter:
+    """Authoritative bounded-cost quality gate for local and streamed text."""
+
     def __init__(
         self,
         min_chars: int = 25,
-        min_score: float = 0.4,
-        max_repetition_ratio: float = 0.5,
-        max_html_ratio: float = 0.3,
-        min_printable_ratio: float = 0.8,
+        max_chars: int = 100_000,
+        min_score: float = 0.55,
+        max_word_repetition_ratio: float = 0.50,
+        min_unique_word_ratio: float = 0.06,
+        max_html_ratio: float = 0.30,
+        min_printable_ratio: float = 0.80,
+        min_alnum_ratio: float = 0.12,
     ):
-        self.min_chars = min_chars
-        self.min_score = min_score
-        self.max_repetition_ratio = max_repetition_ratio
-        self.max_html_ratio = max_html_ratio
-        self.min_printable_ratio = min_printable_ratio
+        if min_chars < 0 or max_chars <= min_chars:
+            raise ValueError("invalid quality length bounds")
+        self.min_chars = int(min_chars)
+        self.max_chars = int(max_chars)
+        self.min_score = float(min_score)
+        self.max_word_repetition_ratio = float(max_word_repetition_ratio)
+        self.min_unique_word_ratio = float(min_unique_word_ratio)
+        self.max_html_ratio = float(max_html_ratio)
+        self.min_printable_ratio = float(min_printable_ratio)
+        self.min_alnum_ratio = float(min_alnum_ratio)
+
+    @staticmethod
+    def _structural_reasons(text: str) -> list[str]:
+        reasons: list[str] = []
+        if "<bos>" in text or "<eos>" in text:
+            if text.count("<bos>") != 1 or text.count("<eos>") != 1:
+                reasons.append("invalid_bos_eos")
+        if "<user>" in text:
+            if text.count("<user>") != text.count("</user>"):
+                reasons.append("unbalanced_user")
+            if text.count("<assistant>") != text.count("</assistant>"):
+                reasons.append("unbalanced_assistant")
+            if "<assistant>" not in text:
+                reasons.append("missing_assistant")
+        if text.count("<think>") != text.count("</think>"):
+            reasons.append("unbalanced_think")
+        return reasons
 
     def score(self, text: str) -> QualityScore:
+        value = str(text or "")
         reasons: list[str] = []
         penalties = 0.0
 
-        if len(text) < self.min_chars:
-            return QualityScore(accepted=False, score=0.0, reasons=["too_short"])
+        if len(value) < self.min_chars:
+            return QualityScore(False, 0.0, ("too_short",))
+        if len(value) > self.max_chars:
+            return QualityScore(False, 0.0, ("too_long",))
 
-        lines = text.splitlines()
-        total_lines = max(len(lines), 1)
-        line_counts: dict[str, int] = {}
-        for ln in lines:
-            stripped = ln.strip()
-            if stripped:
-                line_counts[stripped] = line_counts.get(stripped, 0) + 1
-        if line_counts:
-            top_freq = max(line_counts.values()) / total_lines
-            if top_freq > self.max_repetition_ratio:
-                reasons.append("high_repetition")
-                penalties += 0.4
+        structural = self._structural_reasons(value)
+        if structural:
+            return QualityScore(False, 0.0, tuple(structural))
 
-        html_tags = len(re.findall(r"<[a-zA-Z][^>]*>", text))
-        words = len(text.split())
-        html_ratio = html_tags / max(words, 1)
-        if html_ratio > self.max_html_ratio:
-            reasons.append("mostly_html")
-            penalties += 0.3
-
-        printable = sum(1 for c in text if c.isprintable())
-        printable_ratio = printable / max(len(text), 1)
+        content = _STRUCTURAL_TOKEN_RE.sub(" ", value)
+        printable = sum(1 for char in content if char.isprintable() or char in "\n\t")
+        printable_ratio = printable / max(len(content), 1)
         if printable_ratio < self.min_printable_ratio:
             reasons.append("low_printable")
-            penalties += 0.5
+            penalties += 0.55
 
-        boilerplate_patterns = [
-            r"^(cookie|privacy|terms of service|all rights reserved)",
-            r"(subscribe to our newsletter|click here to)",
-            r"^\s*\d+\s*$",
-        ]
-        lower = text.lower()
-        for pat in boilerplate_patterns:
-            if re.search(pat, lower):
-                reasons.append("boilerplate")
-                penalties += 0.2
-                break
+        alnum = sum(char.isalnum() for char in content)
+        alnum_ratio = alnum / max(len(content), 1)
+        if alnum_ratio < self.min_alnum_ratio:
+            reasons.append("low_alphanumeric_density")
+            penalties += 0.55
 
-        if len(text) < 80:
-            penalties += 0.1
-            reasons.append("very_short")
+        words = [match.group(0).casefold() for match in _WORD_RE.finditer(content)]
+        if len(words) >= 40:
+            counts: dict[str, int] = {}
+            for word in words:
+                counts[word] = counts.get(word, 0) + 1
+            repetition = max(counts.values()) / len(words)
+            unique_ratio = len(counts) / len(words)
+            if repetition >= self.max_word_repetition_ratio:
+                reasons.append("high_word_repetition")
+                penalties += 0.55
+            if unique_ratio < self.min_unique_word_ratio:
+                reasons.append("low_lexical_diversity")
+                penalties += 0.45
+
+        lines = [line.strip() for line in content.splitlines() if line.strip()]
+        if len(lines) >= 12:
+            counts: dict[str, int] = {}
+            for line in lines:
+                counts[line] = counts.get(line, 0) + 1
+            if max(counts.values(), default=0) >= 8:
+                reasons.append("repeated_lines")
+                penalties += 0.55
+
+        # Count real HTML only after stripping Vista control tokens.
+        html_tags = len(re.findall(r"<[a-zA-Z][^>]*>", content))
+        html_ratio = html_tags / max(len(words), 1)
+        if html_ratio > self.max_html_ratio:
+            reasons.append("mostly_html")
+            penalties += 0.40
+
+        lower = content.casefold()
+        boilerplate_patterns = (
+            r"(?:^|\n)\s*(?:cookie policy|privacy policy|terms of service|all rights reserved)\b",
+            r"\b(?:subscribe to our newsletter|accept all cookies|click here to unsubscribe)\b",
+        )
+        if any(re.search(pattern, lower) for pattern in boilerplate_patterns):
+            reasons.append("boilerplate")
+            penalties += 0.35
 
         score = max(0.0, 1.0 - penalties)
-        accepted = score >= self.min_score and "too_short" not in reasons
-        return QualityScore(accepted=accepted, score=round(score, 4), reasons=reasons)
+        accepted = score >= self.min_score
+        return QualityScore(accepted=accepted, score=round(score, 4), reasons=tuple(reasons))
+
+    def accepts(self, text: str) -> bool:
+        return self.score(text).accepted
 
     def filter(self, texts: list[str]) -> tuple[list[str], float]:
-        passed = []
-        for t in texts:
-            qs = self.score(t)
-            if qs.accepted:
-                passed.append(t)
-        pass_rate = len(passed) / max(len(texts), 1)
-        return passed, pass_rate
+        passed = [text for text in texts if self.accepts(text)]
+        return passed, len(passed) / max(len(texts), 1)
+
+
+LANGUAGE_QUALITY_FILTER = QualityFilter()
