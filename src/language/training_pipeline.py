@@ -19,6 +19,8 @@ class TrainingPreflightReport:
     validation_examples: int
     train_sequences: int
     validation_sequences: int
+    train_prediction_tokens: int
+    validation_prediction_tokens: int
     tokenizer_vocab_size: int
     tokenizer_algorithm_version: int
     roundtrip_cases: int
@@ -167,6 +169,11 @@ class PackedSequenceDataset(Dataset):
         return torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long)
 
 
+def prediction_token_count(sequences: list[list[int]]) -> int:
+    """Count non-padding next-token targets contributed by packed sequences."""
+    return sum(max(0, len(sequence) - 1) for sequence in sequences)
+
+
 def corpus_fingerprint(texts: list[str]) -> str:
     digest = hashlib.sha256()
     for text in texts:
@@ -238,7 +245,11 @@ def validate_sequence_contract(
 def run_tiny_overfit_gate(tokenizer: BPETokenizer, train_sequences: list[list[int]]) -> tuple[float, float]:
     """Prove next-token learning works before expensive training is allowed."""
     seq_len = min(48, max(8, len(train_sequences[0]) - 1))
-    dataset = PackedSequenceDataset(train_sequences[: min(4, len(train_sequences))], seq_len, tokenizer.pad_id())
+    dataset = PackedSequenceDataset(
+        train_sequences[: min(4, len(train_sequences))],
+        seq_len,
+        tokenizer.pad_id(),
+    )
     x, y = dataset[0]
     x = x.unsqueeze(0)
     y = y.unsqueeze(0)
@@ -307,6 +318,8 @@ def run_training_preflight(
         validation_examples=len(val_texts),
         train_sequences=len(train_sequences),
         validation_sequences=len(val_sequences),
+        train_prediction_tokens=prediction_token_count(train_sequences),
+        validation_prediction_tokens=prediction_token_count(val_sequences),
         tokenizer_vocab_size=tokenizer.vocab_size,
         tokenizer_algorithm_version=tokenizer.algorithm_version,
         roundtrip_cases=roundtrip_cases,
