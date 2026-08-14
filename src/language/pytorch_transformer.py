@@ -59,12 +59,13 @@ class RotaryEmbedding(nn.Module):
         return freqs.cos().to(dtype=dtype), freqs.sin().to(dtype=dtype)
 
     @staticmethod
-    def apply(
+    def rotate(
         x: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
-        # x: [B, H, T, D], cos/sin: [T, D/2]
+        # Deliberately not named apply(): nn.Module.apply is used recursively
+        # during initialization and must remain intact.
         even = x[..., 0::2]
         odd = x[..., 1::2]
         cos = cos.unsqueeze(0).unsqueeze(0)
@@ -89,11 +90,7 @@ class SwiGLUExpert(nn.Module):
 
 
 class SparseMoE(nn.Module):
-    """Token-routed SwiGLU experts with optional always-on shared expert.
-
-    Top-1 is the CPU profile default. Top-k > 1 is supported for later GPU
-    profiles without changing the model family or bundle format.
-    """
+    """Token-routed SwiGLU experts with optional always-on shared expert."""
 
     def __init__(
         self,
@@ -156,8 +153,6 @@ class SparseMoE(nn.Module):
         if self.shared_expert is not None:
             routed = routed + self.shared_expert(flat)
 
-        # Switch-style differentiable load-balancing signal. This is only added
-        # to the training loss by the parent model; eval loss remains pure CE.
         with torch.no_grad():
             assignment = F.one_hot(
                 top_indices[:, 0], num_classes=self.num_experts
@@ -229,8 +224,8 @@ class GroupedQueryAttention(nn.Module):
             dtype=torch.long,
         )
         cos, sin = self.rope.cos_sin(positions, dtype=q.dtype)
-        q = self.rope.apply(q, cos, sin)
-        k = self.rope.apply(k, cos, sin)
+        q = self.rope.rotate(q, cos, sin)
+        k = self.rope.rotate(k, cos, sin)
         return q, k, v
 
     def _expand_kv(self, tensor: torch.Tensor) -> torch.Tensor:
@@ -450,8 +445,6 @@ class VistaReasoningGPT(nn.Module):
             module.weight.data.fill_(1.0)
 
     def _initialize_routers(self) -> None:
-        # Near-uniform but non-identical routing at step zero. Exact zeros would
-        # deterministically collapse top-1 routing into expert 0 on ties.
         std = 0.01 / math.sqrt(max(1, self.d_model))
         for block in self.blocks:
             if isinstance(block.ffn, SparseMoE):
@@ -475,12 +468,6 @@ class VistaReasoningGPT(nn.Module):
         return sum(parameter.numel() for parameter in self.parameters())
 
     def get_active_params_per_token(self) -> int:
-        """Parameter-equivalent path touched by one token.
-
-        Router logits and shared experts are always active. For MoE blocks only
-        selected routed experts are counted; inactive experts remain capacity
-        without per-token FFN compute.
-        """
         active = self.get_num_params()
         for block in self.blocks:
             if isinstance(block.ffn, SparseMoE):
