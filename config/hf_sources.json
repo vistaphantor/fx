@@ -31,7 +31,7 @@
       "revision": "5119369fbcd73ecd6b1595ebe34f3002bf10c83b",
       "config_name": "everyday-conversations",
       "split": "train",
-      "weight": 0.25,
+      "weight": 0.02,
       "stages": [
         "foundation"
       ],
