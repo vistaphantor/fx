@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from corpus.source import DatasetSource, LocalSource, HFSource
-from corpus.manager import CorpusManager
+"""Corpus package.
 
-__all__ = ["CorpusManager", "DatasetSource", "LocalSource", "HFSource"]
+Import concrete capabilities from their authoritative modules, e.g.
+`corpus.source`, `corpus.streamer`, or `corpus.manager`.  The package root is
+intentionally side-effect free so importing one corpus component cannot pull
+unrelated indexing/registry dependencies into the language trainer.
+"""
