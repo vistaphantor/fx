@@ -52,5 +52,5 @@ def test_epoch_zero_exam_observes_malformed_bytes_without_crashing() -> None:
         validation_loss=None,
         max_new_tokens=1,
     )
-    assert result.question_count > 0
+    assert result.total_questions > 0
     assert all("invalid_utf8_bytes" in answer.gibberish_flags for answer in result.answers)
