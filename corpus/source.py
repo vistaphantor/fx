@@ -23,6 +23,21 @@ class SourceMetadata:
     extra: dict = field(default_factory=dict)
 
 
+@dataclass(frozen=True, slots=True)
+class HFSourceAudit:
+    source_id: str
+    rows_scanned: int
+    rows_serialized: int
+    rows_unrecognized: int
+    mean_serialized_chars: float
+    min_serialized_chars: int
+    max_serialized_chars: int
+
+    @property
+    def serialization_rate(self) -> float:
+        return self.rows_serialized / max(self.rows_scanned, 1)
+
+
 class DatasetSource(ABC):
     @abstractmethod
     def scan(self) -> SourceMetadata: ...
@@ -183,7 +198,7 @@ class HFSource(DatasetSource):
                 ) or None
         return None
 
-    def stream(self) -> Iterator[str]:
+    def _load_dataset(self, *, shuffle: bool):
         if not self._revision:
             raise RuntimeError(
                 f"hf_revision_must_be_pinned:{self._path}:set an immutable commit/tag revision"
@@ -204,11 +219,40 @@ class HFSource(DatasetSource):
             kwargs["name"] = self._config_name
         if self._token:
             kwargs["token"] = self._token
-
         dataset = load_dataset(self._path, **kwargs)
-        if self._shuffle_buffer_size > 0:
+        if shuffle and self._shuffle_buffer_size > 0:
             dataset = dataset.shuffle(seed=self._seed, buffer_size=self._shuffle_buffer_size)
+        return dataset
 
+    def audit(self, *, max_rows: int = 1_000) -> HFSourceAudit:
+        if max_rows <= 0:
+            raise ValueError("max_rows must be positive")
+        scanned = 0
+        serialized = 0
+        lengths: list[int] = []
+        for row in self._load_dataset(shuffle=False):
+            if scanned >= max_rows:
+                break
+            scanned += 1
+            if not isinstance(row, dict):
+                continue
+            text = self._row_to_text(row)
+            if not text:
+                continue
+            serialized += 1
+            lengths.append(len(text))
+        return HFSourceAudit(
+            source_id=self.source_id,
+            rows_scanned=scanned,
+            rows_serialized=serialized,
+            rows_unrecognized=scanned - serialized,
+            mean_serialized_chars=(sum(lengths) / len(lengths) if lengths else 0.0),
+            min_serialized_chars=(min(lengths) if lengths else 0),
+            max_serialized_chars=(max(lengths) if lengths else 0),
+        )
+
+    def stream(self) -> Iterator[str]:
+        dataset = self._load_dataset(shuffle=True)
         emitted = 0
         for row in dataset:
             if self._max_examples is not None and emitted >= self._max_examples:
