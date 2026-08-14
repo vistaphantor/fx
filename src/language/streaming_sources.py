@@ -85,7 +85,14 @@ def stream_quality_accepts(text: str) -> bool:
 
 
 class GuardedSource(DatasetSource):
-    """Canonicalize, quality-filter, deduplicate, enforce curriculum and holdouts."""
+    """Canonicalize, quality-filter, deduplicate and enforce holdouts.
+
+    `enforce_stage` is deliberately configurable. Raw HF sources are filtered
+    per example for the active curriculum stage. Local replay has *already*
+    been selected by `select_curriculum`, so applying the stage predicate a
+    second time would silently remove the general/reasoning replay examples
+    that protect language competence during later specialist stages.
+    """
 
     def __init__(
         self,
@@ -94,23 +101,32 @@ class GuardedSource(DatasetSource):
         stage: str,
         excluded_hashes: frozenset[str] = frozenset(),
         excluded_families: frozenset[str] = frozenset(),
+        enforce_stage: bool = True,
     ):
         self._source = source
         self._stage = stage.strip().casefold()
         self._excluded_hashes = excluded_hashes
         self._excluded_families = excluded_families
+        self._enforce_stage = bool(enforce_stage)
 
     @property
     def source_id(self) -> str:
-        return f"guarded:{self._source.source_id}:{self._stage}"
+        mode = "stage" if self._enforce_stage else "replay"
+        return f"guarded:{self._source.source_id}:{self._stage}:{mode}"
 
     def scan(self) -> SourceMetadata:
         return self._source.scan()
 
     def metadata(self) -> dict:
-        return {**self._source.metadata(), "guarded_stage": self._stage}
+        return {
+            **self._source.metadata(),
+            "guarded_stage": self._stage,
+            "enforce_stage": self._enforce_stage,
+        }
 
     def _stage_accepts(self, text: str) -> bool:
+        if not self._enforce_stage:
+            return True
         if self._stage == "foundation":
             return True
         if self._stage == "reasoning":
@@ -254,6 +270,7 @@ def build_training_stream(
                 stage=stage,
                 excluded_hashes=excluded_hashes,
                 excluded_families=excluded_families,
+                enforce_stage=True,
             ),
             spec.weight,
         ))
@@ -266,6 +283,9 @@ def build_training_stream(
                 stage=stage,
                 excluded_hashes=excluded_hashes,
                 excluded_families=excluded_families,
+                # Local replay is already curriculum-selected. Do not erase
+                # the replay component by re-applying the specialist filter.
+                enforce_stage=False,
             ),
             float(local_weight),
         ))
