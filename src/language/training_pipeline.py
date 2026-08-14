@@ -10,6 +10,7 @@ import torch
 from torch.utils.data import Dataset
 
 from src.language.canonical_contract import prompt_family
+from src.language.loss_objective import build_loss_targets
 from src.language.pytorch_transformer import VistaReasoningGPT
 from src.language.tokenizer import BPETokenizer, TOKENIZER_ALGORITHM_VERSION
 
@@ -170,29 +171,43 @@ def build_example_sequences(
 
 
 class PackedSequenceDataset(Dataset):
-    def __init__(self, sequences: list[list[int]], seq_len: int, pad_id: int):
+    """Packed examples with the authoritative role-aware training objective."""
+
+    def __init__(
+        self,
+        sequences: list[list[int]],
+        seq_len: int,
+        tokenizer: BPETokenizer,
+    ):
         if not sequences:
             raise ValueError("sequences must not be empty")
         self.seq_len = int(seq_len)
-        self.pad_id = int(pad_id)
+        self.tokenizer = tokenizer
         self.sequences = [list(sequence) for sequence in sequences]
 
     def __len__(self) -> int:
         return len(self.sequences)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        sequence = self.sequences[idx][: self.seq_len + 1]
-        x = sequence[:-1]
-        y = sequence[1:]
-        if len(x) < self.seq_len:
-            padding = self.seq_len - len(x)
-            x += [self.pad_id] * padding
-            y += [self.pad_id] * padding
+        x, y, _ = build_loss_targets(
+            self.sequences[idx],
+            self.tokenizer,
+            seq_len=self.seq_len,
+        )
         return torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long)
 
 
-def prediction_token_count(sequences: list[list[int]]) -> int:
-    return sum(max(0, len(sequence) - 1) for sequence in sequences)
+def prediction_token_count(
+    sequences: list[list[int]],
+    tokenizer: BPETokenizer,
+    *,
+    seq_len: int,
+) -> int:
+    total = 0
+    for sequence in sequences:
+        _, _, stats = build_loss_targets(sequence, tokenizer, seq_len=seq_len)
+        total += stats.prediction_tokens
+    return total
 
 
 def corpus_fingerprint(texts: list[str]) -> str:
@@ -251,7 +266,11 @@ def validate_sequence_contract(
 
 def run_tiny_overfit_gate(tokenizer: BPETokenizer, train_sequences: list[list[int]]) -> tuple[float, float]:
     seq_len = min(48, max(8, len(train_sequences[0]) - 1))
-    dataset = PackedSequenceDataset(train_sequences[: min(4, len(train_sequences))], seq_len, tokenizer.pad_id())
+    dataset = PackedSequenceDataset(
+        train_sequences[: min(4, len(train_sequences))],
+        seq_len,
+        tokenizer,
+    )
     x, y = dataset[0]
     x, y = x.unsqueeze(0), y.unsqueeze(0)
     torch.manual_seed(20260814)
@@ -293,6 +312,7 @@ def run_training_preflight(
     initial, final = run_tiny_overfit_gate(tokenizer, train_sequences)
     return TrainingPreflightReport(
         len(train_texts), len(val_texts), len(train_sequences), len(val_sequences),
-        prediction_token_count(train_sequences), prediction_token_count(val_sequences),
+        prediction_token_count(train_sequences, tokenizer, seq_len=seq_len),
+        prediction_token_count(val_sequences, tokenizer, seq_len=seq_len),
         tokenizer.vocab_size, tokenizer.algorithm_version, roundtrips, initial, final,
     )
