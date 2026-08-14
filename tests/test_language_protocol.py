@@ -5,6 +5,7 @@ import pytest
 from src.language.protocol import (
     ProtocolError,
     build_chat_prompt,
+    build_exam_prompt,
     extract_assistant_response,
     format_user_turn,
     generation_stop_ids,
@@ -25,6 +26,12 @@ def _tokenizer() -> BPETokenizer:
 def test_chat_prompt_matches_training_grammar():
     prompt = build_chat_prompt([("user", "What is RSI?")])
     assert prompt == "<user>\nWhat is RSI?\n</user>\n<assistant>\n"
+
+
+def test_exam_prompt_is_exact_single_turn_chat_protocol():
+    question = "What is 2 + 2?"
+    assert build_exam_prompt(question) == build_chat_prompt([("user", question)])
+    assert build_exam_prompt(question) == "<user>\nWhat is 2 + 2?\n</user>\n<assistant>\n"
 
 
 def test_multi_turn_prompt_preserves_complete_turn_boundaries():
