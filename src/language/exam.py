@@ -11,7 +11,7 @@ from src.language.protocol import build_exam_prompt
 from src.language.pytorch_transformer import VistaReasoningGPT
 from src.language.tokenizer import BPETokenizer, ENDASSISTANT, EOS
 
-EXAM_VERSION = 3
+EXAM_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -55,24 +55,9 @@ class EpochExamResult:
 
 
 FOUNDATION_EXAM: tuple[ExamQuestion, ...] = (
-    ExamQuestion(
-        "arithmetic_2_plus_2",
-        "arithmetic",
-        "What is 2 + 2?",
-        expected_all=("4",),
-    ),
-    ExamQuestion(
-        "arithmetic_15_times_14",
-        "arithmetic",
-        "What is 15 multiplied by 14?",
-        expected_all=("210",),
-    ),
-    ExamQuestion(
-        "algebra_simple",
-        "algebra",
-        "If 2x + 5 = 11, what is x?",
-        expected_all=("3",),
-    ),
+    ExamQuestion("arithmetic_2_plus_2", "arithmetic", "What is 2 + 2?", expected_all=("4",)),
+    ExamQuestion("arithmetic_15_times_14", "arithmetic", "What is 15 multiplied by 14?", expected_all=("210",)),
+    ExamQuestion("algebra_simple", "algebra", "If 2x + 5 = 11, what is x?", expected_all=("3",)),
     ExamQuestion(
         "trading_bullish",
         "trading_language",
@@ -175,6 +160,33 @@ def _is_correct(question: ExamQuestion, normalized: str) -> bool:
     return bool(question.expected_all or question.expected_any)
 
 
+def _character_repetition_ratio(text: str, *, ngram: int = 4) -> float:
+    compact = re.sub(r"\s+", "", text.casefold())
+    if len(compact) < max(ngram * 3, 12):
+        return 0.0
+    grams = [compact[index:index + ngram] for index in range(len(compact) - ngram + 1)]
+    if not grams:
+        return 0.0
+    return 1.0 - (len(set(grams)) / len(grams))
+
+
+def _periodic_repetition_ratio(text: str) -> float:
+    compact = re.sub(r"\s+", "", text.casefold())
+    if len(compact) < 16:
+        return 0.0
+    best = 0.0
+    for width in range(1, min(13, len(compact) // 3 + 1)):
+        matches = 0
+        comparisons = 0
+        for index in range(width, len(compact)):
+            comparisons += 1
+            if compact[index] == compact[index - width]:
+                matches += 1
+        if comparisons:
+            best = max(best, matches / comparisons)
+    return best
+
+
 def _quality(value: str) -> tuple[float, float, tuple[str, ...]]:
     raw = str(value or "")
     normalized = _normalize_output(raw)
@@ -186,9 +198,17 @@ def _quality(value: str) -> tuple[float, float, tuple[str, ...]]:
     if not words:
         return 0.0, 1.0, ("no_lexical_content",)
 
-    repetition = 1.0 - (len(set(words)) / max(1, len(words)))
-    if len(words) >= 8 and repetition > 0.55:
-        flags.append("high_repetition")
+    word_repetition = 1.0 - (len(set(words)) / max(1, len(words)))
+    char_repetition = _character_repetition_ratio(normalized)
+    periodic_repetition = _periodic_repetition_ratio(normalized)
+    repetition = max(word_repetition, char_repetition, periodic_repetition)
+
+    if len(words) >= 8 and word_repetition > 0.55:
+        flags.append("high_word_repetition")
+    if len(normalized) >= 24 and char_repetition > 0.58:
+        flags.append("high_character_repetition")
+    if len(normalized) >= 24 and periodic_repetition > 0.72:
+        flags.append("periodic_repetition")
 
     replacement_count = raw.count("\ufffd")
     if replacement_count:
@@ -207,12 +227,20 @@ def _quality(value: str) -> tuple[float, float, tuple[str, ...]]:
     if len(words) >= 8 and single_char_words / len(words) > 0.45:
         flags.append("fragmented_words")
 
+    # Extremely long lexical runs with almost no separators are a strong sign
+    # of subword-loop collapse even when the repeated fragments are not words.
+    longest_run = max((len(part) for part in re.findall(r"[A-Za-z]+", normalized)), default=0)
+    if longest_run >= 40:
+        flags.append("run_on_fragment")
+
     quality = 1.0
-    quality -= min(0.55, repetition * 0.65)
+    quality -= min(0.65, repetition * 0.72)
     quality -= min(0.35, unusual_ratio)
     quality -= min(0.25, replacement_count / max(1, len(raw)))
+    if "run_on_fragment" in flags:
+        quality -= 0.25
     if flags:
-        quality -= min(0.40, 0.12 * len(flags))
+        quality -= min(0.45, 0.10 * len(flags))
     return max(0.0, min(1.0, quality)), repetition, tuple(flags)
 
 
@@ -226,7 +254,9 @@ def _training_signal(
         return "GIBBERISH"
     if gibberish >= total or quality_percent < 20.0:
         return "GIBBERISH"
-    if correctness <= 0.0 and quality_percent < 45.0:
+    if correctness <= 0.0 and gibberish >= max(1, total // 2):
+        return "GIBBERISH"
+    if correctness <= 0.0 and quality_percent < 55.0:
         return "EARLY_SIGNAL"
     if correctness < 60.0:
         return "LEARNING"
@@ -270,11 +300,7 @@ def run_epoch_exam(
             stop_ids=stop_ids,
         )
         continuation = generated[0, len(prompt_ids):].tolist()
-        raw = tokenizer.decode(
-            continuation,
-            skip_special=False,
-            errors="replace",
-        )
+        raw = tokenizer.decode(continuation, skip_special=False, errors="replace")
         normalized = _normalize_output(raw)
         quality, repetition, flags = _quality(raw)
         answers.append(
@@ -336,12 +362,9 @@ def render_exam_text(
     if previous is not None:
         lines.extend(
             [
-                f"Correctness delta: "
-                f"{result.correctness_percent - previous.correctness_percent:+.1f}pp",
-                f"Quality delta: "
-                f"{result.mean_quality_percent - previous.mean_quality_percent:+.1f}pp",
-                f"Gibberish delta: "
-                f"{result.gibberish_answers - previous.gibberish_answers:+d}",
+                f"Correctness delta: {result.correctness_percent - previous.correctness_percent:+.1f}pp",
+                f"Quality delta: {result.mean_quality_percent - previous.mean_quality_percent:+.1f}pp",
+                f"Gibberish delta: {result.gibberish_answers - previous.gibberish_answers:+d}",
             ]
         )
 
@@ -383,10 +406,7 @@ def save_epoch_exam(
     text_path = output / f"{stem}.txt"
     json_path = output / f"{stem}.json"
 
-    text_path.write_text(
-        render_exam_text(result, previous=previous),
-        encoding="utf-8",
-    )
+    text_path.write_text(render_exam_text(result, previous=previous), encoding="utf-8")
     json_path.write_text(
         json.dumps(asdict(result), ensure_ascii=False, indent=2),
         encoding="utf-8",
