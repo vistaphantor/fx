@@ -1,9 +1,11 @@
 """Authoritative target construction for Vista language training.
 
 Documents use full next-token language modelling. Conversational examples use
-assistant-supervised loss: user/system prompt tokens provide causal context but
-do not consume gradient budget. Packed <eos> -> <bos> transitions are always
-masked because they are batching artifacts, not language.
+assistant-content supervision: user/system prompt tokens and the opening
+<assistant> control token provide causal context but do not consume gradient
+budget. Inference already seeds <assistant>, so teaching the model to emit that
+same opener creates a duplicated-control-token attractor. Packed <eos> -> <bos>
+transitions are always masked because they are batching artifacts, not language.
 """
 from __future__ import annotations
 
@@ -11,7 +13,7 @@ from dataclasses import dataclass
 
 from src.language.tokenizer import ASSISTANT, BOS, ENDASSISTANT, EOS, SPECIAL_TOKENS
 
-LOSS_OBJECTIVE_VERSION = 1
+LOSS_OBJECTIVE_VERSION = 2
 
 _BOS_ID = SPECIAL_TOKENS.index(BOS)
 _EOS_ID = SPECIAL_TOKENS.index(EOS)
@@ -86,9 +88,12 @@ def build_loss_targets(
                 boundary_masked += 1
                 continue
             if target == _ASSISTANT_ID:
+                # Generation is seeded with <assistant>; this token is context,
+                # never a prediction target. Masking it prevents repeated role
+                # markers from becoming a cheap high-confidence attractor.
                 inside_assistant = True
                 saw_assistant = True
-                y[y_index] = target
+                prompt_masked += 1
                 continue
             if inside_assistant:
                 y[y_index] = target
