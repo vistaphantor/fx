@@ -4,19 +4,28 @@ import random
 import re
 from dataclasses import dataclass
 
-
 CURRICULUM_STAGES = ("foundation", "reasoning", "trading_reasoning")
 
-_TRADING_TERMS = re.compile(
+# One strong term is sufficient because these are highly specific to trading.
+_STRONG_TRADING_TERMS = re.compile(
     r"\b(?:"
-    r"forex|fx|trading|trade|trader|market|price action|bullish|bearish|"
     r"xauusd|eurusd|gbpusd|usdjpy|usdchf|audusd|nzdusd|"
-    r"candlestick|candle|spread|slippage|stop loss|take profit|"
-    r"risk reward|risk-reward|position size|lot size|leverage|margin|pip|pips|"
-    r"liquidity|support|resistance|breakout|retest|order flow|orderflow|"
-    r"rsi|atr|macd|ema|sma|moving average|volatility|drawdown|"
-    r"trend|timeframe|higher timeframe|lower timeframe|entry|exit|"
-    r"long position|short position|bid|ask|broker|execution"
+    r"candlestick|candlesticks|slippage|stop loss|stop-loss|take profit|"
+    r"risk reward|risk-reward|position size|lot size|leverage|margin call|"
+    r"pip|pips|order flow|orderflow|rsi|atr|macd|"
+    r"bid[- ]ask|bid ask|long position|short position|broker|spread"
+    r")\b",
+    flags=re.IGNORECASE,
+)
+
+# These terms are meaningful in trading context but individually ambiguous.
+# Require at least two distinct hits before calling an example trading-domain.
+_CONTEXT_TRADING_TERMS = re.compile(
+    r"\b(?:"
+    r"forex|fx|trading|trader|trade|bullish|bearish|"
+    r"liquidity|support|resistance|breakout|retest|volatility|drawdown|"
+    r"timeframe|higher timeframe|lower timeframe|entry|exit|execution|"
+    r"moving average|ema|sma|price action|risk management"
     r")\b",
     flags=re.IGNORECASE,
 )
@@ -44,8 +53,17 @@ def is_reasoning_example(text: str) -> bool:
     return "<think>" in text and "</think>" in text
 
 
+def trading_evidence_score(text: str) -> int:
+    if "<market>" in text or "<decision>" in text:
+        return 3
+    if _STRONG_TRADING_TERMS.search(text):
+        return 3
+    context_hits = {match.group(0).casefold() for match in _CONTEXT_TRADING_TERMS.finditer(text)}
+    return len(context_hits)
+
+
 def is_trading_example(text: str) -> bool:
-    return bool(_TRADING_TERMS.search(text)) or "<market>" in text or "<decision>" in text
+    return trading_evidence_score(text) >= 2
 
 
 def is_math_example(text: str) -> bool:
@@ -71,7 +89,7 @@ def select_curriculum(
     seed: int = 42,
     min_trading_examples: int = 100,
 ) -> CurriculumSelection:
-    """Select a deterministic, non-duplicating curriculum for one training stage."""
+    """Select a deterministic, non-duplicating curriculum for one stage."""
     normalized_stage = stage.strip().casefold()
     if normalized_stage == "general_language":
         normalized_stage = "foundation"
@@ -104,13 +122,11 @@ def select_curriculum(
                 f"trading_curriculum_insufficient_examples:{len(trading)}<{min_trading_examples}"
             )
         trading_set = set(trading)
-        reasoning_pool = [
-            text for text in reasoning
-            if text not in trading_set
-        ]
+        reasoning_pool = [text for text in reasoning if text not in trading_set]
+        reasoning_pool_set = set(reasoning_pool)
         general_pool = [
             text for text in texts
-            if text not in trading_set and text not in set(reasoning_pool)
+            if text not in trading_set and text not in reasoning_pool_set
         ]
         reasoning_replay_count = min(len(reasoning_pool), max(25, len(trading) // 3))
         general_replay_count = min(len(general_pool), max(10, len(trading) // 10))
