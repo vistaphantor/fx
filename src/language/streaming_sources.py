@@ -65,6 +65,7 @@ class GuardedSource(DatasetSource):
         enforce_stage: bool = True,
         near_dedup_entries: int = 50_000,
         near_dedup_hamming: int = 4,
+        near_index: NearDuplicateIndex | None = None,
     ):
         self._source = source
         self._stage = stage.strip().casefold()
@@ -73,6 +74,7 @@ class GuardedSource(DatasetSource):
         self._enforce_stage = bool(enforce_stage)
         self._near_dedup_entries = int(near_dedup_entries)
         self._near_dedup_hamming = int(near_dedup_hamming)
+        self._near_index = near_index
 
     @property
     def source_id(self) -> str:
@@ -89,6 +91,7 @@ class GuardedSource(DatasetSource):
             "enforce_stage": self._enforce_stage,
             "near_dedup_entries": self._near_dedup_entries,
             "near_dedup_hamming": self._near_dedup_hamming,
+            "shared_near_dedup": self._near_index is not None,
         }
 
     def _stage_accepts(self, text: str) -> bool:
@@ -104,7 +107,7 @@ class GuardedSource(DatasetSource):
 
     def stream(self) -> Iterator[str]:
         seen: set[str] = set()
-        near = NearDuplicateIndex(
+        near = self._near_index or NearDuplicateIndex(
             max_entries=self._near_dedup_entries,
             max_hamming_distance=self._near_dedup_hamming,
         )
@@ -251,6 +254,12 @@ def build_training_stream(
     excluded_hashes = frozenset(canonical_hash(text) for text in excluded_texts if text and text.strip())
     excluded_families = frozenset(prompt_family(text) for text in excluded_texts if text and text.strip())
     sources: list[tuple[DatasetSource, float]] = []
+
+    # Share the recent near-duplicate index across all HF sources so the same
+    # example copied into two public datasets does not consume optimizer budget
+    # twice. Local replay intentionally uses its own index because replay is a
+    # controlled anti-forgetting curriculum component.
+    hf_near_index = NearDuplicateIndex(max_entries=50_000, max_hamming_distance=4)
     for index, spec in enumerate(selected):
         sources.append((
             GuardedSource(
@@ -259,6 +268,7 @@ def build_training_stream(
                 excluded_hashes=excluded_hashes,
                 excluded_families=excluded_families,
                 enforce_stage=True,
+                near_index=hf_near_index,
             ),
             spec.weight,
         ))
