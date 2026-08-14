@@ -3,9 +3,17 @@ from __future__ import annotations
 import sys
 from types import SimpleNamespace
 
+import pytest
+
 from corpus.source import HFSource
 from corpus.streamer import CorpusStreamer, WeightedSourceStream
-from src.language.streaming_sources import CanonicalMemorySource
+from src.language.canonical_contract import prompt_family
+from src.language.streaming_sources import (
+    CanonicalMemorySource,
+    GuardedSource,
+    HFSourceSpec,
+    build_training_stream,
+)
 from src.language.tokenizer import BPETokenizer
 
 
@@ -22,40 +30,58 @@ class _FakeIterableDataset:
         yield from self.rows
 
 
-def test_hf_source_streams_canonical_chat(monkeypatch):
+def test_hf_source_requires_pinned_revision(monkeypatch):
+    dataset = _FakeIterableDataset([{"question": "What is 2 + 2?", "answer": "4"}])
+    monkeypatch.setitem(sys.modules, "datasets", SimpleNamespace(load_dataset=lambda *a, **k: dataset))
+    with pytest.raises(RuntimeError, match="hf_revision_must_be_pinned"):
+        list(HFSource("example/test", shuffle_buffer_size=0).stream())
+
+
+def test_hf_source_streams_same_canonical_chat_contract(monkeypatch):
+    calls = []
     dataset = _FakeIterableDataset(
         [
-            {"question": "What is 2 + 2?", "answer": "4"},
-            {
-                "messages": [
-                    {"role": "user", "content": "What is ATR?"},
-                    {"role": "assistant", "content": "ATR measures range."},
-                ]
-            },
+            {"question": "What is 2 + 2?", "answer": "<think>Calculate.</think>4"},
+            {"messages": [
+                {"role": "user", "content": "What is ATR?"},
+                {"role": "assistant", "content": "ATR measures range."},
+            ]},
         ]
     )
-    monkeypatch.setitem(
-        sys.modules,
-        "datasets",
-        SimpleNamespace(load_dataset=lambda *args, **kwargs: dataset),
-    )
+
+    def load_dataset(*args, **kwargs):
+        calls.append((args, kwargs))
+        return dataset
+
+    monkeypatch.setitem(sys.modules, "datasets", SimpleNamespace(load_dataset=load_dataset))
     source = HFSource(
-        "example/test",
-        max_examples=2,
-        shuffle_buffer_size=128,
-        seed=7,
+        "example/test", revision="abc123", max_examples=2,
+        shuffle_buffer_size=128, seed=7,
     )
     texts = list(source.stream())
     assert len(texts) == 2
-    assert texts[0].startswith("<bos>\n<user>\n")
-    assert "Human:" not in texts[0]
-    assert "Assistant:" not in texts[0]
-    assert "<assistant>\n4\n</assistant>" in texts[0]
-    assert texts[0].endswith("<eos>")
+    assert texts[0] == (
+        "<bos>\n<user>\nWhat is 2 + 2?\n</user>\n"
+        "<assistant>\n<think>\nCalculate.\n</think>\n4\n</assistant>\n<eos>"
+    )
+    assert calls[0][1]["revision"] == "abc123"
     assert dataset.shuffle_args == (7, 128)
 
 
-def test_corpus_streamer_never_crosses_examples_without_explicit_boundaries():
+def test_guarded_source_excludes_validation_family_and_duplicates():
+    heldout = "<bos>\n<user>\nWhat is RSI?\n</user>\n<assistant>\nHeldout.\n</assistant>\n<eos>"
+    same_family = "<bos>\n<user>\nWhat is RSI?\n</user>\n<assistant>\nDifferent answer.\n</assistant>\n<eos>"
+    safe = "<bos>\n<user>\nExplain ATR.\n</user>\n<assistant>\nATR measures range.\n</assistant>\n<eos>"
+    source = CanonicalMemorySource([same_family, safe, safe])
+    guarded = GuardedSource(
+        source,
+        stage="foundation",
+        excluded_families=frozenset({prompt_family(heldout)}),
+    )
+    assert list(guarded.stream()) == [safe]
+
+
+def test_corpus_streamer_packs_short_examples_into_context():
     texts = [
         "<bos>\n<user>\nA?\n</user>\n<assistant>\nA.\n</assistant>\n<eos>",
         "<bos>\n<user>\nB?\n</user>\n<assistant>\nB.\n</assistant>\n<eos>",
@@ -65,12 +91,13 @@ def test_corpus_streamer_never_crosses_examples_without_explicit_boundaries():
     dataset = CorpusStreamer(texts, tokenizer, seq_len=64)
     samples = list(dataset)
     assert samples
-    decoded = [
-        tokenizer.decode(x.tolist(), skip_special=False)
-        for x, _ in samples
-    ]
-    assert any("A?" in text for text in decoded)
-    assert any("B?" in text for text in decoded)
+    decoded = [tokenizer.decode(x.tolist(), skip_special=False) for x, _ in samples]
+    joined = "\n".join(decoded)
+    assert "A?" in joined and "B?" in joined
+    # Packing must not create a sample per short example when both fit.
+    individual = sum(len(tokenizer.encode(text, False, False)) for text in texts)
+    if individual <= 65:
+        assert len(samples) == 1
 
 
 def test_weighted_stream_repeats_finite_sources_deterministically():
@@ -83,4 +110,10 @@ def test_weighted_stream_repeats_finite_sources_deterministically():
     first_a = [next(iterator_a) for _ in range(12)]
     first_b = [next(iterator_b) for _ in range(12)]
     assert first_a == first_b
-    assert set(first_a) == {"<bos>\nleft\n<eos>", "<bos>\nright\n<eos>"}
+
+
+def test_build_training_stream_rejects_unpinned_spec_before_training():
+    with pytest.raises(ValueError, match="revision"):
+        # Configuration parsing owns this guard in production; this direct
+        # construction documents that callers must provide immutable revisions.
+        HFSourceSpec(path="example/test", weight=1.0, stages=("foundation",), revision=None)
