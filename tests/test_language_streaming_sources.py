@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from types import SimpleNamespace
 
@@ -11,8 +12,7 @@ from src.language.canonical_contract import prompt_family
 from src.language.streaming_sources import (
     CanonicalMemorySource,
     GuardedSource,
-    HFSourceSpec,
-    build_training_stream,
+    load_hf_source_config,
 )
 from src.language.tokenizer import BPETokenizer
 
@@ -94,7 +94,6 @@ def test_corpus_streamer_packs_short_examples_into_context():
     decoded = [tokenizer.decode(x.tolist(), skip_special=False) for x, _ in samples]
     joined = "\n".join(decoded)
     assert "A?" in joined and "B?" in joined
-    # Packing must not create a sample per short example when both fit.
     individual = sum(len(tokenizer.encode(text, False, False)) for text in texts)
     if individual <= 65:
         assert len(samples) == 1
@@ -107,13 +106,14 @@ def test_weighted_stream_repeats_finite_sources_deterministically():
     stream_b = WeightedSourceStream([(left, 1.0), (right, 1.0)], seed=9, repeat=True)
     iterator_a = iter(stream_a)
     iterator_b = iter(stream_b)
-    first_a = [next(iterator_a) for _ in range(12)]
-    first_b = [next(iterator_b) for _ in range(12)]
-    assert first_a == first_b
+    assert [next(iterator_a) for _ in range(12)] == [next(iterator_b) for _ in range(12)]
 
 
-def test_build_training_stream_rejects_unpinned_spec_before_training():
-    with pytest.raises(ValueError, match="revision"):
-        # Configuration parsing owns this guard in production; this direct
-        # construction documents that callers must provide immutable revisions.
-        HFSourceSpec(path="example/test", weight=1.0, stages=("foundation",), revision=None)
+def test_hf_config_rejects_unpinned_revision(tmp_path):
+    path = tmp_path / "hf.json"
+    path.write_text(
+        json.dumps({"sources": [{"path": "example/test", "weight": 1.0, "stages": ["foundation"]}]}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="revision_required"):
+        load_hf_source_config(path)
