@@ -11,28 +11,33 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 from src.language.model_bundle import load_model_bundle
+from src.language.protocol import (
+    ProtocolError,
+    build_chat_prompt,
+    extract_assistant_response,
+    generation_stop_ids,
+)
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--bundle",
-        default="data/models/trading_language/15m",
-    )
-    parser.add_argument("--temperature", type=float, default=0.55)
-    parser.add_argument("--top-k", type=int, default=32)
-    parser.add_argument("--top-p", type=float, default=0.90)
+    parser.add_argument("--bundle", default="data/models/trading_language/15m")
+    parser.add_argument("--temperature", type=float, default=0.45)
+    parser.add_argument("--top-k", type=int, default=24)
+    parser.add_argument("--top-p", type=float, default=0.88)
     parser.add_argument("--max-new-tokens", type=int, default=180)
     args = parser.parse_args()
 
-    model, tok, manifest = load_model_bundle(args.bundle, device="cpu")
+    model, tokenizer, manifest = load_model_bundle(args.bundle, device="cpu")
     print(
         f"Loaded {manifest.architecture} "
-        f"{manifest.parameter_count/1e6:.2f}M "
-        f"stage={manifest.training_stage}"
+        f"{manifest.parameter_count / 1e6:.2f}M "
+        f"stage={manifest.training_stage} "
+        f"context={model.max_seq_len}"
     )
 
-    history: list[str] = []
+    turns: list[tuple[str, str]] = []
+    stop_ids = generation_stop_ids(tokenizer)
 
     while True:
         try:
@@ -46,39 +51,53 @@ def main():
         if user_input in {"/quit", "/exit"}:
             break
         if user_input == "/reset":
-            history.clear()
+            turns.clear()
+            print("Conversation reset.")
             continue
 
-        history.append(f"<user>{user_input}</user>")
-        history = history[-6:]
-        prompt = "\n".join(history) + "\n<assistant>"
+        candidate_turns = turns + [("user", user_input)]
+        try:
+            prompt = build_chat_prompt(candidate_turns)
+        except ProtocolError as exc:
+            print(f"Input rejected by language protocol: {exc}")
+            continue
 
-        ids = tok.encode(prompt, add_bos=True, add_eos=False)
+        ids = tokenizer.encode(prompt, add_bos=True, add_eos=False)
         if len(ids) > model.max_seq_len:
-            ids = ids[-model.max_seq_len:]
+            # Drop complete oldest turns until the canonical prompt fits. Never
+            # slice through the middle of a structural token sequence.
+            trimmed = list(candidate_turns)
+            while len(trimmed) > 1:
+                trimmed = trimmed[1:]
+                if trimmed and trimmed[0][0] == "assistant":
+                    trimmed = trimmed[1:]
+                prompt = build_chat_prompt(trimmed)
+                ids = tokenizer.encode(prompt, add_bos=True, add_eos=False)
+                if len(ids) <= model.max_seq_len:
+                    candidate_turns = trimmed
+                    break
+            if len(ids) > model.max_seq_len:
+                print("Input is longer than the model's trained context window.")
+                continue
 
-        inp = torch.tensor([ids], dtype=torch.long)
-
-        out = model.generate(
-            inp,
+        output = model.generate(
+            torch.tensor([ids], dtype=torch.long),
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
             top_k=args.top_k,
             top_p=args.top_p,
-            eos_id=tok.eos_id(),
+            stop_ids=stop_ids,
         )
+        decoded = tokenizer.decode(output[0].tolist(), skip_special=False)
+        try:
+            response = extract_assistant_response(decoded)
+        except ProtocolError as exc:
+            print(f"Generation violated language protocol: {exc}")
+            continue
 
-        generated = tok.decode(out[0].tolist(), skip_special=False)
-
-        response = generated.split("<assistant>")[-1]
-        if "</assistant>" in response:
-            response = response.split("</assistant>", 1)[0]
-        if "<user>" in response:
-            response = response.split("<user>", 1)[0]
-
-        response = response.strip()
         print(f"\nVista: {response}")
-        history.append(f"<assistant>{response}</assistant>")
+        turns = candidate_turns + [("assistant", response)]
+        turns = turns[-6:]
 
 
 if __name__ == "__main__":
