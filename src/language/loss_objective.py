@@ -6,6 +6,11 @@ assistant-content supervision: user/system prompt tokens and the opening
 budget. Inference already seeds <assistant>, so teaching the model to emit that
 same opener creates a duplicated-control-token attractor. Packed <eos> -> <bos>
 transitions are always masked because they are batching artifacts, not language.
+
+A clipped/context window may legitimately contain only prompt context and no
+assistant target tokens. Such windows return prediction_tokens=0 and are
+filtered by the authoritative dataset/stream layer; target construction itself
+must not turn an expected windowing condition into a runtime crash.
 """
 from __future__ import annotations
 
@@ -13,7 +18,7 @@ from dataclasses import dataclass
 
 from src.language.tokenizer import ASSISTANT, BOS, ENDASSISTANT, EOS, SPECIAL_TOKENS
 
-LOSS_OBJECTIVE_VERSION = 2
+LOSS_OBJECTIVE_VERSION = 3
 
 _BOS_ID = SPECIAL_TOKENS.index(BOS)
 _EOS_ID = SPECIAL_TOKENS.index(EOS)
@@ -88,9 +93,6 @@ def build_loss_targets(
                 boundary_masked += 1
                 continue
             if target == _ASSISTANT_ID:
-                # Generation is seeded with <assistant>; this token is context,
-                # never a prediction target. Masking it prevents repeated role
-                # markers from becoming a cheap high-confidence attractor.
                 inside_assistant = True
                 saw_assistant = True
                 prompt_masked += 1
@@ -111,8 +113,6 @@ def build_loss_targets(
             boundary_masked += 1
 
     prediction_tokens = sum(1 for token_id in y if token_id != pad_id)
-    if prediction_tokens <= 0:
-        raise RuntimeError("loss_objective_has_no_prediction_tokens")
 
     if len(x) < seq_len:
         padding = seq_len - len(x)
