@@ -9,8 +9,6 @@ on:
       - "corpus/quality.py"
       - "corpus/dedup.py"
       - "tools/train_language_reasoner.py"
-      - "tools/benchmark_language_compute.py"
-      - "tools/audit_language_sources.py"
       - "tools/vista_chat.py"
       - "tests/test_language_*.py"
       - "requirements.txt"
@@ -23,8 +21,6 @@ on:
       - "corpus/quality.py"
       - "corpus/dedup.py"
       - "tools/train_language_reasoner.py"
-      - "tools/benchmark_language_compute.py"
-      - "tools/audit_language_sources.py"
       - "tools/vista_chat.py"
       - "tests/test_language_*.py"
       - "requirements.txt"
@@ -46,8 +42,7 @@ jobs:
           python -m compileall -q \
             src/language \
             corpus/source.py corpus/streamer.py corpus/quality.py corpus/dedup.py \
-            tools/train_language_reasoner.py tools/benchmark_language_compute.py \
-            tools/audit_language_sources.py tools/vista_chat.py
+            tools/train_language_reasoner.py tools/vista_chat.py
       - name: Run language architecture tests
         run: |
           python -m pytest \
