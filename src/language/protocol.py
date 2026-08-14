@@ -44,6 +44,16 @@ def build_chat_prompt(turns: Iterable[tuple[str, str]]) -> str:
     return "\n".join(serialized) + "\n"
 
 
+def build_exam_prompt(question: str) -> str:
+    """Build the deterministic single-turn prompt used by epoch exams.
+
+    Exams must exercise the exact same user/assistant grammar as interactive
+    inference. Keeping this here prevents the evaluator from inventing a
+    second prompt protocol that the model never saw during training.
+    """
+    return build_chat_prompt((("user", question),))
+
+
 def generation_stop_ids(tokenizer: BPETokenizer) -> set[int]:
     return {
         tokenizer.eos_id(),
