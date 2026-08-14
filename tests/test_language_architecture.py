@@ -39,9 +39,15 @@ def test_model_bundle_round_trip(tmp_path: Path):
         "d_model": 64,
         "n_layers": 2,
         "n_heads": 4,
+        "n_kv_heads": 2,
         "ffn_dim": 128,
         "max_seq_len": 64,
         "dropout": 0.0,
+        "ffn_type": "moe",
+        "num_experts": 4,
+        "experts_per_token": 1,
+        "moe_ffn_dim": 64,
+        "shared_expert_ffn_dim": 32,
     }
     model = VistaReasoningGPT(**cfg)
     bundle = tmp_path / "bundle"
@@ -56,10 +62,12 @@ def test_model_bundle_round_trip(tmp_path: Path):
     )
 
     loaded_model, loaded_tok, manifest = load_model_bundle(bundle)
-    assert manifest.bundle_version == BUNDLE_VERSION == 2
+    assert manifest.bundle_version == BUNDLE_VERSION == 4
     assert manifest.tokenizer_algorithm_version == TOKENIZER_ALGORITHM_VERSION == 4
     assert loaded_tok.fingerprint() == tok.fingerprint()
     assert loaded_model.get_num_params() == model.get_num_params()
+    assert manifest.active_parameter_count == model.get_active_params_per_token()
+    assert 0.0 < manifest.activation_ratio < 1.0
     assert manifest.training_stage == "smoke"
 
 
