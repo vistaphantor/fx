@@ -173,16 +173,11 @@ def build_example_sequences(
 class PackedSequenceDataset(Dataset):
     """Packed examples with the authoritative role-aware training objective."""
 
-    def __init__(
-        self,
-        sequences: list[list[int]],
-        seq_len: int,
-        tokenizer: BPETokenizer,
-    ):
+    def __init__(self, sequences: list[list[int]], seq_len: int, pad_id: int):
         if not sequences:
             raise ValueError("sequences must not be empty")
         self.seq_len = int(seq_len)
-        self.tokenizer = tokenizer
+        self.pad_id = int(pad_id)
         self.sequences = [list(sequence) for sequence in sequences]
 
     def __len__(self) -> int:
@@ -191,21 +186,18 @@ class PackedSequenceDataset(Dataset):
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         x, y, _ = build_loss_targets(
             self.sequences[idx],
-            self.tokenizer,
             seq_len=self.seq_len,
+            pad_id=self.pad_id,
         )
         return torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long)
 
 
 def prediction_token_count(
-    sequences: list[list[int]],
-    tokenizer: BPETokenizer,
-    *,
-    seq_len: int,
+    sequences: list[list[int]], *, seq_len: int, pad_id: int,
 ) -> int:
     total = 0
     for sequence in sequences:
-        _, _, stats = build_loss_targets(sequence, tokenizer, seq_len=seq_len)
+        _, _, stats = build_loss_targets(sequence, seq_len=seq_len, pad_id=pad_id)
         total += stats.prediction_tokens
     return total
 
@@ -269,7 +261,7 @@ def run_tiny_overfit_gate(tokenizer: BPETokenizer, train_sequences: list[list[in
     dataset = PackedSequenceDataset(
         train_sequences[: min(4, len(train_sequences))],
         seq_len,
-        tokenizer,
+        tokenizer.pad_id(),
     )
     x, y = dataset[0]
     x, y = x.unsqueeze(0), y.unsqueeze(0)
@@ -312,7 +304,11 @@ def run_training_preflight(
     initial, final = run_tiny_overfit_gate(tokenizer, train_sequences)
     return TrainingPreflightReport(
         len(train_texts), len(val_texts), len(train_sequences), len(val_sequences),
-        prediction_token_count(train_sequences, tokenizer, seq_len=seq_len),
-        prediction_token_count(val_sequences, tokenizer, seq_len=seq_len),
+        prediction_token_count(
+            train_sequences, seq_len=seq_len, pad_id=tokenizer.pad_id()
+        ),
+        prediction_token_count(
+            val_sequences, seq_len=seq_len, pad_id=tokenizer.pad_id()
+        ),
         tokenizer.vocab_size, tokenizer.algorithm_version, roundtrips, initial, final,
     )
