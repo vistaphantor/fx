@@ -9,9 +9,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from src.language.tokenizer import BPETokenizer
+from src.language.tokenizer import ASSISTANT, BOS, ENDASSISTANT, EOS, SPECIAL_TOKENS
 
 LOSS_OBJECTIVE_VERSION = 1
+
+_BOS_ID = SPECIAL_TOKENS.index(BOS)
+_EOS_ID = SPECIAL_TOKENS.index(EOS)
+_ASSISTANT_ID = SPECIAL_TOKENS.index(ASSISTANT)
+_END_ASSISTANT_ID = SPECIAL_TOKENS.index(ENDASSISTANT)
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,18 +26,17 @@ class LossTargetStats:
     masked_boundary_tokens: int
 
 
-def _example_ranges(sequence: list[int], *, bos_id: int, eos_id: int) -> list[tuple[int, int]]:
-    """Return inclusive [start, end] ranges for packed canonical examples."""
+def _example_ranges(sequence: list[int]) -> list[tuple[int, int]]:
     if not sequence:
         return []
     ranges: list[tuple[int, int]] = []
     start = 0
     for index, token_id in enumerate(sequence):
-        if token_id == bos_id and index != start:
+        if token_id == _BOS_ID and index != start:
             if index > start:
                 ranges.append((start, index - 1))
             start = index
-        if token_id == eos_id:
+        if token_id == _EOS_ID:
             ranges.append((start, index))
             start = index + 1
     if start < len(sequence):
@@ -42,22 +46,16 @@ def _example_ranges(sequence: list[int], *, bos_id: int, eos_id: int) -> list[tu
 
 def build_loss_targets(
     sequence: list[int],
-    tokenizer: BPETokenizer,
     *,
     seq_len: int,
+    pad_id: int,
 ) -> tuple[list[int], list[int], LossTargetStats]:
-    """Build x/y lists with role-aware supervision."""
+    """Build x/y lists with role-aware supervision under tokenizer v4 IDs."""
     if seq_len < 2:
         raise ValueError("seq_len must be >= 2")
     clipped = list(sequence[: seq_len + 1])
     if len(clipped) < 2:
         raise ValueError("sequence must contain at least two tokens")
-
-    pad_id = tokenizer.pad_id()
-    bos_id = tokenizer.bos_id()
-    eos_id = tokenizer.eos_id()
-    assistant_id = tokenizer.vocab["<assistant>"]
-    end_assistant_id = tokenizer.vocab["</assistant>"]
 
     x = clipped[:-1]
     raw_y = clipped[1:]
@@ -65,15 +63,15 @@ def build_loss_targets(
     prompt_masked = 0
     boundary_masked = 0
 
-    for start, end in _example_ranges(clipped, bos_id=bos_id, eos_id=eos_id):
+    for start, end in _example_ranges(clipped):
         example = clipped[start : end + 1]
-        is_chat = assistant_id in example
+        is_chat = _ASSISTANT_ID in example
 
         if not is_chat:
             for target_index in range(start + 1, end + 1):
                 y_index = target_index - 1
                 target = clipped[target_index]
-                if target == bos_id:
+                if target == _BOS_ID:
                     boundary_masked += 1
                     continue
                 y[y_index] = target
@@ -84,26 +82,26 @@ def build_loss_targets(
         for target_index in range(start + 1, end + 1):
             y_index = target_index - 1
             target = clipped[target_index]
-            if target == bos_id:
+            if target == _BOS_ID:
                 boundary_masked += 1
                 continue
-            if target == assistant_id:
+            if target == _ASSISTANT_ID:
                 inside_assistant = True
                 saw_assistant = True
                 y[y_index] = target
                 continue
             if inside_assistant:
                 y[y_index] = target
-                if target == end_assistant_id:
+                if target == _END_ASSISTANT_ID:
                     inside_assistant = False
                 continue
-            if target == eos_id and saw_assistant:
+            if target == _EOS_ID and saw_assistant:
                 y[y_index] = target
                 continue
             prompt_masked += 1
 
     for index, target in enumerate(raw_y):
-        if target == bos_id and y[index] != pad_id:
+        if target == _BOS_ID and y[index] != pad_id:
             y[index] = pad_id
             boundary_masked += 1
 
