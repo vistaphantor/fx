@@ -1,0 +1,35 @@
+{
+  "sources": [
+    {
+      "path": "ORG_OR_USER/DATASET_NAME",
+      "revision": "PIN_A_DATASET_COMMIT_SHA_OR_TAG",
+      "split": "train",
+      "weight": 1.0,
+      "stages": [
+        "foundation"
+      ],
+      "shuffle_buffer_size": 10000
+    },
+    {
+      "path": "ORG_OR_USER/REASONING_DATASET",
+      "revision": "PIN_A_DATASET_COMMIT_SHA_OR_TAG",
+      "split": "train",
+      "weight": 1.0,
+      "stages": [
+        "reasoning",
+        "trading_reasoning"
+      ],
+      "shuffle_buffer_size": 10000
+    },
+    {
+      "path": "ORG_OR_USER/TRADING_DATASET",
+      "revision": "PIN_A_DATASET_COMMIT_SHA_OR_TAG",
+      "split": "train",
+      "weight": 2.0,
+      "stages": [
+        "trading_reasoning"
+      ],
+      "shuffle_buffer_size": 10000
+    }
+  ]
+}
