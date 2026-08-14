@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import json
 import sys
 from types import SimpleNamespace
 
 import pytest
 
-from corpus.source import HFSource
+from corpus.source import HFSource, LocalSource
 
 
 class _FakeIterableDataset:
@@ -27,6 +28,21 @@ def _install_dataset(monkeypatch, rows):
         SimpleNamespace(load_dataset=lambda *args, **kwargs: dataset),
     )
     return dataset
+
+
+def test_local_source_uses_same_canonical_parser_as_trainer(tmp_path):
+    path = tmp_path / "local.jsonl"
+    path.write_text(
+        json.dumps({"question": "What is ATR?", "answer": "ATR measures true range."}) + "\n",
+        encoding="utf-8",
+    )
+    text = next(LocalSource(path).stream())
+    assert text == (
+        "<bos>\n<user>\nWhat is ATR?\n</user>\n"
+        "<assistant>\nATR measures true range.\n</assistant>\n<eos>"
+    )
+    assert "Human:" not in text
+    assert "Assistant:" not in text
 
 
 def test_explicit_prompt_response_mapping_preserves_roles(monkeypatch):
