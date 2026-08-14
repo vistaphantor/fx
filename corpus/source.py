@@ -54,7 +54,10 @@ class DatasetSource(ABC):
 
 
 class LocalSource(DatasetSource):
+    """Local file adapter backed by the authoritative language data parser."""
+
     SKIP_NAMES = {"master_index.json", "__pycache__", ".DS_Store"}
+    SUPPORTED_EXTENSIONS = {".json", ".jsonl", ".txt"}
 
     def __init__(self, path: str | Path):
         self._path = Path(path)
@@ -71,20 +74,33 @@ class LocalSource(DatasetSource):
 
     def _files(self) -> list[Path]:
         if self._path.is_file():
+            if self._path.suffix.casefold() not in self.SUPPORTED_EXTENSIONS:
+                raise ValueError(f"unsupported_local_training_file:{self._path}")
             return [self._path]
-        exts = {".json", ".jsonl", ".txt", ".gz"}
         return [
-            f
-            for f in sorted(self._path.rglob("*"))
-            if f.is_file() and f.suffix.lower() in exts and f.name not in self.SKIP_NAMES
+            file_path
+            for file_path in sorted(self._path.rglob("*"))
+            if file_path.is_file()
+            and file_path.suffix.casefold() in self.SUPPORTED_EXTENSIONS
+            and file_path.name not in self.SKIP_NAMES
         ]
 
     def stream(self) -> Iterator[str]:
-        from corpus.normalizer import TextNormalizer
+        # Deliberately reuse the exact parser used by train_language_reasoner.
+        # This avoids a second local grammar/normalizer drifting from training.
+        from src.language.data_pipeline import (
+            _load_json_file,
+            _load_jsonl_file,
+            _load_txt_file,
+        )
 
-        normalizer = TextNormalizer()
+        loaders = {
+            ".json": _load_json_file,
+            ".jsonl": _load_jsonl_file,
+            ".txt": _load_txt_file,
+        }
         for file_path in self._files():
-            yield from normalizer.parse_file(file_path)
+            yield from loaders[file_path.suffix.casefold()](file_path)
 
     def metadata(self) -> dict:
         return {"source_type": "local", "path": str(self._path)}
@@ -184,7 +200,6 @@ class HFSource(DatasetSource):
         return messages
 
     def _row_to_text(self, row: dict) -> Optional[str]:
-        # Explicit prompt/response mapping is authoritative when configured.
         if self._prompt_field and self._response_field:
             schema = self._detect_schema(row)
             if schema is None:
@@ -197,8 +212,6 @@ class HFSource(DatasetSource):
                 [CanonicalMessage("user", str(prompt)), CanonicalMessage("assistant", str(response))]
             ) or None
 
-        # text_fields is intentionally document-only. It must never be used to
-        # smuggle question/answer columns into an untyped pretraining document.
         if self._text_fields:
             parts = [str(row.get(field, "")) for field in self._text_fields]
             document = "\n\n".join(part for part in parts if part and part.strip())
