@@ -68,7 +68,7 @@ def test_long_example_is_chunked_without_crossing_other_examples():
     assert all("Short?" not in text for text in long_chunks)
 
 
-def test_packed_dataset_returns_aligned_fixed_shapes():
+def test_packed_dataset_masks_prompt_and_supervises_assistant():
     tok = _tokenizer()
     sequences = build_example_sequences(
         ["<bos><user>A?</user><assistant>A.</assistant><eos>"],
@@ -79,7 +79,14 @@ def test_packed_dataset_returns_aligned_fixed_shapes():
     x, y = dataset[0]
     assert tuple(x.shape) == (32,)
     assert tuple(y.shape) == (32,)
-    assert y[0].item() == sequences[0][1]
+    # <user> and its prompt are context, not gradient targets.
+    assert y[0].item() == tok.pad_id()
+    assistant_id = tok.vocab["<assistant>"]
+    assistant_target_positions = [
+        index - 1 for index, token in enumerate(sequences[0]) if token == assistant_id
+    ]
+    assert assistant_target_positions
+    assert all(y[position].item() == assistant_id for position in assistant_target_positions)
 
 
 def test_preflight_proves_roundtrip_alignment_and_learning():
