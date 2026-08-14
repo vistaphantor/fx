@@ -17,6 +17,7 @@ class HFSourceSpec:
     stages: tuple[str, ...]
     split: str = "train"
     config_name: str | None = None
+    revision: str | None = None
     text_fields: tuple[str, ...] | None = None
     max_examples: int | None = None
     shuffle_buffer_size: int = 10_000
@@ -80,12 +81,14 @@ def _parse_spec(payload: dict) -> HFSourceSpec:
     buffer_size = int(payload.get("shuffle_buffer_size", 10_000))
     if buffer_size < 0:
         raise ValueError(f"hf_source_shuffle_buffer_invalid:{path}")
+    revision = str(payload["revision"]).strip() if payload.get("revision") else None
     return HFSourceSpec(
         path=path,
         weight=weight,
         stages=stages,
         split=str(payload.get("split", "train")),
         config_name=(str(payload["config_name"]) if payload.get("config_name") else None),
+        revision=revision,
         text_fields=text_fields,
         max_examples=max_examples,
         shuffle_buffer_size=buffer_size,
@@ -117,6 +120,7 @@ def specs_fingerprint(specs: Sequence[HFSourceSpec]) -> str:
             "stages": list(spec.stages),
             "split": spec.split,
             "config_name": spec.config_name,
+            "revision": spec.revision or "main",
             "text_fields": list(spec.text_fields) if spec.text_fields else None,
             "max_examples": spec.max_examples,
             "shuffle_buffer_size": spec.shuffle_buffer_size,
@@ -134,6 +138,7 @@ def _hf_source(spec: HFSourceSpec, *, seed: int) -> HFSource:
         text_fields=list(spec.text_fields) if spec.text_fields else None,
         max_examples=spec.max_examples,
         config_name=spec.config_name,
+        revision=spec.revision,
         shuffle_buffer_size=spec.shuffle_buffer_size,
         seed=seed,
     )
