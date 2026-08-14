@@ -13,6 +13,7 @@ from src.language.streaming_sources import (
     CanonicalMemorySource,
     GuardedSource,
     load_hf_source_config,
+    stream_quality_accepts,
 )
 from src.language.tokenizer import BPETokenizer
 
@@ -79,6 +80,22 @@ def test_guarded_source_excludes_validation_family_and_duplicates():
         excluded_families=frozenset({prompt_family(heldout)}),
     )
     assert list(guarded.stream()) == [safe]
+
+
+def test_stream_quality_rejects_malformed_and_pathological_records():
+    good = "<bos>\n<user>\nExplain volatility.\n</user>\n<assistant>\nVolatility describes how much price changes over time.\n</assistant>\n<eos>"
+    malformed = "<bos>\n<user>\nQuestion only.\n</user>\n<eos>"
+    repetitive = "<bos>\n" + "word " * 100 + "\n<eos>"
+    assert stream_quality_accepts(good)
+    assert not stream_quality_accepts(malformed)
+    assert not stream_quality_accepts(repetitive)
+
+
+def test_guarded_source_drops_bad_rows_before_training():
+    good = "<bos>\n<user>\nExplain ATR.\n</user>\n<assistant>\nATR measures market range and volatility.\n</assistant>\n<eos>"
+    bad = "<bos>\n<user>\nMissing assistant.\n</user>\n<eos>"
+    guarded = GuardedSource(CanonicalMemorySource([bad, good]), stage="foundation")
+    assert list(guarded.stream()) == [good]
 
 
 def test_corpus_streamer_packs_short_examples_into_context():
