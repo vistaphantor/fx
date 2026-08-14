@@ -109,6 +109,8 @@ class HFSource(DatasetSource):
         path: str,
         split: str = "train",
         text_fields: Optional[list[str]] = None,
+        prompt_field: Optional[str] = None,
+        response_field: Optional[str] = None,
         max_examples: Optional[int] = None,
         config_name: Optional[str] = None,
         revision: Optional[str] = None,
@@ -120,9 +122,15 @@ class HFSource(DatasetSource):
             raise ValueError("HFSource path must not be empty")
         if shuffle_buffer_size < 0:
             raise ValueError("shuffle_buffer_size must be >= 0")
+        if bool(prompt_field) != bool(response_field):
+            raise ValueError("prompt_field and response_field must be configured together")
+        if text_fields and prompt_field:
+            raise ValueError("text_fields cannot be combined with prompt/response fields")
         self._path = path.strip()
         self._split = split
         self._text_fields = list(text_fields) if text_fields else None
+        self._prompt_field = str(prompt_field) if prompt_field else None
+        self._response_field = str(response_field) if response_field else None
         self._max_examples = max_examples
         self._config_name = config_name
         self._revision = revision
@@ -146,10 +154,17 @@ class HFSource(DatasetSource):
                 "max_examples": self._max_examples,
                 "shuffle_buffer_size": self._shuffle_buffer_size,
                 "seed": self._seed,
+                "text_fields": self._text_fields,
+                "prompt_field": self._prompt_field,
+                "response_field": self._response_field,
             },
         )
 
     def _detect_schema(self, row: dict) -> Optional[tuple[str, str]]:
+        if self._prompt_field and self._response_field:
+            if self._prompt_field in row and self._response_field in row:
+                return self._prompt_field, self._response_field
+            return None
         for prompt_field, response_field in self.COLUMN_SCHEMAS:
             if prompt_field in row and response_field in row:
                 return prompt_field, response_field
@@ -169,6 +184,21 @@ class HFSource(DatasetSource):
         return messages
 
     def _row_to_text(self, row: dict) -> Optional[str]:
+        # Explicit prompt/response mapping is authoritative when configured.
+        if self._prompt_field and self._response_field:
+            schema = self._detect_schema(row)
+            if schema is None:
+                return None
+            prompt = row.get(self._prompt_field)
+            response = row.get(self._response_field)
+            if prompt is None or response is None:
+                return None
+            return serialize_messages(
+                [CanonicalMessage("user", str(prompt)), CanonicalMessage("assistant", str(response))]
+            ) or None
+
+        # text_fields is intentionally document-only. It must never be used to
+        # smuggle question/answer columns into an untyped pretraining document.
         if self._text_fields:
             parts = [str(row.get(field, "")) for field in self._text_fields]
             document = "\n\n".join(part for part in parts if part and part.strip())
@@ -191,10 +221,7 @@ class HFSource(DatasetSource):
             response = row.get(response_field)
             if prompt is not None and response is not None:
                 return serialize_messages(
-                    [
-                        CanonicalMessage("user", str(prompt)),
-                        CanonicalMessage("assistant", str(response)),
-                    ]
+                    [CanonicalMessage("user", str(prompt)), CanonicalMessage("assistant", str(response))]
                 ) or None
         return None
 
@@ -274,4 +301,7 @@ class HFSource(DatasetSource):
             "max_examples": self._max_examples,
             "shuffle_buffer_size": self._shuffle_buffer_size,
             "seed": self._seed,
+            "text_fields": self._text_fields,
+            "prompt_field": self._prompt_field,
+            "response_field": self._response_field,
         }
