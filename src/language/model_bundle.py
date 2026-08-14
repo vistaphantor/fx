@@ -8,11 +8,12 @@ from typing import Any
 
 import torch
 
+from src.language.loss_objective import LOSS_OBJECTIVE_VERSION
 from src.language.pytorch_transformer import VistaReasoningGPT
 from src.language.tokenizer import BPETokenizer, TOKENIZER_ALGORITHM_VERSION
 
 
-BUNDLE_VERSION = 2
+BUNDLE_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -23,6 +24,7 @@ class ModelManifest:
     tokenizer_algorithm_version: int
     tokenizer_fingerprint: str
     tokenizer_sha256: str
+    loss_objective_version: int
     vocab_size: int
     parameter_count: int
     corpus_fingerprint: str
@@ -47,9 +49,12 @@ def save_model_bundle(
     training_stage: str,
     corpus_fingerprint: str,
     metrics: dict[str, Any] | None = None,
+    loss_objective_version: int = LOSS_OBJECTIVE_VERSION,
 ) -> Path:
     if tokenizer.algorithm_version != TOKENIZER_ALGORITHM_VERSION:
         raise RuntimeError("refusing_to_save_non_authoritative_tokenizer")
+    if int(loss_objective_version) != LOSS_OBJECTIVE_VERSION:
+        raise RuntimeError("refusing_to_save_non_authoritative_loss_objective")
     if model_config.get("vocab_size") != tokenizer.vocab_size:
         raise RuntimeError("model_tokenizer_vocab_size_mismatch")
 
@@ -65,6 +70,7 @@ def save_model_bundle(
         {
             "model_state_dict": model.state_dict(),
             "config": dict(model_config),
+            "loss_objective_version": LOSS_OBJECTIVE_VERSION,
         },
         model_path,
     )
@@ -76,6 +82,7 @@ def save_model_bundle(
         tokenizer_algorithm_version=tokenizer.algorithm_version,
         tokenizer_fingerprint=tokenizer.fingerprint(),
         tokenizer_sha256=sha256_file(tokenizer_path),
+        loss_objective_version=LOSS_OBJECTIVE_VERSION,
         vocab_size=tokenizer.vocab_size,
         parameter_count=model.get_num_params(),
         corpus_fingerprint=str(corpus_fingerprint),
@@ -112,6 +119,8 @@ def load_model_bundle(
         raise RuntimeError("unsupported_model_architecture")
     if manifest.tokenizer_algorithm_version != TOKENIZER_ALGORITHM_VERSION:
         raise RuntimeError("unsupported_bundle_tokenizer_algorithm_version")
+    if manifest.loss_objective_version != LOSS_OBJECTIVE_VERSION:
+        raise RuntimeError("unsupported_bundle_loss_objective_version")
 
     actual_tokenizer_sha = sha256_file(tokenizer_path)
     if actual_tokenizer_sha != manifest.tokenizer_sha256:
@@ -133,6 +142,8 @@ def load_model_bundle(
         raise RuntimeError("model_config_mismatch")
     if config.get("vocab_size") != tokenizer.vocab_size:
         raise RuntimeError("checkpoint_tokenizer_vocab_size_mismatch")
+    if int(checkpoint.get("loss_objective_version", 0)) != LOSS_OBJECTIVE_VERSION:
+        raise RuntimeError("checkpoint_loss_objective_version_mismatch")
 
     model = VistaReasoningGPT(
         vocab_size=config["vocab_size"],
