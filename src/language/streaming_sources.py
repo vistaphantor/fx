@@ -187,7 +187,7 @@ def sample_training_stream(
         stage=stage,
         seed=seed,
         local_replay=(),
-        repeat=True,
+        repeat=False,
     )
     result: list[str] = []
     seen: set[str] = set()
