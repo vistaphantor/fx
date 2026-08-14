@@ -54,9 +54,9 @@ def split_by_prompt_family(
     keys = list(groups)
     random.Random(seed).shuffle(keys)
     target_val = max(1, int(round(len(texts) * val_fraction)))
-
     train: list[str] = []
     val: list[str] = []
+
     for key in keys:
         group = groups[key]
         if len(val) < target_val:
@@ -78,6 +78,7 @@ def split_by_prompt_family(
 
 
 def _content_windows(token_ids: list[int], seq_len: int) -> list[list[int]]:
+    """Fallback for documents/prompts that cannot be structurally chunked."""
     if len(token_ids) < 2:
         return []
     window = seq_len + 1
@@ -88,12 +89,81 @@ def _content_windows(token_ids: list[int], seq_len: int) -> list[list[int]]:
     chunks: list[list[int]] = []
     start = 0
     while start < len(token_ids) - 1:
-        chunk = token_ids[start:start + window]
+        chunk = token_ids[start : start + window]
         if len(chunk) >= 2:
             chunks.append(chunk)
         if start + window >= len(token_ids):
             break
         start += stride
+    return chunks
+
+
+def _contextual_long_chunks(
+    text: str,
+    tokenizer: BPETokenizer,
+    *,
+    seq_len: int,
+) -> list[list[int]]:
+    """Chunk a long answer while repeating its question/assistant context.
+
+    Intermediate reasoning chunks intentionally do not synthesize closing tags or a
+    fake final answer. Only the final chunk learns the real reasoning close and final
+    response, avoiding the premature-termination signal produced by artificial tails.
+    """
+    max_tokens = seq_len + 1
+    full_ids = tokenizer.encode(text, add_bos=False, add_eos=False)
+    if len(full_ids) <= max_tokens:
+        return [full_ids]
+
+    reasoning = re.match(
+        r"(?s)^(.*?<assistant>\s*<think>\s*)(.*?)(\s*</think>.*)$",
+        text,
+    )
+    if reasoning:
+        prefix_text, body_text, final_tail_text = reasoning.groups()
+    else:
+        assistant = re.match(
+            r"(?s)^(.*?<assistant>\s*)(.*?)(\s*</assistant>\s*<eos>\s*)$",
+            text,
+        )
+        if not assistant:
+            return _content_windows(full_ids, seq_len)
+        prefix_text, body_text, final_tail_text = assistant.groups()
+
+    prefix_ids = tokenizer.encode(prefix_text, add_bos=False, add_eos=False)
+    body_ids = tokenizer.encode(body_text, add_bos=False, add_eos=False)
+    final_tail_ids = tokenizer.encode(final_tail_text, add_bos=False, add_eos=False)
+
+    # If the question/prefix itself consumes the context, arbitrary windowing is
+    # more faithful than silently truncating or manufacturing a shortened prompt.
+    if len(prefix_ids) >= max_tokens - 2:
+        return _content_windows(full_ids, seq_len)
+
+    intermediate_capacity = max_tokens - len(prefix_ids)
+    final_capacity = max_tokens - len(prefix_ids) - len(final_tail_ids)
+    if final_capacity < 1:
+        return _content_windows(full_ids, seq_len)
+
+    chunks: list[list[int]] = []
+    cursor = 0
+    while cursor < len(body_ids):
+        remaining = len(body_ids) - cursor
+        if remaining <= final_capacity:
+            chunk = prefix_ids + body_ids[cursor:] + final_tail_ids
+            chunks.append(chunk)
+            cursor = len(body_ids)
+            break
+
+        take = min(intermediate_capacity, remaining - final_capacity)
+        if take <= 0:
+            return _content_windows(full_ids, seq_len)
+        chunks.append(prefix_ids + body_ids[cursor : cursor + take])
+        cursor += take
+
+    if not chunks:
+        return _content_windows(full_ids, seq_len)
+    if any(len(chunk) < 2 or len(chunk) > max_tokens for chunk in chunks):
+        raise RuntimeError("contextual_long_chunk_length_invalid")
     return chunks
 
 
@@ -103,21 +173,18 @@ def build_example_sequences(
     *,
     seq_len: int,
 ) -> list[list[int]]:
-    """Preserve complete short examples and never cross long-example boundaries."""
+    """Pack complete short examples and context-preserving long-example chunks."""
     if seq_len < 2:
         raise ValueError("seq_len must be >= 2")
-
-    encoded_examples = [
-        tokenizer.encode(text, add_bos=False, add_eos=False)
-        for text in texts
-        if text.strip()
-    ]
 
     sequences: list[list[int]] = []
     pack: list[int] = []
     max_tokens = seq_len + 1
 
-    for ids in encoded_examples:
+    for text in texts:
+        if not text.strip():
+            continue
+        ids = tokenizer.encode(text, add_bos=False, add_eos=False)
         if len(ids) < 2:
             continue
 
@@ -125,7 +192,7 @@ def build_example_sequences(
             if len(pack) >= 2:
                 sequences.append(pack)
                 pack = []
-            sequences.extend(_content_windows(ids, seq_len))
+            sequences.extend(_contextual_long_chunks(text, tokenizer, seq_len=seq_len))
             continue
 
         if not pack:
@@ -170,7 +237,6 @@ class PackedSequenceDataset(Dataset):
 
 
 def prediction_token_count(sequences: list[list[int]]) -> int:
-    """Count non-padding next-token targets contributed by packed sequences."""
     return sum(max(0, len(sequence) - 1) for sequence in sequences)
 
 
@@ -243,7 +309,6 @@ def validate_sequence_contract(
 
 
 def run_tiny_overfit_gate(tokenizer: BPETokenizer, train_sequences: list[list[int]]) -> tuple[float, float]:
-    """Prove next-token learning works before expensive training is allowed."""
     seq_len = min(48, max(8, len(train_sequences[0]) - 1))
     dataset = PackedSequenceDataset(
         train_sequences[: min(4, len(train_sequences))],
