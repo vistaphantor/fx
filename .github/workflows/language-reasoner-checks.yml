@@ -52,6 +52,7 @@ jobs:
             tests/test_language_tokenizer_semantics.py \
             tests/test_language_tokenizer_v4.py \
             tests/test_language_training_pipeline.py \
+            tests/test_language_training_budget.py \
             tests/test_language_long_reasoning.py \
             tests/test_language_curriculum.py \
             tests/test_language_protocol.py \
