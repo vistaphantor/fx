@@ -49,13 +49,23 @@ class QualityFilter:
         if "<bos>" in text or "<eos>" in text:
             if text.count("<bos>") != 1 or text.count("<eos>") != 1:
                 reasons.append("invalid_bos_eos")
-        if "<user>" in text:
+
+        has_user = "<user>" in text or "</user>" in text
+        has_assistant = "<assistant>" in text or "</assistant>" in text
+        if has_user or has_assistant:
+            # Anything encoded as conversation must contain both sides. Plain
+            # documents have neither and remain valid pretraining material.
+            if not has_user:
+                reasons.append("missing_user")
+            if not has_assistant:
+                reasons.append("missing_assistant")
             if text.count("<user>") != text.count("</user>"):
                 reasons.append("unbalanced_user")
             if text.count("<assistant>") != text.count("</assistant>"):
                 reasons.append("unbalanced_assistant")
-            if "<assistant>" not in text:
-                reasons.append("missing_assistant")
+            if text.count("<user>") <= 0 or text.count("<assistant>") <= 0:
+                reasons.append("empty_chat_side")
+
         if text.count("<think>") != text.count("</think>"):
             reasons.append("unbalanced_think")
         return reasons
@@ -110,7 +120,6 @@ class QualityFilter:
                 reasons.append("repeated_lines")
                 penalties += 0.55
 
-        # Count real HTML only after stripping Vista control tokens.
         html_tags = len(re.findall(r"<[a-zA-Z][^>]*>", content))
         html_ratio = html_tags / max(len(words), 1)
         if html_ratio > self.max_html_ratio:
