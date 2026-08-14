@@ -104,12 +104,7 @@ def _canonical_messages(messages: list[tuple[str, str]]) -> str:
 
 
 class HFSource(DatasetSource):
-    """Authoritative Hugging Face streaming adapter.
-
-    Rows are converted directly to the canonical Vista language grammar. The
-    adapter never emits legacy ``Human:``/``Assistant:`` records and never
-    materializes the remote dataset in RAM.
-    """
+    """Canonical, bounded-memory Hugging Face streaming adapter."""
 
     COLUMN_SCHEMAS = (
         ("problem", "solution"),
@@ -129,6 +124,7 @@ class HFSource(DatasetSource):
         text_fields: Optional[list[str]] = None,
         max_examples: Optional[int] = None,
         config_name: Optional[str] = None,
+        revision: Optional[str] = None,
         token: Optional[str] = None,
         shuffle_buffer_size: int = 10_000,
         seed: int = 42,
@@ -142,6 +138,7 @@ class HFSource(DatasetSource):
         self._text_fields = list(text_fields) if text_fields else None
         self._max_examples = max_examples
         self._config_name = config_name
+        self._revision = revision
         self._token = token or os.environ.get("HF_TOKEN")
         self._shuffle_buffer_size = int(shuffle_buffer_size)
         self._seed = int(seed)
@@ -149,7 +146,8 @@ class HFSource(DatasetSource):
     @property
     def source_id(self) -> str:
         config = f"/{self._config_name}" if self._config_name else ""
-        return f"hf:{self._path}{config}/{self._split}"
+        revision = f"@{self._revision}" if self._revision else "@main"
+        return f"hf:{self._path}{config}{revision}/{self._split}"
 
     def scan(self) -> SourceMetadata:
         return SourceMetadata(
@@ -157,6 +155,7 @@ class HFSource(DatasetSource):
             path=self.source_id,
             description=f"{self._path} [{self._split}]",
             extra={
+                "revision": self._revision or "main",
                 "max_examples": self._max_examples,
                 "shuffle_buffer_size": self._shuffle_buffer_size,
                 "seed": self._seed,
@@ -205,7 +204,6 @@ class HFSource(DatasetSource):
             response = _clean_content(row.get(response_field))
             if prompt and response:
                 return _canonical_messages([("user", prompt), ("assistant", response)])
-
         return None
 
     def stream(self) -> Iterator[str]:
@@ -216,21 +214,17 @@ class HFSource(DatasetSource):
                 "Hugging Face streaming requires the 'datasets' package declared in requirements.txt"
             ) from exc
 
-        kwargs: dict = {
-            "split": self._split,
-            "streaming": True,
-        }
+        kwargs: dict = {"split": self._split, "streaming": True}
         if self._config_name:
             kwargs["name"] = self._config_name
+        if self._revision:
+            kwargs["revision"] = self._revision
         if self._token:
             kwargs["token"] = self._token
 
         dataset = load_dataset(self._path, **kwargs)
         if self._shuffle_buffer_size > 0:
-            dataset = dataset.shuffle(
-                seed=self._seed,
-                buffer_size=self._shuffle_buffer_size,
-            )
+            dataset = dataset.shuffle(seed=self._seed, buffer_size=self._shuffle_buffer_size)
 
         emitted = 0
         for row in dataset:
@@ -249,6 +243,7 @@ class HFSource(DatasetSource):
             "path": self._path,
             "split": self._split,
             "config_name": self._config_name,
+            "revision": self._revision or "main",
             "max_examples": self._max_examples,
             "shuffle_buffer_size": self._shuffle_buffer_size,
             "seed": self._seed,
