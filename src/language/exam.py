@@ -1,9 +1,4 @@
-"""Deterministic held-out diagnostics for Vista language-model training.
-
-The exam is never used for gradient updates. It exists to answer a practical
-question after every expensive epoch: is the model becoming more coherent and
-more correct, or are we burning CPU on gibberish?
-"""
+"""Deterministic held-out diagnostics for Vista language-model training."""
 from __future__ import annotations
 
 import json
@@ -17,7 +12,7 @@ import torch
 from src.language.pytorch_transformer import VistaReasoningGPT
 from src.language.tokenizer import BPETokenizer, ENDASSISTANT, EOS
 
-EXAM_VERSION = 1
+EXAM_VERSION = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +21,7 @@ class ExamQuestion:
     category: str
     prompt: str
     expected_any: tuple[str, ...] = ()
+    expected_all: tuple[str, ...] = ()
     expected_regex: str | None = None
 
 
@@ -65,61 +61,46 @@ FOUNDATION_EXAM: tuple[ExamQuestion, ...] = (
     ExamQuestion("math_15_times_14", "arithmetic", "What is 15 multiplied by 14?", expected_regex=r"(?<!\d)210(?!\d)"),
     ExamQuestion("algebra_linear", "arithmetic", "If 2x + 5 = 11, what is x?", expected_regex=r"(?<!\d)3(?:\.0+)?(?!\d)"),
     ExamQuestion(
-        "language_bullish",
-        "market_language",
-        "In trading, what does bullish mean?",
+        "language_bullish", "market_language", "In trading, what does bullish mean?",
         expected_any=("rise", "rising", "higher", "increase", "buyers", "buying", "upward"),
     ),
     ExamQuestion(
-        "language_risk",
-        "risk_language",
-        "What does risk mean in trading?",
+        "language_risk", "risk_language", "What does risk mean in trading?",
         expected_any=("loss", "uncertainty", "exposure", "lose", "downside"),
     ),
     ExamQuestion(
-        "logic_youngest",
-        "logic",
+        "logic_youngest", "logic",
         "Alice is older than Bob, and Bob is older than Charlie. Who is youngest?",
         expected_any=("charlie",),
     ),
     ExamQuestion(
-        "trading_spread",
-        "trading",
-        "What is the bid-ask spread?",
-        expected_any=("difference", "bid", "ask"),
+        "trading_spread", "trading", "What is the bid-ask spread?",
+        expected_all=("bid", "ask"), expected_any=("difference", "gap"),
     ),
     ExamQuestion(
-        "trading_atr",
-        "trading",
-        "What does ATR measure in market analysis?",
-        expected_any=("volatility", "range", "true range"),
+        "trading_atr", "trading", "What does ATR measure in market analysis?",
+        expected_any=("volatility", "true range", "range"),
     ),
 )
 
 TRADING_EXTENSION: tuple[ExamQuestion, ...] = (
     ExamQuestion(
-        "trading_stop_loss",
-        "risk",
-        "Why does a trader use a stop-loss?",
-        expected_any=("loss", "risk", "limit", "protect"),
+        "trading_stop_loss", "risk", "Why does a trader use a stop-loss?",
+        expected_any=("limit loss", "limit losses", "risk", "protect", "loss"),
     ),
     ExamQuestion(
-        "trading_long_profit",
-        "arithmetic",
+        "trading_long_profit", "arithmetic",
         "A long position enters at 100 and exits at 105 before fees. What is the price gain per unit?",
         expected_regex=r"(?<!\d)5(?:\.0+)?(?!\d)",
     ),
     ExamQuestion(
-        "trading_direction",
-        "reasoning",
+        "trading_direction", "reasoning",
         "If buyers repeatedly lift the ask and price makes higher highs, which side has directional control?",
         expected_any=("buyer", "buyers", "bull", "bullish", "buying"),
     ),
     ExamQuestion(
-        "trading_invalidation",
-        "reasoning",
-        "What is an invalidation level in a trading thesis?",
-        expected_any=("wrong", "invalid", "thesis", "level", "exit"),
+        "trading_invalidation", "reasoning", "What is an invalidation level in a trading thesis?",
+        expected_all=("thesis",), expected_any=("wrong", "invalid", "fails", "failure", "exit"),
     ),
 )
 
@@ -131,26 +112,15 @@ WORD_RE = re.compile(r"[A-Za-z0-9]+(?:[._'-][A-Za-z0-9]+)*")
 
 
 def exam_questions(training_stage: str) -> tuple[ExamQuestion, ...]:
-    stage = training_stage.strip().casefold()
-    if stage == "trading_reasoning":
-        return FOUNDATION_EXAM + TRADING_EXTENSION
-    return FOUNDATION_EXAM
+    return FOUNDATION_EXAM + TRADING_EXTENSION if training_stage.strip().casefold() == "trading_reasoning" else FOUNDATION_EXAM
 
 
 def build_exam_prompt(question: str) -> str:
-    return (
-        "<bos>\n"
-        "<user>\n"
-        f"{question.strip()}\n"
-        "</user>\n"
-        "<assistant>\n"
-    )
+    return "<bos>\n<user>\n" + question.strip() + "\n</user>\n<assistant>\n"
 
 
 def _normalize_output(text: str) -> str:
-    value = CONTROL_TOKEN_RE.sub(" ", text)
-    value = re.sub(r"\s+", " ", value)
-    return value.strip()
+    return re.sub(r"\s+", " ", CONTROL_TOKEN_RE.sub(" ", text)).strip()
 
 
 def _repetition_ratio(text: str) -> float:
@@ -168,7 +138,6 @@ def _quality(text: str) -> tuple[float, float, tuple[str, ...]]:
     words = WORD_RE.findall(normalized)
     flags: list[str] = []
     repetition = _repetition_ratio(normalized)
-
     if not normalized:
         flags.append("empty")
     if "<unk>" in text:
@@ -179,48 +148,44 @@ def _quality(text: str) -> tuple[float, float, tuple[str, ...]]:
         flags.append("no_lexical_content")
     if normalized and sum(ch.isalnum() for ch in normalized) / max(len(normalized), 1) < 0.35:
         flags.append("low_alphanumeric_density")
-    if text.count("<think>") > 2 or text.count("</think>") > 2:
+    if text.count("<think>") > 1 or text.count("</think>") > 1:
         flags.append("control_token_loop")
-
+    if "<user>" in text or "</user>" in text or "<bos>" in text:
+        flags.append("protocol_leak")
     score = 1.0
     penalties = {
-        "empty": 1.0,
-        "unk_token": 0.30,
-        "high_repetition": 0.50,
-        "no_lexical_content": 0.70,
-        "low_alphanumeric_density": 0.35,
-        "control_token_loop": 0.50,
+        "empty": 1.0, "unk_token": 0.30, "high_repetition": 0.50,
+        "no_lexical_content": 0.70, "low_alphanumeric_density": 0.35,
+        "control_token_loop": 0.50, "protocol_leak": 0.50,
     }
     for flag in flags:
         score -= penalties[flag]
     return max(0.0, min(1.0, score)), repetition, tuple(flags)
 
 
-def _contains_keyword(value: str, keyword: str) -> bool:
-    escaped = re.escape(keyword.casefold())
+def _contains(value: str, keyword: str) -> bool:
+    keyword = keyword.casefold()
     if " " in keyword:
-        return keyword.casefold() in value
-    return bool(re.search(rf"(?<![a-z0-9]){escaped}(?![a-z0-9])", value))
+        return keyword in value
+    return bool(re.search(rf"(?<![a-z0-9]){re.escape(keyword)}(?![a-z0-9])", value))
 
 
 def _is_correct(question: ExamQuestion, normalized: str) -> bool:
     value = normalized.casefold()
-    regex_ok = bool(
-        question.expected_regex
-        and re.search(question.expected_regex, normalized, flags=re.IGNORECASE)
-    )
-    keyword_ok = bool(
-        question.expected_any
-        and any(_contains_keyword(value, keyword) for keyword in question.expected_any)
-    )
-    return regex_ok or keyword_ok
+    if question.expected_regex and not re.search(question.expected_regex, normalized, flags=re.IGNORECASE):
+        return False
+    if question.expected_all and not all(_contains(value, word) for word in question.expected_all):
+        return False
+    if question.expected_any and not any(_contains(value, word) for word in question.expected_any):
+        return False
+    return bool(question.expected_regex or question.expected_all or question.expected_any)
 
 
-def _training_signal(correctness: float, quality: float, gibberish_answers: int, total: int) -> str:
-    gibberish_ratio = gibberish_answers / max(total, 1)
-    if correctness == 0.0 and gibberish_ratio >= 0.75:
+def _training_signal(correctness: float, quality: float, gibberish: int, total: int) -> str:
+    ratio = gibberish / max(total, 1)
+    if correctness == 0.0 and ratio >= 0.75:
         return "GIBBERISH"
-    if correctness < 25.0:
+    if correctness < 25.0 or quality < 50.0:
         return "EARLY_SIGNAL"
     if correctness < 60.0:
         return "LEARNING"
@@ -228,41 +193,24 @@ def _training_signal(correctness: float, quality: float, gibberish_answers: int,
 
 
 def run_epoch_exam(
-    *,
-    model: VistaReasoningGPT,
-    tokenizer: BPETokenizer,
-    epoch: int,
-    training_stage: str,
-    train_loss: float | None,
-    validation_loss: float | None,
+    *, model: VistaReasoningGPT, tokenizer: BPETokenizer, epoch: int,
+    training_stage: str, train_loss: float | None, validation_loss: float | None,
     max_new_tokens: int = 64,
 ) -> EpochExamResult:
-    if epoch < 0:
-        raise ValueError("epoch must be >= 0")
-    if max_new_tokens <= 0:
-        raise ValueError("max_new_tokens must be positive")
-
+    if epoch < 0 or max_new_tokens <= 0:
+        raise ValueError("invalid exam epoch/token budget")
     questions = exam_questions(training_stage)
     stop_ids = {tokenizer.vocab[ENDASSISTANT], tokenizer.vocab[EOS]}
     answers: list[ExamAnswer] = []
-
     model.eval()
     for question in questions:
-        prompt = build_exam_prompt(question.prompt)
-        prompt_ids = tokenizer.encode(prompt, add_bos=False, add_eos=False)
+        prompt_ids = tokenizer.encode(build_exam_prompt(question.prompt), add_bos=False, add_eos=False)
         if len(prompt_ids) >= model.max_seq_len:
-            raise RuntimeError(
-                f"exam_prompt_exceeds_model_context:{question.question_id}:"
-                f"{len(prompt_ids)}>={model.max_seq_len}"
-            )
+            raise RuntimeError(f"exam_prompt_exceeds_model_context:{question.question_id}")
         ids = torch.tensor([prompt_ids], dtype=torch.long)
         generated = model.generate(
-            ids,
-            max_new_tokens=min(max_new_tokens, model.max_seq_len),
-            temperature=1.0,
-            top_k=1,
-            top_p=1.0,
-            stop_ids=stop_ids,
+            ids, max_new_tokens=min(max_new_tokens, model.max_seq_len - len(prompt_ids)),
+            temperature=1.0, top_k=1, top_p=1.0, stop_ids=stop_ids,
         )
         continuation = generated[0, len(prompt_ids):].tolist()
         raw = tokenizer.decode(continuation, skip_special=False)
@@ -270,53 +218,31 @@ def run_epoch_exam(
         quality, repetition, flags = _quality(raw)
         answers.append(
             ExamAnswer(
-                question_id=question.question_id,
-                category=question.category,
-                prompt=question.prompt,
-                raw_output=raw,
-                normalized_output=normalized,
-                generated_tokens=len(continuation),
-                correct=_is_correct(question, normalized),
-                quality_score=quality,
-                repetition_ratio=repetition,
-                gibberish_flags=flags,
+                question.question_id, question.category, question.prompt, raw, normalized,
+                len(continuation), _is_correct(question, normalized), quality, repetition, flags,
             )
         )
-
-    correct = sum(1 for answer in answers if answer.correct)
-    gibberish = sum(1 for answer in answers if answer.gibberish_flags)
+    correct = sum(answer.correct for answer in answers)
+    gibberish = sum(bool(answer.gibberish_flags) for answer in answers)
     mean_quality = sum(answer.quality_score for answer in answers) / len(answers)
-    mean_tokens = sum(answer.generated_tokens for answer in answers) / len(answers)
     correctness = 100.0 * correct / len(answers)
     quality_percent = 100.0 * mean_quality
     return EpochExamResult(
-        exam_version=EXAM_VERSION,
-        epoch=epoch,
-        training_stage=training_stage,
-        train_loss=train_loss,
-        validation_loss=validation_loss,
-        total_questions=len(answers),
-        correct_questions=correct,
-        correctness_percent=correctness,
-        mean_quality_percent=quality_percent,
-        gibberish_answers=gibberish,
-        mean_generated_tokens=mean_tokens,
-        training_signal=_training_signal(correctness, quality_percent, gibberish, len(answers)),
-        answers=tuple(answers),
+        EXAM_VERSION, epoch, training_stage, train_loss, validation_loss, len(answers), correct,
+        correctness, quality_percent, gibberish,
+        sum(answer.generated_tokens for answer in answers) / len(answers),
+        _training_signal(correctness, quality_percent, gibberish, len(answers)), tuple(answers),
     )
 
 
 def _fmt_loss(value: float | None) -> str:
-    if value is None or not math.isfinite(value):
-        return "n/a"
-    return f"{value:.4f}"
+    return "n/a" if value is None or not math.isfinite(value) else f"{value:.4f}"
 
 
 def render_exam_text(result: EpochExamResult, previous: EpochExamResult | None = None) -> str:
     delta = None if previous is None else result.correctness_percent - previous.correctness_percent
     lines = [
-        "VISTA LANGUAGE REASONER - EPOCH EXAM",
-        "=" * 80,
+        "VISTA LANGUAGE REASONER - EPOCH EXAM", "=" * 80,
         f"Exam version     : {result.exam_version}",
         f"Epoch            : {result.epoch}",
         f"Training stage   : {result.training_stage}",
@@ -327,36 +253,22 @@ def render_exam_text(result: EpochExamResult, previous: EpochExamResult | None =
         f"Quality          : {result.mean_quality_percent:.1f}%",
         f"Gibberish flags  : {result.gibberish_answers}/{result.total_questions} answers",
         f"Mean new tokens  : {result.mean_generated_tokens:.1f}",
-        f"Score delta      : {'n/a' if delta is None else f'{delta:+.1f} points'}",
-        "",
+        f"Score delta      : {'n/a' if delta is None else f'{delta:+.1f} points'}", "",
     ]
     for index, answer in enumerate(result.answers, start=1):
-        lines.extend(
-            [
-                f"QUESTION {index:02d} | {answer.question_id} | {answer.category}",
-                "-" * 80,
-                f"Prompt       : {answer.prompt}",
-                f"Correct      : {'YES' if answer.correct else 'NO'}",
-                f"Quality      : {answer.quality_score * 100:.1f}%",
-                f"Repetition   : {answer.repetition_ratio:.3f}",
-                f"Flags        : {', '.join(answer.gibberish_flags) if answer.gibberish_flags else 'none'}",
-                f"Tokens       : {answer.generated_tokens}",
-                "Raw output:",
-                answer.raw_output if answer.raw_output else "<EMPTY>",
-                "",
-                "Normalized output:",
-                answer.normalized_output if answer.normalized_output else "<EMPTY>",
-                "",
-            ]
-        )
+        lines.extend([
+            f"QUESTION {index:02d} | {answer.question_id} | {answer.category}", "-" * 80,
+            f"Prompt       : {answer.prompt}", f"Correct      : {'YES' if answer.correct else 'NO'}",
+            f"Quality      : {answer.quality_score * 100:.1f}%", f"Repetition   : {answer.repetition_ratio:.3f}",
+            f"Flags        : {', '.join(answer.gibberish_flags) if answer.gibberish_flags else 'none'}",
+            f"Tokens       : {answer.generated_tokens}", "Raw output:", answer.raw_output or "<EMPTY>", "",
+            "Normalized output:", answer.normalized_output or "<EMPTY>", "",
+        ])
     return "\n".join(lines).rstrip() + "\n"
 
 
 def save_epoch_exam(
-    *,
-    result: EpochExamResult,
-    exams_dir: Path,
-    previous: EpochExamResult | None = None,
+    *, result: EpochExamResult, exams_dir: Path, previous: EpochExamResult | None = None,
 ) -> tuple[Path, Path]:
     exams_dir.mkdir(parents=True, exist_ok=True)
     stem = f"epoch_{result.epoch:03d}_exam"
