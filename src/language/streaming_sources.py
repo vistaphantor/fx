@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Sequence
 
+from corpus.dedup import NearDuplicateIndex
 from corpus.source import DatasetSource, HFSource, SourceMetadata
 from corpus.streamer import WeightedSourceStream
 from src.language.canonical_contract import canonical_hash, canonicalize_serialized, prompt_family
@@ -85,7 +86,7 @@ def stream_quality_accepts(text: str) -> bool:
 
 
 class GuardedSource(DatasetSource):
-    """Canonicalize, quality-filter, deduplicate and enforce holdouts.
+    """Canonicalize, quality-filter, near-deduplicate and enforce holdouts.
 
     `enforce_stage` is deliberately configurable. Raw HF sources are filtered
     per example for the active curriculum stage. Local replay has *already*
@@ -102,12 +103,16 @@ class GuardedSource(DatasetSource):
         excluded_hashes: frozenset[str] = frozenset(),
         excluded_families: frozenset[str] = frozenset(),
         enforce_stage: bool = True,
+        near_dedup_entries: int = 50_000,
+        near_dedup_hamming: int = 4,
     ):
         self._source = source
         self._stage = stage.strip().casefold()
         self._excluded_hashes = excluded_hashes
         self._excluded_families = excluded_families
         self._enforce_stage = bool(enforce_stage)
+        self._near_dedup_entries = int(near_dedup_entries)
+        self._near_dedup_hamming = int(near_dedup_hamming)
 
     @property
     def source_id(self) -> str:
@@ -122,6 +127,8 @@ class GuardedSource(DatasetSource):
             **self._source.metadata(),
             "guarded_stage": self._stage,
             "enforce_stage": self._enforce_stage,
+            "near_dedup_entries": self._near_dedup_entries,
+            "near_dedup_hamming": self._near_dedup_hamming,
         }
 
     def _stage_accepts(self, text: str) -> bool:
@@ -137,6 +144,10 @@ class GuardedSource(DatasetSource):
 
     def stream(self) -> Iterator[str]:
         seen: set[str] = set()
+        near = NearDuplicateIndex(
+            max_entries=self._near_dedup_entries,
+            max_hamming_distance=self._near_dedup_hamming,
+        )
         for raw in self._source.stream():
             text = canonicalize_serialized(raw)
             if not text or not stream_quality_accepts(text):
@@ -148,6 +159,8 @@ class GuardedSource(DatasetSource):
             if family and family in self._excluded_families:
                 continue
             if not self._stage_accepts(text):
+                continue
+            if not near.accept(text):
                 continue
             seen.add(digest)
             yield text
