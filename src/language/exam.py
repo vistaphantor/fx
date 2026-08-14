@@ -11,7 +11,7 @@ from src.language.protocol import build_exam_prompt
 from src.language.pytorch_transformer import VistaReasoningGPT
 from src.language.tokenizer import BPETokenizer, ENDASSISTANT, EOS
 
-EXAM_VERSION = 4
+EXAM_VERSION = 5
 
 
 @dataclass(frozen=True)
@@ -122,6 +122,14 @@ TRADING_EXTENSION: tuple[ExamQuestion, ...] = (
 )
 
 
+_NUMERIC_ANSWERS = {
+    "arithmetic_2_plus_2": "4",
+    "arithmetic_15_times_14": "210",
+    "algebra_simple": "3",
+    "trading_gain_per_unit": "5",
+}
+
+
 def exam_questions(training_stage: str) -> tuple[ExamQuestion, ...]:
     if training_stage.strip().casefold() == "trading_reasoning":
         return FOUNDATION_EXAM + TRADING_EXTENSION
@@ -143,9 +151,31 @@ def _normalize_output(value: str) -> str:
     return text
 
 
-def _is_correct(question: ExamQuestion, normalized: str) -> bool:
-    if not normalized:
+def _numeric_answer_matches(question_id: str, normalized: str) -> bool:
+    expected = _NUMERIC_ANSWERS[question_id]
+    numbers = re.findall(r"(?<![\w.])-?\d+(?:\.\d+)?(?![\w.])", normalized)
+    if question_id == "algebra_simple":
+        if re.search(rf"\bx\s*=\s*{re.escape(expected)}\b", normalized):
+            return True
+    if normalized.strip(" .!,:;") == expected:
+        return True
+    if re.search(rf"\b(?:answer|result|value)\s+(?:is|=)\s*{re.escape(expected)}\b", normalized):
+        return True
+    # A numeric answer embedded among many unrelated numbers is not evidence of
+    # correctness. This closes the epoch-3 false positive where a repeated '3'
+    # attractor happened to contain the expected value.
+    return len(numbers) <= 2 and numbers and numbers[-1] == expected
+
+
+def _is_correct(
+    question: ExamQuestion,
+    normalized: str,
+    gibberish_flags: tuple[str, ...] = (),
+) -> bool:
+    if not normalized or gibberish_flags:
         return False
+    if question.question_id in _NUMERIC_ANSWERS:
+        return _numeric_answer_matches(question.question_id, normalized)
 
     def present(term: str) -> bool:
         term_norm = term.casefold().strip()
@@ -189,14 +219,20 @@ def _periodic_repetition_ratio(text: str) -> float:
 
 def _quality(value: str) -> tuple[float, float, tuple[str, ...]]:
     raw = str(value or "")
+    replacement_count = raw.count("\ufffd")
     normalized = _normalize_output(raw)
     flags: list[str] = []
+    if replacement_count:
+        flags.append("invalid_utf8_bytes")
     if not normalized:
-        return 0.0, 1.0, ("empty",)
+        if "empty" not in flags:
+            flags.append("empty")
+        return 0.0, 1.0, tuple(flags)
 
     words = re.findall(r"[A-Za-z0-9]+(?:['-][A-Za-z0-9]+)?", normalized)
     if not words:
-        return 0.0, 1.0, ("no_lexical_content",)
+        flags.append("no_lexical_content")
+        return 0.0, 1.0, tuple(dict.fromkeys(flags))
 
     word_repetition = 1.0 - (len(set(words)) / max(1, len(words)))
     char_repetition = _character_repetition_ratio(normalized)
@@ -209,10 +245,8 @@ def _quality(value: str) -> tuple[float, float, tuple[str, ...]]:
         flags.append("high_character_repetition")
     if len(normalized) >= 24 and periodic_repetition > 0.72:
         flags.append("periodic_repetition")
-
-    replacement_count = raw.count("\ufffd")
-    if replacement_count:
-        flags.append("invalid_utf8_bytes")
+    if re.search(r"(\d)\1{7,}", normalized):
+        flags.append("digit_run_repetition")
 
     unusual = sum(
         1
@@ -227,8 +261,6 @@ def _quality(value: str) -> tuple[float, float, tuple[str, ...]]:
     if len(words) >= 8 and single_char_words / len(words) > 0.45:
         flags.append("fragmented_words")
 
-    # Extremely long lexical runs with almost no separators are a strong sign
-    # of subword-loop collapse even when the repeated fragments are not words.
     longest_run = max((len(part) for part in re.findall(r"[A-Za-z]+", normalized)), default=0)
     if longest_run >= 40:
         flags.append("run_on_fragment")
@@ -237,11 +269,11 @@ def _quality(value: str) -> tuple[float, float, tuple[str, ...]]:
     quality -= min(0.65, repetition * 0.72)
     quality -= min(0.35, unusual_ratio)
     quality -= min(0.25, replacement_count / max(1, len(raw)))
-    if "run_on_fragment" in flags:
+    if "run_on_fragment" in flags or "digit_run_repetition" in flags:
         quality -= 0.25
     if flags:
         quality -= min(0.45, 0.10 * len(flags))
-    return max(0.0, min(1.0, quality)), repetition, tuple(flags)
+    return max(0.0, min(1.0, quality)), repetition, tuple(dict.fromkeys(flags))
 
 
 def _training_signal(
@@ -311,7 +343,7 @@ def run_epoch_exam(
                 raw_output=raw,
                 normalized_output=normalized,
                 generated_tokens=len(continuation),
-                correct=_is_correct(question, normalized),
+                correct=_is_correct(question, normalized, flags),
                 quality_score=quality,
                 repetition_ratio=repetition,
                 gibberish_flags=flags,
