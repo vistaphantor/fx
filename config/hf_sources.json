@@ -27,15 +27,14 @@
       "shuffle_buffer_size": 10000
     },
     {
-      "path": "HuggingFaceTB/smoltalk",
-      "revision": "5119369fbcd73ecd6b1595ebe34f3002bf10c83b",
-      "config_name": "everyday-conversations",
-      "split": "train",
+      "path": "HuggingFaceTB/everyday-conversations-llama3.1-2k",
+      "revision": "14f543216b9ba42b6b951dc5bd199460d193b162",
+      "split": "train_sft",
       "weight": 0.02,
       "stages": [
         "foundation"
       ],
-      "shuffle_buffer_size": 10000
+      "shuffle_buffer_size": 2260
     },
     {
       "path": "openai/gsm8k",
