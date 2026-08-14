@@ -106,7 +106,6 @@ def _parse_hh_conversation(value: str) -> list[TrainingMessage]:
     value = str(value or "").strip()
     if not value:
         return []
-    # Some downloaded JSON escaped newlines into literal backslash-n pairs.
     if "\\n\\nHuman:" in value and "\n\nHuman:" not in value:
         value = value.replace("\\n", "\n")
     markers = list(re.finditer(r"(?:^|\n\n)(Human|Assistant):\s*", value, flags=re.IGNORECASE))
@@ -183,6 +182,14 @@ def _parse_serialized_chat_turns(value: str) -> list[TrainingMessage]:
     return messages
 
 
+def _first_present(obj: dict, keys: tuple[str, ...]):
+    for key in keys:
+        value = obj.get(key)
+        if value is not None and value != "":
+            return value
+    return None
+
+
 def _example_from_embedded_object(obj, *, source: str) -> TrainingExample | None:
     if not isinstance(obj, dict):
         return None
@@ -203,7 +210,7 @@ def _example_from_embedded_object(obj, *, source: str) -> TrainingExample | None
 
     instruction = obj.get("instruction")
     input_text = obj.get("input")
-    output = obj.get("output") or obj.get("response") or obj.get("answer")
+    output = _first_present(obj, ("output", "response", "answer", "solution"))
     if instruction:
         user = _clean_instruction(str(instruction))
         extra = _clean_text(input_text)
@@ -211,11 +218,17 @@ def _example_from_embedded_object(obj, *, source: str) -> TrainingExample | None
             user = f"{user}\n\n{extra}"
         _append_message(messages, "user", user)
         _append_message(messages, "assistant", output)
-    elif obj.get("prompt") and output:
-        user_text, embedded_assistant = _split_legacy_prompt(obj.get("prompt", ""))
-        _append_message(messages, "user", user_text)
-        authoritative_answer = _clean_text(output)
-        _append_message(messages, "assistant", authoritative_answer or embedded_assistant)
+    elif output is not None:
+        prompt_value = _first_present(obj, ("prompt", "question", "problem", "query"))
+        # `input` is a prompt only for records that do not also have an
+        # instruction field. This keeps Alpaca-style instruction+input intact.
+        if prompt_value is None and input_text is not None:
+            prompt_value = input_text
+        if prompt_value is not None:
+            user_text, embedded_assistant = _split_legacy_prompt(prompt_value)
+            _append_message(messages, "user", user_text)
+            authoritative_answer = _clean_text(output)
+            _append_message(messages, "assistant", authoritative_answer or embedded_assistant)
 
     teacher_response = _clean_text(obj.get("teacher_response"))
     if teacher_response:
@@ -237,8 +250,8 @@ def _parse_source_example(ex: dict, *, source: str) -> TrainingExample | None:
         if embedded is not None:
             parsed = _example_from_embedded_object(embedded, source=source)
             if parsed is not None:
-                outer_response = ex.get("response") or ex.get("output") or ex.get("answer")
-                if outer_response:
+                outer_response = _first_present(ex, ("response", "output", "answer", "solution"))
+                if outer_response is not None:
                     messages = list(parsed.messages)
                     _append_message(messages, "assistant", outer_response)
                     return TrainingExample(_deduplicate_messages(messages), source=source)
@@ -246,8 +259,8 @@ def _parse_source_example(ex: dict, *, source: str) -> TrainingExample | None:
 
         serialized_chat = _parse_serialized_chat_turns(prompt)
         if serialized_chat:
-            outer_response = ex.get("response") or ex.get("output") or ex.get("answer")
-            if outer_response:
+            outer_response = _first_present(ex, ("response", "output", "answer", "solution"))
+            if outer_response is not None:
                 _append_message(serialized_chat, "assistant", outer_response)
             return TrainingExample(_deduplicate_messages(serialized_chat), source=source)
 
@@ -303,12 +316,8 @@ def _load_jsonl_file(path: Path) -> Iterator[str]:
             try:
                 record = json.loads(line)
             except json.JSONDecodeError:
-                # Bad individual rows should not discard the rest of a large file.
                 continue
-            serialized = _serialize_record(
-                record,
-                source=f"{path}:{line_number}",
-            )
+            serialized = _serialize_record(record, source=f"{path}:{line_number}")
             if serialized:
                 yield serialized
 
@@ -424,13 +433,7 @@ def build_tokenizer_training_sample(
     max_chars: int = 8_000_000,
     seed: int = 42,
 ) -> str:
-    """Build a tokenizer sample from complete canonical examples only.
-
-    Structural tokens are atomic model grammar. Random character slicing can
-    cut `<assistant>` or `<think>` in half and teach BPE useless fragments.
-    The character budget is therefore a soft ceiling: examples are shuffled
-    deterministically and accepted whole until the budget is reached.
-    """
+    """Build a tokenizer sample from complete canonical examples only."""
     if not texts or max_chars <= 0:
         return ""
     canonical = [canonicalize_serialized(text) for text in texts if text and text.strip()]
@@ -447,7 +450,5 @@ def build_tokenizer_training_sample(
         if used >= max_chars:
             break
     if not pieces:
-        # A single unusually large record is still safer whole than sliced
-        # through control-token boundaries.
         pieces.append(canonical[0])
     return "\n<sep>\n".join(pieces)
