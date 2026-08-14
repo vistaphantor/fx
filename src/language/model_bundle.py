@@ -13,7 +13,7 @@ from src.language.pytorch_transformer import VistaReasoningGPT
 from src.language.tokenizer import BPETokenizer, TOKENIZER_ALGORITHM_VERSION
 
 
-BUNDLE_VERSION = 3
+BUNDLE_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -27,6 +27,8 @@ class ModelManifest:
     loss_objective_version: int
     vocab_size: int
     parameter_count: int
+    active_parameter_count: int
+    activation_ratio: float
     corpus_fingerprint: str
     model_config: dict[str, Any]
     metrics: dict[str, Any]
@@ -60,7 +62,6 @@ def save_model_bundle(
 
     bundle = Path(bundle_dir)
     bundle.mkdir(parents=True, exist_ok=True)
-
     model_path = bundle / "model.pt"
     tokenizer_path = bundle / "tokenizer.json"
     manifest_path = bundle / "manifest.json"
@@ -75,6 +76,8 @@ def save_model_bundle(
         model_path,
     )
 
+    total = model.get_num_params()
+    active = model.get_active_params_per_token()
     manifest = ModelManifest(
         bundle_version=BUNDLE_VERSION,
         architecture="VistaReasoningGPT",
@@ -84,7 +87,9 @@ def save_model_bundle(
         tokenizer_sha256=sha256_file(tokenizer_path),
         loss_objective_version=LOSS_OBJECTIVE_VERSION,
         vocab_size=tokenizer.vocab_size,
-        parameter_count=model.get_num_params(),
+        parameter_count=total,
+        active_parameter_count=active,
+        activation_ratio=active / max(total, 1),
         corpus_fingerprint=str(corpus_fingerprint),
         model_config=dict(model_config),
         metrics=dict(metrics or {}),
@@ -122,10 +127,8 @@ def load_model_bundle(
     if manifest.loss_objective_version != LOSS_OBJECTIVE_VERSION:
         raise RuntimeError("unsupported_bundle_loss_objective_version")
 
-    actual_tokenizer_sha = sha256_file(tokenizer_path)
-    if actual_tokenizer_sha != manifest.tokenizer_sha256:
+    if sha256_file(tokenizer_path) != manifest.tokenizer_sha256:
         raise RuntimeError("tokenizer_sha256_mismatch")
-
     tokenizer = BPETokenizer.load(tokenizer_path)
     if tokenizer.algorithm_version != manifest.tokenizer_algorithm_version:
         raise RuntimeError("tokenizer_algorithm_version_mismatch")
@@ -145,19 +148,12 @@ def load_model_bundle(
     if int(checkpoint.get("loss_objective_version", 0)) != LOSS_OBJECTIVE_VERSION:
         raise RuntimeError("checkpoint_loss_objective_version_mismatch")
 
-    model = VistaReasoningGPT(
-        vocab_size=config["vocab_size"],
-        d_model=config["d_model"],
-        n_layers=config["n_layers"],
-        n_heads=config["n_heads"],
-        ffn_dim=config["ffn_dim"],
-        max_seq_len=config["max_seq_len"],
-        dropout=config.get("dropout", 0.0),
-    ).to(device)
+    model = VistaReasoningGPT(**config).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
     if model.get_num_params() != manifest.parameter_count:
         raise RuntimeError("parameter_count_mismatch")
-
+    if model.get_active_params_per_token() != manifest.active_parameter_count:
+        raise RuntimeError("active_parameter_count_mismatch")
     return model, tokenizer, manifest
