@@ -12,6 +12,7 @@ from src.language.canonical_contract import prompt_family
 from src.language.streaming_sources import (
     CanonicalMemorySource,
     GuardedSource,
+    build_training_stream,
     load_hf_source_config,
     stream_quality_accepts,
 )
@@ -96,6 +97,45 @@ def test_guarded_source_drops_bad_rows_before_training():
     bad = "<bos>\n<user>\nMissing assistant.\n</user>\n<eos>"
     guarded = GuardedSource(CanonicalMemorySource([bad, good]), stage="foundation")
     assert list(guarded.stream()) == [good]
+
+
+def test_specialist_local_replay_preserves_general_language_examples(monkeypatch):
+    general = (
+        "<bos>\n<user>\nExplain photosynthesis.\n</user>\n"
+        "<assistant>\nPlants convert light into chemical energy.\n</assistant>\n<eos>"
+    )
+    trading = (
+        "<bos>\n<user>\nWhat does ATR measure?\n</user>\n"
+        "<assistant>\nATR measures market volatility and range.\n</assistant>\n<eos>"
+    )
+    # No HF row is required to prove replay behavior; use a tiny fake source
+    # configuration whose iterator is empty, while local replay must remain.
+    dataset = _FakeIterableDataset([])
+    monkeypatch.setitem(
+        sys.modules,
+        "datasets",
+        SimpleNamespace(load_dataset=lambda *a, **k: dataset),
+    )
+    from src.language.streaming_sources import HFSourceSpec
+
+    spec = HFSourceSpec(
+        path="example/empty",
+        revision="abc123",
+        weight=1.0,
+        stages=("trading_reasoning",),
+        shuffle_buffer_size=0,
+    )
+    stream = build_training_stream(
+        specs=(spec,),
+        stage="trading_reasoning",
+        seed=7,
+        local_replay=(general, trading),
+        local_weight=1.0,
+        repeat=False,
+    )
+    values = list(stream)
+    assert general in values
+    assert trading in values
 
 
 def test_corpus_streamer_packs_short_examples_into_context():
