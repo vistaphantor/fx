@@ -3,3 +3,4 @@ python-dotenv
 pytest
 numpy
 lightgbm
+torch
