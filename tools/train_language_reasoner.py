@@ -292,26 +292,38 @@ def _checkpoint_contract(
     }
 
 
-def _print_budget(*, report, model: VistaReasoningGPT, epochs: int) -> dict:
+def _raw_training_tokens(train_texts: list[str], tokenizer: BPETokenizer) -> int:
+    return sum(
+        max(0, len(tokenizer.encode(text, add_bos=False, add_eos=False)) - 1)
+        for text in train_texts
+    )
+
+
+def _print_budget(
+    *,
+    report,
+    model: VistaReasoningGPT,
+    tokenizer: BPETokenizer,
+    train_texts: list[str],
+    epochs: int,
+) -> dict:
     parameter_count = model.get_num_params()
-    per_epoch = report.train_prediction_tokens
-    planned = per_epoch * epochs
-    ratio = per_epoch / max(parameter_count, 1)
+    raw_tokens = _raw_training_tokens(train_texts, tokenizer)
+    packed_per_epoch = report.train_prediction_tokens
+    planned = packed_per_epoch * epochs
+    raw_ratio = raw_tokens / max(parameter_count, 1)
     planned_ratio = planned / max(parameter_count, 1)
     print(
-        f"[Budget] params={parameter_count:,} tokens/epoch={per_epoch:,} planned={planned:,} "
-        f"tokens_per_param/epoch={ratio:.3f} planned_tokens_per_param={planned_ratio:.3f}"
+        f"[Budget] params={parameter_count:,} raw_canonical_tokens={raw_tokens:,} "
+        f"packed_tokens/epoch={packed_per_epoch:,} planned_token_updates={planned:,} "
+        f"raw_tokens_per_param={raw_ratio:.3f} planned_tokens_per_param={planned_ratio:.3f}"
     )
-    if ratio < 1.0:
-        print(
-            "[Budget] WARNING: the unique packed token budget is smaller than the parameter count. "
-            "The pipeline is valid, but scratch language quality is likely data-limited."
-        )
     return {
         "parameter_count": parameter_count,
-        "train_prediction_tokens_per_epoch": per_epoch,
+        "raw_canonical_training_tokens": raw_tokens,
+        "train_prediction_tokens_per_epoch": packed_per_epoch,
         "planned_token_updates": planned,
-        "prediction_tokens_per_parameter_per_epoch": ratio,
+        "raw_training_tokens_per_parameter": raw_ratio,
         "planned_prediction_tokens_per_parameter": planned_ratio,
     }
 
@@ -326,6 +338,7 @@ def main() -> None:
     parser.add_argument("--threads", type=int, default=max(1, min(4, os.cpu_count() or 2)))
     parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--allow-data-starved", action="store_true")
     args = parser.parse_args()
 
     stage = _normalize_stage(args.training_stage)
@@ -366,9 +379,8 @@ def main() -> None:
     texts = selection.texts
     print(
         f"[Curriculum] stage={selection.stage} selected={len(texts):,}/{selection.total_available:,} "
-        f"trading_available={selection.trading_available:,} "
-        f"reasoning_available={selection.reasoning_available:,} math_available={selection.math_available:,} "
-        f"replay={selection.replay_examples:,}"
+        f"trading_available={selection.trading_available:,} reasoning_available={selection.reasoning_available:,} "
+        f"math_available={selection.math_available:,} replay={selection.replay_examples:,}"
     )
 
     lineage_model, lineage_tokenizer, lineage_fingerprint = _prepare_lineage(
@@ -386,8 +398,8 @@ def main() -> None:
     curriculum_hash = corpus_fingerprint(texts)
     split_hash = split_fingerprint(train_texts, val_texts)
     print(
-        f"[Split] train={len(train_texts):,} val={len(val_texts):,} family-isolated=true "
-        f"split={split_hash[:12]}"
+        f"[Split] train={len(train_texts):,} val={len(val_texts):,} "
+        f"family-isolated=true split={split_hash[:12]}"
     )
 
     static_contract = _static_preflight_contract(
@@ -407,13 +419,16 @@ def main() -> None:
         cfg=cfg,
         lineage_tokenizer=lineage_tokenizer,
     )
-    print(f"[Tokenizer] verified_reuse={str(reused).lower()} fingerprint={tokenizer.fingerprint()}")
+    print(
+        f"[Tokenizer] verified_reuse={str(reused).lower()} "
+        f"fingerprint={tokenizer.fingerprint()}"
+    )
 
     train_sequences = build_example_sequences(train_texts, tokenizer, seq_len=cfg["seq_len"])
     val_sequences = build_example_sequences(val_texts, tokenizer, seq_len=cfg["seq_len"])
     print(
-        f"[Packing] train_sequences={len(train_sequences):,} val_sequences={len(val_sequences):,} "
-        f"seq_len={cfg['seq_len']}"
+        f"[Packing] train_sequences={len(train_sequences):,} "
+        f"val_sequences={len(val_sequences):,} seq_len={cfg['seq_len']}"
     )
 
     report = run_training_preflight(
@@ -450,7 +465,24 @@ def main() -> None:
             raise RuntimeError("lineage_model_runtime_contract_mismatch")
     else:
         model = VistaReasoningGPT(**model_config).to("cpu")
-    budget = _print_budget(report=report, model=model, epochs=cfg["epochs"])
+
+    budget = _print_budget(
+        report=report,
+        model=model,
+        tokenizer=tokenizer,
+        train_texts=train_texts,
+        epochs=cfg["epochs"],
+    )
+    data_starved = budget["raw_training_tokens_per_parameter"] < 1.0
+    if stage == "foundation" and args.profile != "smoke" and data_starved:
+        print(
+            "[Budget] BLOCK: foundation corpus has fewer than 1.0 raw canonical training token "
+            "per model parameter. This is a conservative no-waste guardrail, not an optimality claim."
+        )
+        if not args.preflight_only and not args.allow_data_starved:
+            raise RuntimeError(
+                "foundation_training_blocked_by_data_budget:add_corpus_or_explicitly_use_--allow-data-starved"
+            )
 
     if args.preflight_only:
         print("[Preflight] Full training intentionally not started. Verified artifacts are reusable.")
@@ -541,8 +573,9 @@ def main() -> None:
             state_path,
         )
         print(
-            f"epoch={epoch + 1}/{cfg['epochs']} train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
-            f"best_val={best_val:.4f} params={model.get_num_params()/1e6:.2f}M "
+            f"epoch={epoch + 1}/{cfg['epochs']} train_loss={train_loss:.4f} "
+            f"val_loss={val_loss:.4f} best_val={best_val:.4f} "
+            f"params={model.get_num_params()/1e6:.2f}M "
             f"epoch_seconds={time.time() - epoch_started:.1f} checkpoint=saved"
         )
         if epochs_without_improvement >= cfg["early_stop_patience"]:
@@ -586,6 +619,7 @@ def main() -> None:
         "trained_context_length": cfg["seq_len"],
         "resumable_training": True,
         "lineage_tokenizer_fingerprint": lineage_fingerprint,
+        "data_starved_override": bool(args.allow_data_starved),
         **budget,
     }
     save_model_bundle(
