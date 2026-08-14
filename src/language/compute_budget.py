@@ -17,6 +17,8 @@ DEFAULT_WALL_CLOCK_HOURS = 4.0
 @dataclass(frozen=True, slots=True)
 class TrainingThroughputReport:
     parameter_count: int
+    active_parameter_count: int
+    activation_ratio: float
     benchmark_steps: int
     benchmark_prediction_tokens: int
     elapsed_seconds: float
@@ -24,6 +26,7 @@ class TrainingThroughputReport:
     wall_clock_hours: float
     projected_useful_tokens: int
     projected_tokens_per_parameter: float
+    projected_tokens_per_active_parameter: float
     reference_tokens_per_parameter: float
     reference_target_tokens: int
     projected_hours_to_reference_target: float
@@ -82,7 +85,7 @@ def benchmark_training_throughput(
     wall_clock_hours: float = DEFAULT_WALL_CLOCK_HOURS,
     reference_tokens_per_parameter: float = REFERENCE_TOKENS_PER_PARAMETER,
 ) -> TrainingThroughputReport:
-    """Measure real forward/backward throughput on gradient-bearing tokens."""
+    """Measure real CPU forward/backward throughput on supervised targets."""
     if steps <= 0:
         raise ValueError("steps must be positive")
     if wall_clock_hours <= 0:
@@ -90,10 +93,7 @@ def benchmark_training_throughput(
 
     seq_len = int(model_config["max_seq_len"])
     x, y, useful_per_step = _build_probe_batch(
-        tokenizer,
-        sequences,
-        seq_len=seq_len,
-        batch_size=batch_size,
+        tokenizer, sequences, seq_len=seq_len, batch_size=batch_size,
     )
 
     torch.manual_seed(20260814)
@@ -119,15 +119,17 @@ def benchmark_training_throughput(
     tokens_per_second = benchmark_tokens / max(elapsed, 1e-9)
 
     params = model.get_num_params()
+    active = model.get_active_params_per_token()
     projected = int(tokens_per_second * wall_clock_hours * 3600.0)
     reference_target = reference_token_target(
-        params,
-        tokens_per_parameter=reference_tokens_per_parameter,
+        params, tokens_per_parameter=reference_tokens_per_parameter,
     )
     hours_to_target = reference_target / max(tokens_per_second, 1e-9) / 3600.0
 
     return TrainingThroughputReport(
         parameter_count=params,
+        active_parameter_count=active,
+        activation_ratio=active / max(params, 1),
         benchmark_steps=steps,
         benchmark_prediction_tokens=benchmark_tokens,
         elapsed_seconds=elapsed,
@@ -135,11 +137,11 @@ def benchmark_training_throughput(
         wall_clock_hours=wall_clock_hours,
         projected_useful_tokens=projected,
         projected_tokens_per_parameter=projected / max(params, 1),
+        projected_tokens_per_active_parameter=projected / max(active, 1),
         reference_tokens_per_parameter=reference_tokens_per_parameter,
         reference_target_tokens=reference_target,
         projected_hours_to_reference_target=hours_to_target,
         required_tokens_per_second_for_reference_in_window=required_tokens_per_second(
-            reference_target,
-            wall_clock_hours,
+            reference_target, wall_clock_hours,
         ),
     )
