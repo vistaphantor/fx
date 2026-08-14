@@ -4,8 +4,11 @@ import argparse
 import hashlib
 import math
 import os
+import random
+import re
 import sys
 import time
+from collections import defaultdict
 from pathlib import Path
 
 import torch
@@ -16,7 +19,6 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 from src.language.data_pipeline import (
-    build_corpus_string,
     build_tokenizer_training_sample,
     load_all_training_text,
 )
@@ -71,40 +73,160 @@ PROFILES = {
 }
 
 
-class TokenSequenceDataset(Dataset):
-    def __init__(self, token_ids: list[int], seq_len: int):
-        self.seq_len = seq_len
-        self.starts = list(range(0, max(0, len(token_ids) - seq_len - 1), seq_len))
+def _normalize_prompt_family(text: str) -> str:
+    """Stable split key that keeps near-identical prompt variants together."""
+    match = re.search(r"<user>\s*(.*?)\s*</user>", text, flags=re.DOTALL)
+    if match:
+        value = match.group(1)
+    else:
+        # General-text examples are grouped by their normalized prefix.
+        value = text[:512]
+    value = value.casefold()
+    value = re.sub(r"\s+", " ", value)
+    value = re.sub(r"[\s\.,;:!?]+$", "", value)
+    return value.strip()
 
-    def __len__(self):
-        return len(self.starts)
 
-    def __getitem__(self, idx):
-        start = self.starts[idx]
-        chunk = self.token_ids[start:start + self.seq_len + 1]
+def split_by_prompt_family(
+    texts: list[str],
+    *,
+    val_fraction: float,
+    seed: int,
+) -> tuple[list[str], list[str]]:
+    """Split entire prompt families, never individual variants, across train/val."""
+    groups: dict[str, list[str]] = defaultdict(list)
+    for text in texts:
+        groups[_normalize_prompt_family(text)].append(text)
+
+    keys = list(groups)
+    random.Random(seed).shuffle(keys)
+    target_val = max(1, int(round(len(texts) * val_fraction)))
+
+    train: list[str] = []
+    val: list[str] = []
+    for key in keys:
+        group = groups[key]
+        if len(val) < target_val:
+            val.extend(group)
+        else:
+            train.extend(group)
+
+    if not train:
+        raise RuntimeError("family_split_produced_empty_training_set")
+    if not val:
+        raise RuntimeError("family_split_produced_empty_validation_set")
+    return train, val
+
+
+def _content_windows(token_ids: list[int], seq_len: int) -> list[list[int]]:
+    """Chunk one canonical example without crossing into another example."""
+    if len(token_ids) < 2:
+        return []
+
+    # Each training item needs seq_len + 1 tokens so x/y stay aligned.
+    window = seq_len + 1
+    if len(token_ids) <= window:
+        return [token_ids]
+
+    # Overlap long examples so the model sees continuity instead of disconnected
+    # fixed slices. No window ever crosses an example boundary.
+    stride = max(1, seq_len // 2)
+    chunks: list[list[int]] = []
+    start = 0
+    while start < len(token_ids) - 1:
+        chunk = token_ids[start:start + window]
+        if len(chunk) >= 2:
+            chunks.append(chunk)
+        if start + window >= len(token_ids):
+            break
+        start += stride
+    return chunks
+
+
+def build_example_sequences(
+    texts: list[str],
+    tokenizer: BPETokenizer,
+    *,
+    seq_len: int,
+) -> list[list[int]]:
+    """
+    Tokenize examples independently, preserve complete short examples, and pack
+    only complete examples together. Long examples are intentionally overlapped.
+    """
+    encoded_examples = [
+        tokenizer.encode(text, add_bos=False, add_eos=False)
+        for text in texts
+        if text.strip()
+    ]
+
+    sequences: list[list[int]] = []
+    pack: list[int] = []
+    max_tokens = seq_len + 1
+
+    for ids in encoded_examples:
+        if len(ids) < 2:
+            continue
+
+        if len(ids) > max_tokens:
+            if len(pack) >= 2:
+                sequences.append(pack)
+                pack = []
+            sequences.extend(_content_windows(ids, seq_len))
+            continue
+
+        if not pack:
+            pack = list(ids)
+            continue
+
+        if len(pack) + len(ids) <= max_tokens:
+            pack.extend(ids)
+        else:
+            if len(pack) >= 2:
+                sequences.append(pack)
+            pack = list(ids)
+
+    if len(pack) >= 2:
+        sequences.append(pack)
+
+    return sequences
+
+
+class PackedSequenceDataset(Dataset):
+    def __init__(self, sequences: list[list[int]], seq_len: int, pad_id: int):
+        if not sequences:
+            raise ValueError("sequences must not be empty")
+        self.seq_len = int(seq_len)
+        self.pad_id = int(pad_id)
+        self.sequences = [list(seq) for seq in sequences]
+
+    def __len__(self) -> int:
+        return len(self.sequences)
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        seq = self.sequences[idx][: self.seq_len + 1]
+        x = seq[:-1]
+        y = seq[1:]
+
+        if len(x) < self.seq_len:
+            padding = self.seq_len - len(x)
+            x = x + [self.pad_id] * padding
+            y = y + [self.pad_id] * padding
+
         return (
-            torch.tensor(chunk[:-1], dtype=torch.long),
-            torch.tensor(chunk[1:], dtype=torch.long),
+            torch.tensor(x, dtype=torch.long),
+            torch.tensor(y, dtype=torch.long),
         )
-
-    @property
-    def token_ids(self):
-        return self._token_ids
-
-    @token_ids.setter
-    def token_ids(self, value):
-        self._token_ids = value
 
 
 def corpus_fingerprint(texts: list[str]) -> str:
     digest = hashlib.sha256()
     for text in texts:
         digest.update(text.encode("utf-8", errors="replace"))
-        digest.update(b"\\0")
+        digest.update(b"\0")
     return digest.hexdigest()
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--profile", choices=sorted(PROFILES), default="15m")
     parser.add_argument("--data-root", default="data/data/trainingdata")
@@ -129,35 +251,47 @@ def main():
     texts = load_all_training_text(
         data_root=Path(args.data_root),
         max_examples=cfg["max_examples"],
-        shuffle=True,
+        shuffle=False,
         seed=42,
     )
     if not texts:
         raise SystemExit("No training data found")
 
-    n_val = max(1, int(len(texts) * cfg["val_split"]))
-    val_texts = texts[:n_val]
-    train_texts = texts[n_val:]
+    train_texts, val_texts = split_by_prompt_family(
+        texts,
+        val_fraction=cfg["val_split"],
+        seed=42,
+    )
+    print(
+        f"[Split] train={len(train_texts):,} val={len(val_texts):,} "
+        f"family-isolated=true"
+    )
 
     tokenizer_sample = build_tokenizer_training_sample(
-        texts,
+        train_texts,
         max_chars=cfg["tokenizer_chars"],
         seed=42,
     )
-
     tokenizer = BPETokenizer()
     tokenizer.train(tokenizer_sample, vocab_size=cfg["vocab_size"])
 
-    train_ids = tokenizer.encode(build_corpus_string(train_texts), add_bos=False, add_eos=False)
-    val_ids = tokenizer.encode(build_corpus_string(val_texts), add_bos=False, add_eos=False)
+    train_sequences = build_example_sequences(
+        train_texts,
+        tokenizer,
+        seq_len=cfg["seq_len"],
+    )
+    val_sequences = build_example_sequences(
+        val_texts,
+        tokenizer,
+        seq_len=cfg["seq_len"],
+    )
+    print(
+        f"[Packing] train_sequences={len(train_sequences):,} "
+        f"val_sequences={len(val_sequences):,} seq_len={cfg['seq_len']}"
+    )
 
-    train_ds = TokenSequenceDataset(train_ids, cfg["seq_len"])
-    val_ds = TokenSequenceDataset(val_ids, cfg["seq_len"])
-    train_ds.token_ids = train_ids
-    val_ds.token_ids = val_ids
-
-    if len(train_ds) == 0:
-        raise SystemExit("Training corpus too small for selected profile")
+    train_ds = PackedSequenceDataset(train_sequences, cfg["seq_len"], tokenizer.pad_id())
+    val_ds = PackedSequenceDataset(val_sequences, cfg["seq_len"], tokenizer.pad_id())
 
     train_loader = DataLoader(
         train_ds,
@@ -248,16 +382,18 @@ def main():
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    bundle_dir = Path(
-        args.bundle_dir
-        or f"data/models/trading_language/{args.profile}"
-    )
-
+    bundle_dir = Path(args.bundle_dir or f"data/models/trading_language/{args.profile}")
     metrics = {
         "best_validation_loss": best_val,
         "perplexity": math.exp(min(best_val, 20)),
         "training_seconds": time.time() - started,
         "profile": args.profile,
+        "training_examples": len(train_texts),
+        "validation_examples": len(val_texts),
+        "train_sequences": len(train_sequences),
+        "validation_sequences": len(val_sequences),
+        "family_isolated_validation": True,
+        "example_aware_packing": True,
     }
 
     save_model_bundle(
