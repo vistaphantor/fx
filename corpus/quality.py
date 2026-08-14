@@ -9,6 +9,17 @@ _STRUCTURAL_TOKEN_RE = re.compile(
     flags=re.IGNORECASE,
 )
 _WORD_RE = re.compile(r"[A-Za-z0-9]+")
+_URL_RE = re.compile(r"(?:https?://|www\.|\b[a-z0-9.-]+\.(?:com|org|net|io|co|ai)\b)", re.IGNORECASE)
+_EMAIL_RE = re.compile(r"\b[^\s@]+@[^\s@]+\.[^\s@]+\b")
+_CODE_RE = re.compile(
+    r"(?:\b(?:def|class|function|import|return|SELECT|INSERT|const|let|var)\b|"
+    r"```|=>|::|</?[a-z][^>]*>)",
+    re.IGNORECASE,
+)
+_MATH_RE = re.compile(
+    r"(?:\\(?:frac|begin|end|mathrm|mathbf|sqrt|det|sum|int)\b|"
+    r"\$[^$]{2,}\$|\b[a-zA-Z]\s*[=<>]\s*[-+]?\d|[{}]{2,})"
+)
 
 
 @dataclass(frozen=True)
@@ -19,7 +30,7 @@ class QualityScore:
 
 
 class QualityFilter:
-    """Authoritative bounded-cost quality gate for local and streamed text."""
+    """Authoritative bounded-cost quality gate for canonical streamed text."""
 
     def __init__(
         self,
@@ -53,8 +64,6 @@ class QualityFilter:
         has_user = "<user>" in text or "</user>" in text
         has_assistant = "<assistant>" in text or "</assistant>" in text
         if has_user or has_assistant:
-            # Anything encoded as conversation must contain both sides. Plain
-            # documents have neither and remain valid pretraining material.
             if not has_user:
                 reasons.append("missing_user")
             if not has_assistant:
@@ -136,8 +145,7 @@ class QualityFilter:
             penalties += 0.35
 
         score = max(0.0, 1.0 - penalties)
-        accepted = score >= self.min_score
-        return QualityScore(accepted=accepted, score=round(score, 4), reasons=tuple(reasons))
+        return QualityScore(score >= self.min_score, round(score, 4), tuple(reasons))
 
     def accepts(self, text: str) -> bool:
         return self.score(text).accepted
@@ -147,4 +155,74 @@ class QualityFilter:
         return passed, len(passed) / max(len(texts), 1)
 
 
+class FoundationEnglishFilter(QualityFilter):
+    """Stricter gate for the first language stage of a very small model.
+
+    Foundation should teach ordinary English and turn-taking, not web markup,
+    source code, dense formulae, identifiers, or boilerplate. Later stages may
+    intentionally admit mathematics and trading notation through their own
+    streamed sources, so these restrictions are foundation-only.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            min_chars=40,
+            max_chars=20_000,
+            min_score=0.70,
+            max_word_repetition_ratio=0.32,
+            min_unique_word_ratio=0.10,
+            max_html_ratio=0.08,
+            min_printable_ratio=0.95,
+            min_alnum_ratio=0.30,
+        )
+
+    def score(self, text: str) -> QualityScore:
+        base = super().score(text)
+        if not base.accepted:
+            return base
+
+        value = _STRUCTURAL_TOKEN_RE.sub(" ", str(text or ""))
+        words = _WORD_RE.findall(value)
+        reasons = list(base.reasons)
+        penalties = 1.0 - base.score
+
+        if len(words) < 8:
+            return QualityScore(False, 0.0, tuple(reasons + ["too_few_words_for_foundation"]))
+
+        ascii_letters = sum(ch.isascii() and ch.isalpha() for ch in value)
+        all_letters = sum(ch.isalpha() for ch in value)
+        if all_letters and ascii_letters / all_letters < 0.90:
+            reasons.append("non_english_script_density")
+            penalties += 0.45
+
+        url_count = len(_URL_RE.findall(value)) + len(_EMAIL_RE.findall(value))
+        if url_count >= 3 or url_count / max(len(words), 1) > 0.025:
+            reasons.append("link_or_identifier_heavy")
+            penalties += 0.45
+
+        code_hits = len(_CODE_RE.findall(value))
+        if code_hits >= 3 or code_hits / max(len(words), 1) > 0.03:
+            reasons.append("code_or_markup_heavy")
+            penalties += 0.50
+
+        math_hits = len(_MATH_RE.findall(value))
+        if math_hits >= 3 or math_hits / max(len(words), 1) > 0.025:
+            reasons.append("math_notation_heavy")
+            penalties += 0.50
+
+        punctuation = sum(ch in ".!?" for ch in value)
+        if len(words) >= 30 and punctuation == 0:
+            reasons.append("no_sentence_boundaries")
+            penalties += 0.35
+
+        digit_words = sum(word.isdigit() for word in words)
+        if digit_words / max(len(words), 1) > 0.16:
+            reasons.append("numeric_heavy")
+            penalties += 0.40
+
+        score = max(0.0, 1.0 - penalties)
+        return QualityScore(score >= self.min_score, round(score, 4), tuple(reasons))
+
+
 LANGUAGE_QUALITY_FILTER = QualityFilter()
+FOUNDATION_ENGLISH_FILTER = FoundationEnglishFilter()
