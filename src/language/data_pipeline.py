@@ -1,4 +1,9 @@
-"""Authoritative heterogeneous-data parser for Vista language training."""
+"""
+Authoritative language-model data pipeline.
+
+All heterogeneous local datasets are normalized into the same canonical
+protocol used by streamed sources before tokenization.
+"""
 from __future__ import annotations
 
 import ast
@@ -33,12 +38,18 @@ class TrainingExample:
     metadata: dict[str, object] = field(default_factory=dict)
 
 
+ROLE_PREFIX_RE = re.compile(
+    r"^\s*(?:Human|User|Assistant|AI|System)\s*:\s*",
+    flags=re.IGNORECASE,
+)
+
+
 def _clean_text(value: object) -> str:
     return normalize_text(value, strip_role_prefix=True)
 
 
-def _clean_instruction(value: object) -> str:
-    text = _clean_text(value)
+def _clean_instruction(text: str) -> str:
+    text = _clean_text(text)
     text = re.sub(
         r"^Below is an instruction that describes a task\.\s*"
         r"Write a response that appropriately completes the request\.\s*"
@@ -51,7 +62,17 @@ def _clean_instruction(value: object) -> str:
     return text.strip()
 
 
+def _split_legacy_prompt(value: object) -> tuple[str, str]:
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    text = re.sub(r"^\s*(?:Human|User)\s*:\s*", "", text, count=1, flags=re.IGNORECASE)
+    match = re.search(r"(?:^|\n)\s*Assistant\s*:\s*", text, flags=re.IGNORECASE)
+    if not match:
+        return _clean_instruction(text), ""
+    return _clean_instruction(text[: match.start()]), _clean_text(text[match.end() :])
+
+
 def _append_message(messages: list[TrainingMessage], role: str, content: object) -> None:
+    role = str(role or "").strip().casefold()
     role_map = {
         "human": "user",
         "user": "user",
@@ -61,10 +82,10 @@ def _append_message(messages: list[TrainingMessage], role: str, content: object)
         "model": "assistant",
         "system": "system",
     }
-    normalized_role = role_map.get(str(role or "").strip().casefold(), "")
+    normalized_role = role_map.get(role, role)
     if normalized_role not in {"user", "assistant", "system"}:
         return
-    cleaned = _clean_instruction(content) if normalized_role == "user" else _clean_text(content)
+    cleaned = _clean_text(content)
     if not cleaned:
         return
     message = TrainingMessage(normalized_role, cleaned)
@@ -81,18 +102,16 @@ def _deduplicate_messages(messages: list[TrainingMessage]) -> tuple[TrainingMess
     return tuple(result)
 
 
-def _split_legacy_prompt(value: object) -> tuple[str, str]:
-    text = str(value or "").replace("\\n", "\n").replace("\r\n", "\n").replace("\r", "\n").strip()
-    text = re.sub(r"^\s*(?:Human|User)\s*:\s*", "", text, count=1, flags=re.IGNORECASE)
-    match = re.search(r"(?:^|\n)\s*Assistant\s*:\s*", text, flags=re.IGNORECASE)
-    if not match:
-        return _clean_instruction(text), ""
-    return _clean_instruction(text[: match.start()]), _clean_text(text[match.end() :])
-
-
 def _parse_hh_conversation(value: str) -> list[TrainingMessage]:
-    value = str(value or "").replace("\\n", "\n").replace("\r\n", "\n").replace("\r", "\n").strip()
+    value = str(value or "").strip()
+    if not value:
+        return []
+    # Some downloaded JSON escaped newlines into literal backslash-n pairs.
+    if "\\n\\nHuman:" in value and "\n\nHuman:" not in value:
+        value = value.replace("\\n", "\n")
     markers = list(re.finditer(r"(?:^|\n\n)(Human|Assistant):\s*", value, flags=re.IGNORECASE))
+    if not markers:
+        return []
     messages: list[TrainingMessage] = []
     for index, marker in enumerate(markers):
         end = markers[index + 1].start() if index + 1 < len(markers) else len(value)
@@ -100,19 +119,21 @@ def _parse_hh_conversation(value: str) -> list[TrainingMessage]:
     return messages
 
 
-def _try_parse_embedded_object(value: str):
-    raw = str(value or "").strip()
-    if not raw:
+def _try_parse_embedded_object(prompt_str: str):
+    prompt_str = str(prompt_str or "").strip()
+    if not prompt_str:
         return None
-    for parser in (json.loads, ast.literal_eval):
-        try:
-            return parser(raw)
-        except Exception:
-            continue
-    return None
+    try:
+        return json.loads(prompt_str)
+    except Exception:
+        pass
+    try:
+        return ast.literal_eval(prompt_str)
+    except Exception:
+        return None
 
 
-def _messages_from_list(values) -> list[TrainingMessage]:
+def _messages_from_conversation_list(values) -> list[TrainingMessage]:
     messages: list[TrainingMessage] = []
     if not isinstance(values, list):
         return messages
@@ -121,20 +142,44 @@ def _messages_from_list(values) -> list[TrainingMessage]:
             continue
         role = item.get("from", item.get("role", ""))
         content = item.get("value", item.get("content", ""))
+        if str(role).strip().casefold() in {"human", "user"}:
+            content = _clean_instruction(str(content))
+        _append_message(messages, role, content)
+    return messages
+
+
+def _messages_from_message_list(values) -> list[TrainingMessage]:
+    messages: list[TrainingMessage] = []
+    if not isinstance(values, list):
+        return messages
+    for item in values:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role", "")
+        content = item.get("content", "")
+        if str(role).strip().casefold() in {"human", "user"}:
+            content = _clean_instruction(str(content))
         _append_message(messages, role, content)
     return messages
 
 
 def _parse_serialized_chat_turns(value: str) -> list[TrainingMessage]:
+    raw = str(value or "").strip()
+    if not raw:
+        return []
     messages: list[TrainingMessage] = []
-    for raw_line in str(value or "").strip().splitlines():
-        line = raw_line.strip()
+    for line in raw.splitlines():
+        line = line.strip()
         if not line:
             continue
         obj = _try_parse_embedded_object(line)
         if not isinstance(obj, dict) or "role" not in obj or "content" not in obj:
             return []
-        _append_message(messages, obj.get("role", ""), obj.get("content", ""))
+        role = obj.get("role", "")
+        content = obj.get("content", "")
+        if str(role).strip().casefold() in {"human", "user"}:
+            content = _clean_instruction(str(content))
+        _append_message(messages, role, content)
     return messages
 
 
@@ -146,55 +191,65 @@ def _example_from_embedded_object(obj, *, source: str) -> TrainingExample | None
     if "chosen" in obj or "rejected" in obj:
         messages.extend(_parse_hh_conversation(str(obj.get("chosen") or obj.get("rejected") or "")))
 
-    for key in ("content", "messages", "conversations"):
-        if isinstance(obj.get(key), list):
-            messages.extend(_messages_from_list(obj[key]))
+    contents = obj.get("content")
+    if isinstance(contents, list):
+        messages.extend(_messages_from_message_list(contents))
+    messages_value = obj.get("messages")
+    if isinstance(messages_value, list):
+        messages.extend(_messages_from_message_list(messages_value))
+    conversations = obj.get("conversations")
+    if isinstance(conversations, list):
+        messages.extend(_messages_from_conversation_list(conversations))
 
     instruction = obj.get("instruction")
+    input_text = obj.get("input")
     output = obj.get("output") or obj.get("response") or obj.get("answer")
     if instruction:
-        user = _clean_instruction(instruction)
-        extra = _clean_text(obj.get("input"))
+        user = _clean_instruction(str(instruction))
+        extra = _clean_text(input_text)
         if extra:
             user = f"{user}\n\n{extra}"
         _append_message(messages, "user", user)
         _append_message(messages, "assistant", output)
     elif obj.get("prompt") and output:
-        user, embedded_answer = _split_legacy_prompt(obj.get("prompt"))
-        _append_message(messages, "user", user)
-        _append_message(messages, "assistant", output or embedded_answer)
+        user_text, embedded_assistant = _split_legacy_prompt(obj.get("prompt", ""))
+        _append_message(messages, "user", user_text)
+        authoritative_answer = _clean_text(output)
+        _append_message(messages, "assistant", authoritative_answer or embedded_assistant)
 
-    teacher = _clean_text(obj.get("teacher_response"))
-    if teacher:
-        _append_message(messages, "assistant", teacher)
+    teacher_response = _clean_text(obj.get("teacher_response"))
+    if teacher_response:
+        if not (messages and messages[-1].role == "assistant" and messages[-1].content == teacher_response):
+            _append_message(messages, "assistant", teacher_response)
 
-    deduped = _deduplicate_messages(messages)
-    return TrainingExample(deduped, source=source) if deduped else None
+    messages_tuple = _deduplicate_messages(messages)
+    if not messages_tuple:
+        return None
+    return TrainingExample(messages_tuple, source=source)
 
 
 def _parse_source_example(ex: dict, *, source: str) -> TrainingExample | None:
     if not isinstance(ex, dict):
         return None
     prompt = ex.get("prompt")
-
     if isinstance(prompt, str):
         embedded = _try_parse_embedded_object(prompt)
         if embedded is not None:
             parsed = _example_from_embedded_object(embedded, source=source)
             if parsed is not None:
-                outer = ex.get("response") or ex.get("output") or ex.get("answer")
-                if outer:
+                outer_response = ex.get("response") or ex.get("output") or ex.get("answer")
+                if outer_response:
                     messages = list(parsed.messages)
-                    _append_message(messages, "assistant", outer)
+                    _append_message(messages, "assistant", outer_response)
                     return TrainingExample(_deduplicate_messages(messages), source=source)
                 return parsed
 
-        serialized = _parse_serialized_chat_turns(prompt)
-        if serialized:
-            outer = ex.get("response") or ex.get("output") or ex.get("answer")
-            if outer:
-                _append_message(serialized, "assistant", outer)
-            return TrainingExample(_deduplicate_messages(serialized), source=source)
+        serialized_chat = _parse_serialized_chat_turns(prompt)
+        if serialized_chat:
+            outer_response = ex.get("response") or ex.get("output") or ex.get("answer")
+            if outer_response:
+                _append_message(serialized_chat, "assistant", outer_response)
+            return TrainingExample(_deduplicate_messages(serialized_chat), source=source)
 
     parsed = _example_from_embedded_object(ex, source=source)
     if parsed is not None:
@@ -207,8 +262,18 @@ def _parse_source_example(ex: dict, *, source: str) -> TrainingExample | None:
 
 
 def serialize_training_example(example: TrainingExample) -> str:
-    messages = [CanonicalMessage(message.role, message.content) for message in example.messages]
-    return serialize_messages(messages)
+    canonical_messages = [CanonicalMessage(message.role, message.content) for message in example.messages]
+    return serialize_messages(canonical_messages)
+
+
+def _serialize_record(ex: object, *, source: str) -> str | None:
+    if not isinstance(ex, dict):
+        return None
+    parsed = _parse_source_example(ex, source=source)
+    if parsed is None:
+        return None
+    serialized = serialize_training_example(parsed)
+    return serialized if len(serialized) > 20 else None
 
 
 def _load_json_file(path: Path) -> Iterator[str]:
@@ -219,14 +284,33 @@ def _load_json_file(path: Path) -> Iterator[str]:
         return
     examples = data.get("examples") or data.get("data") or [] if isinstance(data, dict) else data if isinstance(data, list) else []
     for ex in examples:
-        if not isinstance(ex, dict):
-            continue
-        parsed = _parse_source_example(ex, source=str(path))
-        if parsed is None:
-            continue
-        serialized = serialize_training_example(parsed)
-        if len(serialized) > 20:
+        serialized = _serialize_record(ex, source=str(path))
+        if serialized:
             yield serialized
+
+
+def _load_jsonl_file(path: Path) -> Iterator[str]:
+    try:
+        handle = path.open("r", encoding="utf-8", errors="replace")
+    except OSError as exc:
+        print(f"  [DataLoader] Skip {path.name}: {exc}")
+        return
+    with handle:
+        for line_number, line in enumerate(handle, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                # Bad individual rows should not discard the rest of a large file.
+                continue
+            serialized = _serialize_record(
+                record,
+                source=f"{path}:{line_number}",
+            )
+            if serialized:
+                yield serialized
 
 
 def _load_txt_file(path: Path) -> Iterator[str]:
@@ -259,33 +343,47 @@ def load_all_training_text(
     seed: int = 42,
 ) -> list[str]:
     all_texts: list[str] = []
-    json_files = sorted(data_root.glob("*.json")) if data_root.exists() else []
-    txt_files = sorted(data_root.glob("*.txt")) if data_root.exists() else []
-    print(f"[DataLoader] Found {len(json_files)} root JSON files and {len(txt_files)} TXT files in {data_root}")
+    if not data_root.exists():
+        print(f"[DataLoader] Training root does not exist: {data_root}")
+        return []
+
+    json_files = sorted(data_root.rglob("*.json"))
+    jsonl_files = sorted(data_root.rglob("*.jsonl"))
+    txt_files = sorted(data_root.rglob("*.txt"))
+    print(
+        f"[DataLoader] Found {len(json_files)} JSON, {len(jsonl_files)} JSONL "
+        f"and {len(txt_files)} TXT files in {data_root}"
+    )
 
     for path in json_files:
-        if "master_index" not in path.name.casefold():
-            before = len(all_texts)
-            all_texts.extend(_load_json_file(path))
-            print(f"  {path.name}: +{len(all_texts) - before} examples")
+        if "master_index" in path.name.casefold():
+            continue
+        before = len(all_texts)
+        all_texts.extend(_load_json_file(path))
+        count = len(all_texts) - before
+        if count:
+            print(f"  {path.relative_to(data_root)}: +{count} examples")
 
-    if data_root.exists():
-        for subdir in sorted(data_root.iterdir()):
-            if not subdir.is_dir():
-                continue
-            for path in sorted(subdir.glob("*.json")):
-                before = len(all_texts)
-                all_texts.extend(_load_json_file(path))
-                count = len(all_texts) - before
-                if count:
-                    print(f"  {subdir.name}/{path.name}: +{count} examples")
+    for path in jsonl_files:
+        before = len(all_texts)
+        all_texts.extend(_load_jsonl_file(path))
+        count = len(all_texts) - before
+        if count:
+            print(f"  {path.relative_to(data_root)}: +{count} examples")
 
     for path in txt_files:
+        before = len(all_texts)
         all_texts.extend(_load_txt_file(path))
+        count = len(all_texts) - before
+        if count:
+            print(f"  {path.relative_to(data_root)}: +{count} examples")
 
     raw_count = len(all_texts)
     all_texts = _stable_unique(all_texts)
-    print(f"[DataLoader] Parsed: {raw_count:,} | Unique canonical examples: {len(all_texts):,}")
+    print(
+        f"[DataLoader] Parsed: {raw_count:,} | "
+        f"Unique canonical examples: {len(all_texts):,}"
+    )
     if shuffle:
         random.Random(seed).shuffle(all_texts)
     if max_examples is not None:
@@ -326,25 +424,30 @@ def build_tokenizer_training_sample(
     max_chars: int = 8_000_000,
     seed: int = 42,
 ) -> str:
+    """Build a tokenizer sample from complete canonical examples only.
+
+    Structural tokens are atomic model grammar. Random character slicing can
+    cut `<assistant>` or `<think>` in half and teach BPE useless fragments.
+    The character budget is therefore a soft ceiling: examples are shuffled
+    deterministically and accepted whole until the budget is reached.
+    """
     if not texts or max_chars <= 0:
         return ""
     canonical = [canonicalize_serialized(text) for text in texts if text and text.strip()]
-    rng = random.Random(seed)
-    indices = list(range(len(canonical)))
-    rng.shuffle(indices)
-    target_per_text = max(256, max_chars // max(len(canonical), 1))
+    random.Random(seed).shuffle(canonical)
     pieces: list[str] = []
-    remaining = max_chars
-    for index in indices:
-        if remaining <= 0:
+    used = 0
+    separator_chars = len("\n<sep>\n")
+    for text in canonical:
+        additional = len(text) + (separator_chars if pieces else 0)
+        if pieces and used + additional > max_chars:
+            continue
+        pieces.append(text)
+        used += additional
+        if used >= max_chars:
             break
-        text = canonical[index]
-        take = min(len(text), target_per_text, remaining)
-        if len(text) > take:
-            start = rng.randint(0, len(text) - take)
-            piece = text[start : start + take]
-        else:
-            piece = text
-        pieces.append(piece)
-        remaining -= len(piece)
+    if not pieces:
+        # A single unusually large record is still safer whole than sliced
+        # through control-token boundaries.
+        pieces.append(canonical[0])
     return "\n<sep>\n".join(pieces)
