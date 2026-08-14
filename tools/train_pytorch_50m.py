@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import random
@@ -28,8 +29,8 @@ from src.language.training_pipeline import (
     split_fingerprint,
 )
 
-
 TRAINING_STATE_VERSION = 1
+PREFLIGHT_MANIFEST_VERSION = 1
 SEED = 42
 
 PROFILES = {
@@ -88,15 +89,21 @@ def _atomic_torch_save(payload: dict, path: Path) -> None:
     os.replace(temporary, path)
 
 
+def _atomic_json_save(payload: dict, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(temporary, path)
+
+
 def _model_config(cfg: dict, tokenizer: BPETokenizer) -> dict:
-    # The trained sequence length is the authoritative inference context length.
-    # Never expose untrained positional embeddings.
     return {
         "vocab_size": tokenizer.vocab_size,
         "d_model": cfg["d_model"],
         "n_layers": cfg["n_layers"],
         "n_heads": cfg["n_heads"],
         "ffn_dim": cfg["ffn_dim"],
+        # Never expose positional embeddings that were not trained.
         "max_seq_len": cfg["seq_len"],
         "dropout": cfg["dropout"],
     }
@@ -110,12 +117,7 @@ def _new_optimizer(model: VistaReasoningGPT, cfg: dict) -> torch.optim.Optimizer
     )
 
 
-def _epoch_loader(
-    dataset: PackedSequenceDataset,
-    *,
-    batch_size: int,
-    epoch: int,
-) -> DataLoader:
+def _epoch_loader(dataset: PackedSequenceDataset, *, batch_size: int, epoch: int) -> DataLoader:
     generator = torch.Generator()
     generator.manual_seed(SEED + int(epoch))
     return DataLoader(
@@ -158,13 +160,14 @@ def _token_weighted_loss(
             valid_tokens = int((y != pad_id).sum().item())
             if valid_tokens <= 0:
                 continue
-
             if training:
                 optimizer.zero_grad(set_to_none=True)
 
             _, loss = model(x, targets=y, pad_id=pad_id)
             if loss is None or not torch.isfinite(loss):
-                raise RuntimeError("non_finite_training_loss" if training else "non_finite_validation_loss")
+                raise RuntimeError(
+                    "non_finite_training_loss" if training else "non_finite_validation_loss"
+                )
 
             if training:
                 loss.backward()
@@ -179,6 +182,69 @@ def _token_weighted_loss(
     if total_tokens <= 0:
         raise RuntimeError("no_non_padding_tokens_seen")
     return total_loss / total_tokens
+
+
+def _static_preflight_contract(
+    *,
+    profile: str,
+    training_stage: str,
+    cfg: dict,
+    corpus_hash: str,
+    split_hash: str,
+) -> dict:
+    return {
+        "preflight_manifest_version": PREFLIGHT_MANIFEST_VERSION,
+        "profile": profile,
+        "training_stage": training_stage,
+        "tokenizer_algorithm_version": TOKENIZER_ALGORITHM_VERSION,
+        "target_vocab_size": cfg["vocab_size"],
+        "tokenizer_chars": cfg["tokenizer_chars"],
+        "seq_len": cfg["seq_len"],
+        "corpus_fingerprint": corpus_hash,
+        "split_fingerprint": split_hash,
+    }
+
+
+def _validate_contract(saved: dict, expected: dict, *, prefix: str) -> None:
+    for key, expected_value in expected.items():
+        if saved.get(key) != expected_value:
+            raise RuntimeError(f"{prefix}_contract_mismatch:{key}")
+
+
+def _load_or_train_tokenizer(
+    *,
+    tokenizer_path: Path,
+    preflight_path: Path,
+    static_contract: dict,
+    train_texts: list[str],
+    cfg: dict,
+) -> tuple[BPETokenizer, bool]:
+    if tokenizer_path.exists():
+        if not preflight_path.exists():
+            raise RuntimeError(
+                "unverified_preflight_tokenizer_exists:delete_bundle_.training_and_run_preflight"
+            )
+        saved = json.loads(preflight_path.read_text(encoding="utf-8"))
+        _validate_contract(saved, static_contract, prefix="preflight")
+        tokenizer = BPETokenizer.load(tokenizer_path)
+        if saved.get("tokenizer_fingerprint") != tokenizer.fingerprint():
+            raise RuntimeError("preflight_tokenizer_fingerprint_mismatch")
+        if saved.get("actual_vocab_size") != tokenizer.vocab_size:
+            raise RuntimeError("preflight_tokenizer_vocab_size_mismatch")
+        return tokenizer, True
+
+    if preflight_path.exists():
+        raise RuntimeError("preflight_manifest_exists_without_tokenizer")
+
+    tokenizer_sample = build_tokenizer_training_sample(
+        train_texts,
+        max_chars=cfg["tokenizer_chars"],
+        seed=SEED,
+    )
+    tokenizer = BPETokenizer()
+    tokenizer.train(tokenizer_sample, vocab_size=cfg["vocab_size"])
+    tokenizer.save(tokenizer_path)
+    return tokenizer, False
 
 
 def _checkpoint_contract(
@@ -202,33 +268,29 @@ def _checkpoint_contract(
     }
 
 
-def _validate_resume_contract(saved: dict, expected: dict) -> None:
-    for key, expected_value in expected.items():
-        if saved.get(key) != expected_value:
-            raise RuntimeError(f"resume_contract_mismatch:{key}")
-
-
-def _load_or_train_tokenizer(
-    *,
-    resume: bool,
-    tokenizer_path: Path,
-    train_texts: list[str],
-    cfg: dict,
-) -> BPETokenizer:
-    if resume:
-        if not tokenizer_path.exists():
-            raise RuntimeError("resume_tokenizer_missing")
-        return BPETokenizer.load(tokenizer_path)
-
-    tokenizer_sample = build_tokenizer_training_sample(
-        train_texts,
-        max_chars=cfg["tokenizer_chars"],
-        seed=SEED,
+def _print_budget(*, report, model: VistaReasoningGPT, epochs: int) -> dict:
+    parameter_count = model.get_num_params()
+    per_epoch = report.train_prediction_tokens
+    planned = per_epoch * epochs
+    unique_ratio = per_epoch / max(parameter_count, 1)
+    planned_ratio = planned / max(parameter_count, 1)
+    print(
+        f"[Budget] params={parameter_count:,} train_prediction_tokens/epoch={per_epoch:,} "
+        f"planned_token_updates={planned:,} tokens_per_param/epoch={unique_ratio:.3f} "
+        f"planned_tokens_per_param={planned_ratio:.3f}"
     )
-    tokenizer = BPETokenizer()
-    tokenizer.train(tokenizer_sample, vocab_size=cfg["vocab_size"])
-    tokenizer.save(tokenizer_path)
-    return tokenizer
+    if unique_ratio < 1.0:
+        print(
+            "[Budget] WARNING: fewer than one packed training prediction token per model parameter "
+            "per epoch. Architecture is valid, but scratch-model language quality may be data-limited."
+        )
+    return {
+        "parameter_count": parameter_count,
+        "train_prediction_tokens_per_epoch": per_epoch,
+        "planned_token_updates": planned,
+        "prediction_tokens_per_parameter_per_epoch": unique_ratio,
+        "planned_prediction_tokens_per_parameter": planned_ratio,
+    }
 
 
 def main() -> None:
@@ -262,6 +324,7 @@ def main() -> None:
     bundle_dir = Path(args.bundle_dir or f"data/models/trading_language/{args.profile}")
     work_dir = bundle_dir / ".training"
     tokenizer_path = work_dir / "tokenizer.json"
+    preflight_path = work_dir / "preflight.json"
     state_path = work_dir / "training_state.pt"
     best_model_path = work_dir / "best_model.pt"
 
@@ -286,14 +349,21 @@ def main() -> None:
         f"family-isolated=true split={split_hash[:12]}"
     )
 
-    tokenizer = _load_or_train_tokenizer(
-        resume=args.resume,
+    static_contract = _static_preflight_contract(
+        profile=args.profile,
+        training_stage=args.training_stage,
+        cfg=cfg,
+        corpus_hash=corpus_hash,
+        split_hash=split_hash,
+    )
+    tokenizer, reused_verified_tokenizer = _load_or_train_tokenizer(
         tokenizer_path=tokenizer_path,
+        preflight_path=preflight_path,
+        static_contract=static_contract,
         train_texts=train_texts,
         cfg=cfg,
     )
-    if tokenizer.algorithm_version != TOKENIZER_ALGORITHM_VERSION:
-        raise RuntimeError("trainer_loaded_non_authoritative_tokenizer")
+    print(f"[Tokenizer] verified_reuse={str(reused_verified_tokenizer).lower()}")
 
     train_sequences = build_example_sequences(
         train_texts,
@@ -318,22 +388,36 @@ def main() -> None:
         val_sequences=val_sequences,
         seq_len=cfg["seq_len"],
     )
+    verified_manifest = {
+        **static_contract,
+        "tokenizer_fingerprint": tokenizer.fingerprint(),
+        "actual_vocab_size": tokenizer.vocab_size,
+        "roundtrip_cases": report.roundtrip_cases,
+        "overfit_initial_loss": report.overfit_initial_loss,
+        "overfit_final_loss": report.overfit_final_loss,
+        "train_prediction_tokens": report.train_prediction_tokens,
+        "validation_prediction_tokens": report.validation_prediction_tokens,
+    }
+    _atomic_json_save(verified_manifest, preflight_path)
     print(
         "[Preflight] PASS "
         f"tokenizer=v{report.tokenizer_algorithm_version} "
         f"roundtrips={report.roundtrip_cases} "
         f"overfit_loss={report.overfit_initial_loss:.4f}->{report.overfit_final_loss:.4f}"
     )
+
+    model_config = _model_config(cfg, tokenizer)
+    model = VistaReasoningGPT(**model_config).to("cpu")
+    budget = _print_budget(report=report, model=model, epochs=cfg["epochs"])
+
     if args.preflight_only:
-        print("[Preflight] Full training intentionally not started.")
+        print("[Preflight] Full training intentionally not started. Verified tokenizer is reusable.")
         return
 
     train_ds = PackedSequenceDataset(train_sequences, cfg["seq_len"], tokenizer.pad_id())
     val_ds = PackedSequenceDataset(val_sequences, cfg["seq_len"], tokenizer.pad_id())
     val_loader = _validation_loader(val_ds, batch_size=cfg["batch_size"])
 
-    model_config = _model_config(cfg, tokenizer)
-    model = VistaReasoningGPT(**model_config).to("cpu")
     optimizer = _new_optimizer(model, cfg)
     steps_per_epoch = math.ceil(len(train_ds) / cfg["batch_size"])
     total_steps = max(1, steps_per_epoch * cfg["epochs"])
@@ -355,12 +439,11 @@ def main() -> None:
     start_epoch = 0
     best_val = float("inf")
     epochs_without_improvement = 0
-
     if args.resume:
         if not state_path.exists():
             raise RuntimeError("resume_training_state_missing")
         state = torch.load(state_path, map_location="cpu", weights_only=False)
-        _validate_resume_contract(state, contract)
+        _validate_contract(state, contract, prefix="resume")
         model.load_state_dict(state["model_state_dict"])
         optimizer.load_state_dict(state["optimizer_state_dict"])
         scheduler.load_state_dict(state["scheduler_state_dict"])
@@ -369,9 +452,7 @@ def main() -> None:
         epochs_without_improvement = int(state.get("epochs_without_improvement", 0))
         print(f"[Resume] continuing at epoch={start_epoch + 1} best_val={best_val:.4f}")
     elif state_path.exists():
-        raise RuntimeError(
-            "training_state_already_exists:use_--resume_or_delete_bundle_training_directory"
-        )
+        raise RuntimeError("training_state_already_exists:use_--resume")
 
     started = time.time()
     last_train_loss = float("nan")
@@ -392,11 +473,7 @@ def main() -> None:
             scheduler=scheduler,
             grad_clip=cfg["grad_clip"],
         )
-        val_loss = _token_weighted_loss(
-            model,
-            val_loader,
-            pad_id=tokenizer.pad_id(),
-        )
+        val_loss = _token_weighted_loss(model, val_loader, pad_id=tokenizer.pad_id())
         last_train_loss = train_loss
         last_val_loss = val_loss
 
@@ -428,10 +505,9 @@ def main() -> None:
 
         elapsed = time.time() - epoch_started
         print(
-            f"epoch={epoch + 1}/{cfg['epochs']} "
-            f"train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
-            f"best_val={best_val:.4f} params={model.get_num_params()/1e6:.2f}M "
-            f"epoch_seconds={elapsed:.1f} checkpoint=saved"
+            f"epoch={epoch + 1}/{cfg['epochs']} train_loss={train_loss:.4f} "
+            f"val_loss={val_loss:.4f} best_val={best_val:.4f} "
+            f"params={model.get_num_params()/1e6:.2f}M epoch_seconds={elapsed:.1f} checkpoint=saved"
         )
 
         if epochs_without_improvement >= cfg["early_stop_patience"]:
@@ -467,6 +543,7 @@ def main() -> None:
         "last_validation_loss": last_val_loss,
         "trained_context_length": cfg["seq_len"],
         "resumable_training": True,
+        **budget,
     }
 
     save_model_bundle(
