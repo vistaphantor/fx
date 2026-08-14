@@ -14,20 +14,58 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 
+TOKENIZER_ALGORITHM_VERSION = 3
+
 PAD      = "<pad>"      # 0
 UNK      = "<unk>"      # 1
 BOS      = "<bos>"      # 2
 EOS      = "<eos>"      # 3
 SEP      = "<sep>"      # 4
-THINK    = "<think>"    # 5
-ENDTHINK = "</think>"  # 6
+THINK       = "<think>"        # 5
+ENDTHINK    = "</think>"       # 6
+USER        = "<user>"
+ENDUSER     = "</user>"
+ASSISTANT   = "<assistant>"
+ENDASSISTANT= "</assistant>"
+MARKET      = "<market>"
+ENDMARKET   = "</market>"
+ACCOUNT     = "<account>"
+ENDACCOUNT  = "</account>"
+POSITION    = "<position>"
+ENDPOSITION = "</position>"
+EVIDENCE    = "<evidence>"
+ENDEVIDENCE = "</evidence>"
+HYPOTHESIS  = "<hypothesis>"
+ENDHYPOTHESIS = "</hypothesis>"
+COUNTERCASE = "<countercase>"
+ENDCOUNTERCASE = "</countercase>"
+TOOL        = "<tool>"
+ENDTOOL     = "</tool>"
+TOOL_RESULT = "<tool_result>"
+ENDTOOL_RESULT = "</tool_result>"
+DECISION    = "<decision>"
+ENDDECISION = "</decision>"
+CONFIDENCE  = "<confidence>"
+ENDCONFIDENCE = "</confidence>"
+INVALIDATION = "<invalidation>"
+ENDINVALIDATION = "</invalidation>"
 
-SPECIAL_TOKENS = [PAD, UNK, BOS, EOS, SEP, THINK, ENDTHINK]
+SPECIAL_TOKENS = [
+    PAD, UNK, BOS, EOS, SEP, THINK, ENDTHINK,
+    USER, ENDUSER, ASSISTANT, ENDASSISTANT,
+    MARKET, ENDMARKET, ACCOUNT, ENDACCOUNT,
+    POSITION, ENDPOSITION, EVIDENCE, ENDEVIDENCE,
+    HYPOTHESIS, ENDHYPOTHESIS, COUNTERCASE, ENDCOUNTERCASE,
+    TOOL, ENDTOOL, TOOL_RESULT, ENDTOOL_RESULT,
+    DECISION, ENDDECISION, CONFIDENCE, ENDCONFIDENCE,
+    INVALIDATION, ENDINVALIDATION,
+]
 
 
 class BPETokenizer:
 
     def __init__(self, cache_max_size: int = 65536):
+        self.algorithm_version = TOKENIZER_ALGORITHM_VERSION
         self.vocab: dict[str, int] = {}
         self.id_to_token: dict[int, str] = {}
         self.merges: list[tuple[str, str]] = []
@@ -45,13 +83,35 @@ class BPETokenizer:
             if ch not in vocab:
                 vocab[ch] = len(vocab)
 
-        word_freqs = Counter(re.findall(r'\S+|\n', text))
+        special_pattern = "(" + "|".join(
+            re.escape(tok)
+            for tok in sorted(
+                SPECIAL_TOKENS,
+                key=len,
+                reverse=True,
+            )
+        ) + ")"
+
+        ordinary_parts = [
+            part
+            for part in re.split(special_pattern, text)
+            if part and part not in SPECIAL_TOKENS
+        ]
+
+        word_freqs = Counter()
+
+        for part in ordinary_parts:
+            word_freqs.update(
+                re.findall(r'\S+', part)
+            )
 
         def word_to_chars(word):
-            return tuple(list(word) + ["</w>"])
+            return tuple(word)
 
-        splits = {word: list(word_to_chars(word)) for word in word_freqs}
-        vocab["</w>"] = len(vocab)
+        splits = {
+            word: list(word_to_chars(word))
+            for word in word_freqs
+        }
 
         merges = []
         merge_map = {}
@@ -109,7 +169,7 @@ class BPETokenizer:
         if word in self._word_cache:
             return self._word_cache[word]
 
-        syms = list(word) + ["</w>"]
+        syms = list(word)
 
         if self._merge_ranks:
             while len(syms) > 1:
@@ -153,21 +213,55 @@ class BPETokenizer:
         self._word_cache[word] = token_ids
         return token_ids
 
-    def encode(self, text: str, add_bos: bool = True, add_eos: bool = True) -> list[int]:
-        tokens = []
+    def encode(
+        self,
+        text: str,
+        add_bos: bool = True,
+        add_eos: bool = True,
+    ) -> list[int]:
+        tokens: list[int] = []
+
         if add_bos:
             tokens.append(self.vocab.get(BOS, 2))
 
-        space_id = self.vocab.get(" ", self.vocab.get(UNK, 1))
+        special_pattern = "(" + "|".join(
+            re.escape(tok)
+            for tok in sorted(
+                SPECIAL_TOKENS,
+                key=len,
+                reverse=True,
+            )
+        ) + ")"
 
-        words = re.findall(r'\S+|\n', text)
-        for w in words:
-            tokens.extend(self._tokenize_word(w))
-            tokens.append(space_id)
+        parts = re.split(special_pattern, text)
+        unk_id = self.vocab.get(UNK, 1)
+
+        for part in parts:
+            if not part:
+                continue
+
+            if part in SPECIAL_TOKENS:
+                tokens.append(
+                    self.vocab.get(part, unk_id)
+                )
+                continue
+
+            for segment in re.findall(r'\s+|\S+', part):
+                if segment.isspace():
+                    for char in segment:
+                        tokens.append(
+                            self.vocab.get(char, unk_id)
+                        )
+                else:
+                    tokens.extend(
+                        self._tokenize_word(segment)
+                    )
 
         if add_eos:
             tokens.append(self.vocab.get(EOS, 3))
+
         return tokens
+
 
     def encode_batch(self, texts: list[str], workers: int = 4, add_bos: bool = True, add_eos: bool = True) -> list[list[int]]:
         if workers <= 1 or len(texts) < 10:
@@ -177,33 +271,51 @@ class BPETokenizer:
             return list(ex.map(lambda t: self.encode(t, add_bos=add_bos, add_eos=add_eos), texts))
 
     def count_tokens(self, text: str) -> int:
-        words = re.findall(r'\S+|\n', text)
-        cnt = 1  # BOS
-        for w in words:
-            cnt += len(self._tokenize_word(w)) + 1
-        return cnt
+        """Count tokens using the exact same grammar as encode()."""
+        return len(
+            self.encode(
+                text,
+                add_bos=True,
+                add_eos=True,
+            )
+        )
 
     def decode(self, ids: list[int], skip_special: bool = True) -> str:
-        tokens = []
+        tokens: list[str] = []
+
         for i in ids:
             tok = self.id_to_token.get(i, UNK)
+
             if skip_special and tok in SPECIAL_TOKENS:
                 continue
+
             tokens.append(tok)
-        text = "".join(tokens)
-        text = text.replace("</w>", " ").strip()
-        return text
+
+        return "".join(tokens)
 
     def fingerprint(self) -> str:
         vocab_items = sorted(self.vocab.items())
         merges_items = self.merges
-        payload = json.dumps({"v": vocab_items, "m": merges_items}, ensure_ascii=False)
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+        payload = json.dumps(
+            {
+                "algorithm_version": self.algorithm_version,
+                "v": vocab_items,
+                "m": merges_items,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+
+        return hashlib.sha256(
+            payload.encode("utf-8")
+        ).hexdigest()[:16]
 
     def save(self, path: str | Path) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         data = {
+            "algorithm_version": self.algorithm_version,
             "vocab": self.vocab,
             "merges": [[a, b] for a, b in self.merges],
         }
@@ -249,7 +361,22 @@ class BPETokenizer:
             return cls.load_binary(path)
 
         data = json.loads(path.read_text(encoding="utf-8"))
+
+        version = int(
+            data.get(
+                "algorithm_version",
+                1,
+            )
+        )
+
+        if version != TOKENIZER_ALGORITHM_VERSION:
+            raise RuntimeError(
+                "unsupported_tokenizer_algorithm_version:"
+                f"{version}"
+            )
+
         tok = cls()
+        tok.algorithm_version = version
         tok.vocab = {k: int(v) for k, v in data["vocab"].items()}
         tok.id_to_token = {int(v): k for k, v in data["vocab"].items()}
         tok.merges = [tuple(m) for m in data["merges"]]

@@ -132,12 +132,23 @@ class VistaReasoningGPT(nn.Module):
 
         loss = None
         if targets is not None:
-            # Shift logits and targets for next-token prediction
-            shift_logits = logits[:, :-1, :].contiguous()
-            shift_targets = targets[:, 1:].contiguous()
+            # Training datasets already provide aligned next-token targets:
+            #
+            #   input   = tokens[:-1]
+            #   target  = tokens[1:]
+            #
+            # Therefore logits[t] must be compared directly with targets[t].
+            # Shifting here again would incorrectly train the model to predict
+            # two tokens ahead.
+            if targets.shape != idx.shape:
+                raise ValueError(
+                    "targets must have the same shape as idx; "
+                    f"got idx={tuple(idx.shape)} targets={tuple(targets.shape)}"
+                )
+
             loss = F.cross_entropy(
-                shift_logits.view(-1, self.vocab_size),
-                shift_targets.view(-1),
+                logits.reshape(-1, self.vocab_size),
+                targets.reshape(-1),
                 ignore_index=pad_id,
             )
 
