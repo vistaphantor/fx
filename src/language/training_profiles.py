@@ -1,0 +1,104 @@
+from __future__ import annotations
+
+PROFILES: dict[str, dict[str, int | float | None]] = {
+    "smoke": {
+        "vocab_size": 1024,
+        "d_model": 128,
+        "n_heads": 4,
+        "n_layers": 4,
+        "ffn_dim": 512,
+        "seq_len": 128,
+        "batch_size": 4,
+        "lr": 8e-4,
+        "max_examples": 512,
+        "tokenizer_chars": 1_500_000,
+        "early_stop_patience": 5,
+        "early_stop_min_delta": 0.003,
+        "exam_max_new_tokens": 48,
+        "hf_preflight_sample_examples": 1000,
+        "checkpoint_every_steps": 50,
+    },
+    "2m": {
+        "vocab_size": 2048,
+        "d_model": 192,
+        "n_heads": 6,
+        "n_layers": 4,
+        "ffn_dim": 768,
+        "seq_len": 160,
+        "batch_size": 2,
+        "lr": 5e-4,
+        "max_examples": None,
+        "tokenizer_chars": 3_000_000,
+        "early_stop_patience": 4,
+        "early_stop_min_delta": 0.004,
+        "exam_max_new_tokens": 48,
+        "hf_preflight_sample_examples": 2500,
+        "checkpoint_every_steps": 100,
+    },
+    "4m": {
+        "vocab_size": 3072,
+        "d_model": 224,
+        "n_heads": 7,
+        "n_layers": 6,
+        "ffn_dim": 896,
+        "seq_len": 192,
+        "batch_size": 2,
+        "lr": 4.5e-4,
+        "max_examples": None,
+        "tokenizer_chars": 4_000_000,
+        "early_stop_patience": 4,
+        "early_stop_min_delta": 0.004,
+        "exam_max_new_tokens": 48,
+        "hf_preflight_sample_examples": 3000,
+        "checkpoint_every_steps": 100,
+    },
+    "8m": {
+        "vocab_size": 4096,
+        "d_model": 256,
+        "n_heads": 8,
+        "n_layers": 8,
+        "ffn_dim": 1024,
+        "seq_len": 192,
+        "batch_size": 2,
+        "lr": 4e-4,
+        "max_examples": None,
+        "tokenizer_chars": 4_000_000,
+        "early_stop_patience": 3,
+        "early_stop_min_delta": 0.005,
+        "exam_max_new_tokens": 48,
+        "hf_preflight_sample_examples": 3000,
+        "checkpoint_every_steps": 100,
+    },
+    "15m": {
+        "vocab_size": 8192,
+        "d_model": 320,
+        "n_heads": 8,
+        "n_layers": 10,
+        "ffn_dim": 1280,
+        "seq_len": 256,
+        "batch_size": 1,
+        "lr": 3e-4,
+        "max_examples": None,
+        "tokenizer_chars": 8_000_000,
+        "early_stop_patience": 3,
+        "early_stop_min_delta": 0.005,
+        "exam_max_new_tokens": 48,
+        "hf_preflight_sample_examples": 5000,
+        "checkpoint_every_steps": 100,
+    },
+}
+
+# Foundation is scratch pretraining. Later stages reuse the same model/tokenizer
+# and therefore need smaller additional token budgets rather than another full
+# scratch-training horizon.
+DEFAULT_STAGE_TOKENS_PER_PARAMETER = {
+    "foundation": 20.0,
+    "reasoning": 6.0,
+    "trading_reasoning": 8.0,
+}
+
+
+def profile(name: str) -> dict:
+    if name not in PROFILES:
+        raise ValueError(f"unknown_training_profile:{name}")
+    return dict(PROFILES[name])
