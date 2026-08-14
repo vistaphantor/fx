@@ -7,14 +7,19 @@ from src.language.curriculum import (
     is_reasoning_example,
     is_trading_example,
     select_curriculum,
+    trading_evidence_score,
 )
 
 
-def test_domain_classification_is_explicit():
+def test_domain_classification_requires_substantive_trading_evidence():
     assert is_trading_example("XAUUSD is bullish on H1 with high spread.")
+    assert is_trading_example("A bullish breakout entry needs risk management.")
     assert is_reasoning_example("<assistant><think>Work it out.</think>Answer.</assistant>")
     assert is_math_example("Solve 2x + 5 = 11")
     assert not is_trading_example("The capital of France is Paris.")
+    assert not is_trading_example("The market price increased this year.")
+    assert not is_trading_example("International trade affects the economy.")
+    assert trading_evidence_score("The market price increased this year.") < 2
 
 
 def test_foundation_preserves_unique_canonical_corpus():
