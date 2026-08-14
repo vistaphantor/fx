@@ -7,7 +7,6 @@ import os
 import random
 import sys
 import time
-from dataclasses import asdict
 from pathlib import Path
 
 import torch
@@ -17,11 +16,19 @@ project_root = Path(__file__).resolve().parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
+from corpus.streamer import CorpusStreamer
 from src.language.curriculum import CURRICULUM_STAGES, select_curriculum
 from src.language.data_pipeline import build_tokenizer_training_sample, load_all_training_text
 from src.language.exam import EpochExamResult, run_epoch_exam, save_epoch_exam
 from src.language.model_bundle import load_model_bundle, save_model_bundle
 from src.language.pytorch_transformer import VistaReasoningGPT
+from src.language.streaming_sources import (
+    HFSourceSpec,
+    build_training_stream,
+    load_hf_source_config,
+    sample_training_stream,
+    specs_fingerprint,
+)
 from src.language.tokenizer import BPETokenizer, TOKENIZER_ALGORITHM_VERSION
 from src.language.training_pipeline import (
     PackedSequenceDataset,
@@ -32,8 +39,8 @@ from src.language.training_pipeline import (
     split_fingerprint,
 )
 
-TRAINING_STATE_VERSION = 2
-PREFLIGHT_MANIFEST_VERSION = 2
+TRAINING_STATE_VERSION = 3
+PREFLIGHT_MANIFEST_VERSION = 3
 SEED = 42
 
 PROFILES = {
@@ -52,6 +59,8 @@ PROFILES = {
         "early_stop_patience": 5,
         "early_stop_min_delta": 0.003,
         "exam_max_new_tokens": 48,
+        "stream_steps_per_epoch": 256,
+        "hf_preflight_sample_examples": 1000,
     },
     "8m": {
         "vocab_size": 4096,
@@ -68,6 +77,8 @@ PROFILES = {
         "early_stop_patience": 3,
         "early_stop_min_delta": 0.005,
         "exam_max_new_tokens": 48,
+        "stream_steps_per_epoch": 1000,
+        "hf_preflight_sample_examples": 3000,
     },
     "15m": {
         "vocab_size": 8192,
@@ -84,6 +95,8 @@ PROFILES = {
         "early_stop_patience": 3,
         "early_stop_min_delta": 0.005,
         "exam_max_new_tokens": 48,
+        "stream_steps_per_epoch": 800,
+        "hf_preflight_sample_examples": 5000,
     },
 }
 
@@ -95,11 +108,23 @@ def _atomic_torch_save(payload: dict, path: Path) -> None:
     os.replace(temporary, path)
 
 
-def _atomic_json_save(payload: dict, path: Path) -> None:
+def _atomic_json_save(payload: object, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
     os.replace(temporary, path)
+
+
+def _stable_unique(texts: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for text in texts:
+        value = text.strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
 
 
 def _model_config(cfg: dict, tokenizer: BPETokenizer) -> dict:
@@ -136,12 +161,39 @@ def _epoch_loader(dataset: PackedSequenceDataset, *, batch_size: int, epoch: int
 
 
 def _validation_loader(dataset: PackedSequenceDataset, *, batch_size: int) -> DataLoader:
+    return DataLoader(dataset, batch_size=batch_size, shuffle=False, drop_last=False, num_workers=0)
+
+
+def _stream_loader(
+    *,
+    specs: tuple[HFSourceSpec, ...],
+    stage: str,
+    epoch: int,
+    train_texts: list[str],
+    tokenizer: BPETokenizer,
+    cfg: dict,
+    local_replay_weight: float,
+) -> DataLoader:
+    text_stream = build_training_stream(
+        specs=specs,
+        stage=stage,
+        seed=SEED + epoch * 100_003,
+        local_replay=train_texts,
+        local_weight=local_replay_weight,
+        repeat=True,
+    )
+    dataset = CorpusStreamer(
+        text_stream,
+        tokenizer,
+        seq_len=cfg["seq_len"],
+        seed=SEED + epoch,
+        shuffle_buffer_size=0,
+    )
     return DataLoader(
         dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        drop_last=False,
+        batch_size=cfg["batch_size"],
         num_workers=0,
+        drop_last=False,
     )
 
 
@@ -153,14 +205,18 @@ def _token_weighted_loss(
     optimizer: torch.optim.Optimizer | None = None,
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
     grad_clip: float = 1.0,
+    max_batches: int | None = None,
 ) -> float:
     training = optimizer is not None
     model.train(training)
     total_loss = 0.0
     total_tokens = 0
+    batches = 0
     context = torch.enable_grad() if training else torch.no_grad()
     with context:
         for x, y in loader:
+            if max_batches is not None and batches >= max_batches:
+                break
             valid_tokens = int((y != pad_id).sum().item())
             if valid_tokens <= 0:
                 continue
@@ -168,9 +224,7 @@ def _token_weighted_loss(
                 optimizer.zero_grad(set_to_none=True)
             _, loss = model(x, targets=y, pad_id=pad_id)
             if loss is None or not torch.isfinite(loss):
-                raise RuntimeError(
-                    "non_finite_training_loss" if training else "non_finite_validation_loss"
-                )
+                raise RuntimeError("non_finite_training_loss" if training else "non_finite_validation_loss")
             if training:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -179,8 +233,11 @@ def _token_weighted_loss(
                     scheduler.step()
             total_loss += float(loss.item()) * valid_tokens
             total_tokens += valid_tokens
+            batches += 1
     if total_tokens <= 0:
         raise RuntimeError("no_non_padding_tokens_seen")
+    if max_batches is not None and batches < max_batches:
+        raise RuntimeError(f"stream_ended_before_epoch_budget:{batches}<{max_batches}")
     return total_loss / total_tokens
 
 
@@ -193,6 +250,42 @@ def _normalize_stage(value: str) -> str:
     return stage
 
 
+def _load_or_sample_hf(
+    *,
+    specs: tuple[HFSourceSpec, ...],
+    stage: str,
+    limit: int,
+    sample_path: Path,
+    metadata_path: Path,
+) -> tuple[list[str], str]:
+    fingerprint = specs_fingerprint(specs)
+    expected = {
+        "config_fingerprint": fingerprint,
+        "stage": stage,
+        "limit": int(limit),
+    }
+    if sample_path.exists() or metadata_path.exists():
+        if not sample_path.exists() or not metadata_path.exists():
+            raise RuntimeError("incomplete_hf_preflight_sample_cache")
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if metadata != expected:
+            raise RuntimeError("hf_preflight_sample_contract_mismatch:delete_bundle_.training_hf_sample")
+        sample = json.loads(sample_path.read_text(encoding="utf-8"))
+        if not isinstance(sample, list) or not sample:
+            raise RuntimeError("cached_hf_preflight_sample_invalid")
+        return [str(value) for value in sample], fingerprint
+
+    sample = sample_training_stream(
+        specs=specs,
+        stage=stage,
+        limit=limit,
+        seed=SEED,
+    )
+    _atomic_json_save(sample, sample_path)
+    _atomic_json_save(expected, metadata_path)
+    return sample, fingerprint
+
+
 def _static_preflight_contract(
     *,
     profile: str,
@@ -202,6 +295,8 @@ def _static_preflight_contract(
     curriculum_hash: str,
     split_hash: str,
     lineage_fingerprint: str | None,
+    hf_fingerprint: str | None,
+    stream_steps_per_epoch: int | None,
 ) -> dict:
     return {
         "preflight_manifest_version": PREFLIGHT_MANIFEST_VERSION,
@@ -215,6 +310,8 @@ def _static_preflight_contract(
         "curriculum_fingerprint": curriculum_hash,
         "split_fingerprint": split_hash,
         "lineage_tokenizer_fingerprint": lineage_fingerprint,
+        "hf_sources_fingerprint": hf_fingerprint,
+        "stream_steps_per_epoch": stream_steps_per_epoch,
     }
 
 
@@ -262,10 +359,8 @@ def _load_or_prepare_tokenizer(
         if saved.get("tokenizer_fingerprint") != tokenizer.fingerprint():
             raise RuntimeError("preflight_tokenizer_fingerprint_mismatch")
         return tokenizer, True
-
     if preflight_path.exists():
         raise RuntimeError("preflight_manifest_exists_without_tokenizer")
-
     if lineage_tokenizer is not None:
         tokenizer = lineage_tokenizer
         tokenizer.save(tokenizer_path)
@@ -291,6 +386,8 @@ def _checkpoint_contract(
     curriculum_hash: str,
     split_hash: str,
     lineage_fingerprint: str | None,
+    hf_fingerprint: str | None,
+    stream_steps_per_epoch: int | None,
 ) -> dict:
     return {
         "training_state_version": TRAINING_STATE_VERSION,
@@ -302,6 +399,8 @@ def _checkpoint_contract(
         "curriculum_fingerprint": curriculum_hash,
         "split_fingerprint": split_hash,
         "lineage_tokenizer_fingerprint": lineage_fingerprint,
+        "hf_sources_fingerprint": hf_fingerprint,
+        "stream_steps_per_epoch": stream_steps_per_epoch,
     }
 
 
@@ -319,24 +418,33 @@ def _print_budget(
     tokenizer: BPETokenizer,
     train_texts: list[str],
     epochs: int,
+    batch_size: int,
+    seq_len: int,
+    stream_steps_per_epoch: int | None,
 ) -> dict:
     parameter_count = model.get_num_params()
     raw_tokens = _raw_training_tokens(train_texts, tokenizer)
-    packed_per_epoch = report.train_prediction_tokens
-    planned = packed_per_epoch * epochs
+    if stream_steps_per_epoch is None:
+        tokens_per_epoch = report.train_prediction_tokens
+        mode = "finite"
+    else:
+        tokens_per_epoch = stream_steps_per_epoch * batch_size * seq_len
+        mode = "streaming"
+    planned = tokens_per_epoch * epochs
     raw_ratio = raw_tokens / max(parameter_count, 1)
     planned_ratio = planned / max(parameter_count, 1)
     print(
-        f"[Budget] params={parameter_count:,} raw_canonical_tokens={raw_tokens:,} "
-        f"packed_tokens/epoch={packed_per_epoch:,} planned_token_updates={planned:,} "
-        f"raw_tokens_per_param={raw_ratio:.3f} planned_tokens_per_param={planned_ratio:.3f}"
+        f"[Budget] mode={mode} params={parameter_count:,} preflight_unique_tokens={raw_tokens:,} "
+        f"planned_tokens/epoch={tokens_per_epoch:,} planned_token_updates={planned:,} "
+        f"preflight_tokens_per_param={raw_ratio:.3f} planned_tokens_per_param={planned_ratio:.3f}"
     )
     return {
+        "training_mode": mode,
         "parameter_count": parameter_count,
-        "raw_canonical_training_tokens": raw_tokens,
-        "train_prediction_tokens_per_epoch": packed_per_epoch,
+        "preflight_unique_training_tokens": raw_tokens,
+        "planned_training_tokens_per_epoch": tokens_per_epoch,
         "planned_token_updates": planned,
-        "raw_training_tokens_per_parameter": raw_ratio,
+        "preflight_training_tokens_per_parameter": raw_ratio,
         "planned_prediction_tokens_per_parameter": planned_ratio,
     }
 
@@ -363,11 +471,7 @@ def _run_and_save_exam(
         validation_loss=val_loss,
         max_new_tokens=max_new_tokens,
     )
-    text_path, _ = save_epoch_exam(
-        result=result,
-        exams_dir=exams_dir,
-        previous=previous,
-    )
+    text_path, _ = save_epoch_exam(result=result, exams_dir=exams_dir, previous=previous)
     print(
         f"[Exam] epoch={epoch} correct={result.correct_questions}/{result.total_questions} "
         f"score={result.correctness_percent:.1f}% quality={result.mean_quality_percent:.1f}% "
@@ -377,7 +481,7 @@ def _run_and_save_exam(
     if epoch >= 2 and result.correct_questions == 0 and result.gibberish_answers == result.total_questions:
         print(
             "[Exam] ALERT: every answer is still incorrect and gibberish after at least two epochs. "
-            "Inspect the exam file before spending more CPU time."
+            "Inspect the exam before spending more CPU time."
         )
     return result
 
@@ -402,6 +506,10 @@ def main() -> None:
     parser.add_argument("--bundle-dir", default=None)
     parser.add_argument("--training-stage", default="foundation")
     parser.add_argument("--init-bundle", default=None)
+    parser.add_argument("--hf-config", default=None)
+    parser.add_argument("--hf-sample-examples", type=int, default=None)
+    parser.add_argument("--stream-steps-per-epoch", type=int, default=None)
+    parser.add_argument("--local-replay-weight", type=float, default=0.25)
     parser.add_argument("--threads", type=int, default=max(1, min(4, os.cpu_count() or 2)))
     parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument("--resume", action="store_true")
@@ -419,6 +527,8 @@ def main() -> None:
             "val_split": 0.05,
         }
     )
+    if args.local_replay_weight <= 0:
+        raise ValueError("--local-replay-weight must be positive")
 
     torch.manual_seed(SEED)
     random.seed(SEED)
@@ -433,15 +543,43 @@ def main() -> None:
     state_path = work_dir / "training_state.pt"
     best_model_path = work_dir / "best_model.pt"
     exams_dir = bundle_dir / "exams"
+    hf_sample_path = work_dir / "hf_preflight_sample.json"
+    hf_sample_meta_path = work_dir / "hf_preflight_sample_meta.json"
 
-    all_texts = load_all_training_text(
+    local_texts = load_all_training_text(
         data_root=Path(args.data_root),
         max_examples=cfg["max_examples"],
         shuffle=False,
         seed=SEED,
     )
+
+    hf_specs: tuple[HFSourceSpec, ...] = ()
+    hf_sample: list[str] = []
+    hf_fingerprint: str | None = None
+    stream_steps_per_epoch: int | None = None
+    if args.hf_config:
+        hf_specs = load_hf_source_config(args.hf_config)
+        sample_limit = args.hf_sample_examples or cfg["hf_preflight_sample_examples"]
+        hf_sample, hf_fingerprint = _load_or_sample_hf(
+            specs=hf_specs,
+            stage=stage,
+            limit=sample_limit,
+            sample_path=hf_sample_path,
+            metadata_path=hf_sample_meta_path,
+        )
+        stream_steps_per_epoch = args.stream_steps_per_epoch or cfg["stream_steps_per_epoch"]
+        if stream_steps_per_epoch <= 0:
+            raise ValueError("--stream-steps-per-epoch must be positive")
+        print(
+            f"[HF] sources={len(hf_specs)} preflight_sample={len(hf_sample):,} "
+            f"steps_per_epoch={stream_steps_per_epoch:,} fingerprint={hf_fingerprint[:12]}"
+        )
+    elif args.stream_steps_per_epoch is not None:
+        raise RuntimeError("--stream-steps-per-epoch_requires_--hf-config")
+
+    all_texts = _stable_unique(local_texts + hf_sample)
     if not all_texts:
-        raise SystemExit("No training data found")
+        raise SystemExit("No local or HF training data found")
 
     selection = select_curriculum(all_texts, stage=stage, seed=SEED)
     texts = selection.texts
@@ -478,6 +616,8 @@ def main() -> None:
         curriculum_hash=curriculum_hash,
         split_hash=split_hash,
         lineage_fingerprint=lineage_fingerprint,
+        hf_fingerprint=hf_fingerprint,
+        stream_steps_per_epoch=stream_steps_per_epoch,
     )
     tokenizer, reused = _load_or_prepare_tokenizer(
         tokenizer_path=tokenizer_path,
@@ -487,14 +627,12 @@ def main() -> None:
         cfg=cfg,
         lineage_tokenizer=lineage_tokenizer,
     )
-    print(
-        f"[Tokenizer] verified_reuse={str(reused).lower()} fingerprint={tokenizer.fingerprint()}"
-    )
+    print(f"[Tokenizer] verified_reuse={str(reused).lower()} fingerprint={tokenizer.fingerprint()}")
 
     train_sequences = build_example_sequences(train_texts, tokenizer, seq_len=cfg["seq_len"])
     val_sequences = build_example_sequences(val_texts, tokenizer, seq_len=cfg["seq_len"])
     print(
-        f"[Packing] train_sequences={len(train_sequences):,} "
+        f"[Packing] preflight_train_sequences={len(train_sequences):,} "
         f"val_sequences={len(val_sequences):,} seq_len={cfg['seq_len']}"
     )
 
@@ -539,27 +677,41 @@ def main() -> None:
         tokenizer=tokenizer,
         train_texts=train_texts,
         epochs=cfg["epochs"],
+        batch_size=cfg["batch_size"],
+        seq_len=cfg["seq_len"],
+        stream_steps_per_epoch=stream_steps_per_epoch,
     )
-    data_starved = budget["raw_training_tokens_per_parameter"] < 1.0
-    if stage == "foundation" and args.profile != "smoke" and data_starved:
-        print(
-            "[Budget] BLOCK: foundation corpus has fewer than 1.0 raw canonical training token "
-            "per model parameter. This is a conservative no-waste guardrail, not an optimality claim."
-        )
-        if not args.preflight_only and not args.allow_data_starved:
-            raise RuntimeError(
-                "foundation_training_blocked_by_data_budget:add_corpus_or_explicitly_use_--allow-data-starved"
+    if stage == "foundation" and args.profile != "smoke":
+        if stream_steps_per_epoch is None:
+            starved = budget["preflight_training_tokens_per_parameter"] < 1.0
+        else:
+            starved = budget["planned_prediction_tokens_per_parameter"] < 1.0
+        if starved:
+            print(
+                "[Budget] BLOCK: configured training exposure is below the conservative no-waste floor."
             )
+            if not args.preflight_only and not args.allow_data_starved:
+                raise RuntimeError(
+                    "foundation_training_blocked_by_data_budget:add_data_or_increase_stream_steps"
+                )
 
     if args.preflight_only:
         print("[Preflight] Full training intentionally not started. Verified artifacts are reusable.")
         return
 
-    train_ds = PackedSequenceDataset(train_sequences, cfg["seq_len"], tokenizer.pad_id())
+    finite_train_ds = (
+        None
+        if hf_specs
+        else PackedSequenceDataset(train_sequences, cfg["seq_len"], tokenizer.pad_id())
+    )
     val_ds = PackedSequenceDataset(val_sequences, cfg["seq_len"], tokenizer.pad_id())
     val_loader = _validation_loader(val_ds, batch_size=cfg["batch_size"])
     optimizer = _new_optimizer(model, cfg)
-    steps_per_epoch = math.ceil(len(train_ds) / cfg["batch_size"])
+    if hf_specs:
+        steps_per_epoch = int(stream_steps_per_epoch)
+    else:
+        assert finite_train_ds is not None
+        steps_per_epoch = math.ceil(len(finite_train_ds) / cfg["batch_size"])
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=max(1, steps_per_epoch * cfg["epochs"]),
@@ -574,6 +726,8 @@ def main() -> None:
         curriculum_hash=curriculum_hash,
         split_hash=split_hash,
         lineage_fingerprint=lineage_fingerprint,
+        hf_fingerprint=hf_fingerprint,
+        stream_steps_per_epoch=stream_steps_per_epoch,
     )
     start_epoch = 0
     best_val = float("inf")
@@ -625,25 +779,41 @@ def main() -> None:
         )
 
     started = time.time()
-
     for epoch in range(start_epoch, cfg["epochs"]):
         epoch_started = time.time()
-        train_loss = _token_weighted_loss(
-            model,
-            _epoch_loader(train_ds, batch_size=cfg["batch_size"], epoch=epoch),
-            pad_id=tokenizer.pad_id(),
-            optimizer=optimizer,
-            scheduler=scheduler,
-            grad_clip=cfg["grad_clip"],
-        )
-        val_loss = _token_weighted_loss(
-            model,
-            val_loader,
-            pad_id=tokenizer.pad_id(),
-        )
+        if hf_specs:
+            train_loader = _stream_loader(
+                specs=hf_specs,
+                stage=stage,
+                epoch=epoch,
+                train_texts=train_texts,
+                tokenizer=tokenizer,
+                cfg=cfg,
+                local_replay_weight=args.local_replay_weight,
+            )
+            train_loss = _token_weighted_loss(
+                model,
+                train_loader,
+                pad_id=tokenizer.pad_id(),
+                optimizer=optimizer,
+                scheduler=scheduler,
+                grad_clip=cfg["grad_clip"],
+                max_batches=steps_per_epoch,
+            )
+        else:
+            assert finite_train_ds is not None
+            train_loss = _token_weighted_loss(
+                model,
+                _epoch_loader(finite_train_ds, batch_size=cfg["batch_size"], epoch=epoch),
+                pad_id=tokenizer.pad_id(),
+                optimizer=optimizer,
+                scheduler=scheduler,
+                grad_clip=cfg["grad_clip"],
+            )
+
+        val_loss = _token_weighted_loss(model, val_loader, pad_id=tokenizer.pad_id())
         last_train_loss = train_loss
         last_val_loss = val_loss
-
         improved = val_loss < (best_val - cfg["early_stop_min_delta"])
         if improved:
             best_val = val_loss
@@ -659,8 +829,6 @@ def main() -> None:
         else:
             epochs_without_improvement += 1
 
-        # Save the resumable epoch before the exam. If an exam crashes, no
-        # completed epoch is lost; --resume will regenerate the missing exam.
         state_payload = {
             **contract,
             "epoch_completed": epoch + 1,
@@ -687,7 +855,6 @@ def main() -> None:
             max_new_tokens=cfg["exam_max_new_tokens"],
         )
         previous_exam = current_exam
-
         state_payload["last_exam"] = _exam_payload(current_exam)
         _atomic_torch_save(state_payload, state_path)
 
@@ -697,7 +864,6 @@ def main() -> None:
             f"params={model.get_num_params()/1e6:.2f}M "
             f"epoch_seconds={time.time() - epoch_started:.1f} checkpoint=saved exam=saved"
         )
-
         if epochs_without_improvement >= cfg["early_stop_patience"]:
             print(
                 f"[EarlyStop] no validation improvement >= {cfg['early_stop_min_delta']:.4f} "
@@ -719,7 +885,10 @@ def main() -> None:
         "training_seconds_this_run": time.time() - started,
         "profile": args.profile,
         "training_stage": stage,
-        "source_examples": len(all_texts),
+        "local_source_examples": len(local_texts),
+        "hf_preflight_examples": len(hf_sample),
+        "hf_sources_fingerprint": hf_fingerprint,
+        "stream_steps_per_epoch": stream_steps_per_epoch,
         "curriculum_examples": len(texts),
         "trading_examples_available": selection.trading_available,
         "reasoning_examples_available": selection.reasoning_available,
@@ -727,7 +896,7 @@ def main() -> None:
         "replay_examples": selection.replay_examples,
         "training_examples": len(train_texts),
         "validation_examples": len(val_texts),
-        "train_sequences": len(train_sequences),
+        "preflight_train_sequences": len(train_sequences),
         "validation_sequences": len(val_sequences),
         "family_isolated_validation": True,
         "example_aware_packing": True,
