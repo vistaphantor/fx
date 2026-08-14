@@ -130,8 +130,8 @@ class CorpusStreamer(IterableDataset):
 
         x, y, _ = build_loss_targets(
             sequence,
-            self.tokenizer,
             seq_len=self.seq_len,
+            pad_id=self.tokenizer.pad_id(),
         )
         return torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long)
 
