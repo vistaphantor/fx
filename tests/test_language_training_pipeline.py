@@ -68,7 +68,7 @@ def test_long_example_is_chunked_without_crossing_other_examples():
     assert all("Short?" not in text for text in long_chunks)
 
 
-def test_packed_dataset_masks_prompt_and_supervises_assistant():
+def test_packed_dataset_masks_prompt_and_seeded_assistant_opener():
     tok = _tokenizer()
     sequences = build_example_sequences(
         ["<bos><user>A?</user><assistant>A.</assistant><eos>"],
@@ -79,14 +79,16 @@ def test_packed_dataset_masks_prompt_and_supervises_assistant():
     x, y = dataset[0]
     assert tuple(x.shape) == (32,)
     assert tuple(y.shape) == (32,)
-    # <user> and its prompt are context, not gradient targets.
     assert y[0].item() == tok.pad_id()
     assistant_id = tok.vocab["<assistant>"]
     assistant_target_positions = [
         index - 1 for index, token in enumerate(sequences[0]) if token == assistant_id
     ]
     assert assistant_target_positions
-    assert all(y[position].item() == assistant_id for position in assistant_target_positions)
+    assert all(y[position].item() == tok.pad_id() for position in assistant_target_positions)
+    # The first assistant-content token immediately after the role marker is supervised.
+    assistant_index = sequences[0].index(assistant_id)
+    assert y[assistant_index].item() != tok.pad_id()
 
 
 def test_preflight_proves_roundtrip_alignment_and_learning():
