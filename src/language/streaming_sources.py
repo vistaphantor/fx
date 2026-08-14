@@ -23,6 +23,8 @@ class HFSourceSpec:
     config_name: str | None = None
     revision: str | None = None
     text_fields: tuple[str, ...] | None = None
+    prompt_field: str | None = None
+    response_field: str | None = None
     max_examples: int | None = None
     shuffle_buffer_size: int = 10_000
 
@@ -47,17 +49,11 @@ class CanonicalMemorySource(DatasetSource):
 
 
 def stream_quality_accepts(text: str) -> bool:
-    """Compatibility name for the single authoritative corpus quality gate."""
     return LANGUAGE_QUALITY_FILTER.accepts(text)
 
 
 class GuardedSource(DatasetSource):
-    """Canonicalize, quality-filter, near-deduplicate and enforce holdouts.
-
-    Raw HF sources are classified per example for the active specialist stage.
-    Local replay has already been selected by `select_curriculum`, so it must
-    not be stage-filtered again or the anti-forgetting replay is erased.
-    """
+    """Canonicalize, quality-filter, near-deduplicate and enforce holdouts."""
 
     def __init__(
         self,
@@ -145,12 +141,21 @@ def _parse_spec(payload: dict) -> HFSourceSpec:
     invalid = set(stages).difference(allowed)
     if invalid:
         raise ValueError(f"hf_source_invalid_stages:{path}:{','.join(sorted(invalid))}")
+
     text_fields_payload = payload.get("text_fields")
     text_fields = None
     if text_fields_payload is not None:
         if not isinstance(text_fields_payload, list) or not text_fields_payload:
             raise ValueError(f"hf_source_text_fields_invalid:{path}")
         text_fields = tuple(str(value) for value in text_fields_payload)
+
+    prompt_field = str(payload["prompt_field"]).strip() if payload.get("prompt_field") else None
+    response_field = str(payload["response_field"]).strip() if payload.get("response_field") else None
+    if bool(prompt_field) != bool(response_field):
+        raise ValueError(f"hf_source_prompt_response_fields_must_be_paired:{path}")
+    if text_fields and prompt_field:
+        raise ValueError(f"hf_source_document_and_chat_mapping_conflict:{path}")
+
     max_examples = payload.get("max_examples")
     if max_examples is not None:
         max_examples = int(max_examples)
@@ -170,6 +175,8 @@ def _parse_spec(payload: dict) -> HFSourceSpec:
         config_name=(str(payload["config_name"]) if payload.get("config_name") else None),
         revision=revision,
         text_fields=text_fields,
+        prompt_field=prompt_field,
+        response_field=response_field,
         max_examples=max_examples,
         shuffle_buffer_size=buffer_size,
     )
@@ -196,6 +203,8 @@ def specs_fingerprint(specs: Sequence[HFSourceSpec]) -> str:
             "config_name": spec.config_name,
             "revision": spec.revision,
             "text_fields": list(spec.text_fields) if spec.text_fields else None,
+            "prompt_field": spec.prompt_field,
+            "response_field": spec.response_field,
             "max_examples": spec.max_examples,
             "shuffle_buffer_size": spec.shuffle_buffer_size,
         }
@@ -205,11 +214,13 @@ def specs_fingerprint(specs: Sequence[HFSourceSpec]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _hf_source(spec: HFSourceSpec, *, seed: int) -> HFSource:
+def hf_source_from_spec(spec: HFSourceSpec, *, seed: int) -> HFSource:
     return HFSource(
         path=spec.path,
         split=spec.split,
         text_fields=list(spec.text_fields) if spec.text_fields else None,
+        prompt_field=spec.prompt_field,
+        response_field=spec.response_field,
         max_examples=spec.max_examples,
         config_name=spec.config_name,
         revision=spec.revision,
@@ -243,7 +254,7 @@ def build_training_stream(
     for index, spec in enumerate(selected):
         sources.append((
             GuardedSource(
-                _hf_source(spec, seed=seed + index * 997),
+                hf_source_from_spec(spec, seed=seed + index * 997),
                 stage=stage,
                 excluded_hashes=excluded_hashes,
                 excluded_families=excluded_families,
