@@ -105,4 +105,33 @@ def test_repetitive_gibberish_is_visible_in_exam_result():
     )
     assert result.correct_questions == 0
     assert result.gibberish_answers == result.total_questions
-    assert all("high_repetition" in answer.gibberish_flags for answer in result.answers)
+    assert all("high_word_repetition" in answer.gibberish_flags for answer in result.answers)
+
+
+def test_concatenated_subword_loops_are_gibberish():
+    tokenizer = _tokenizer()
+    loops = {
+        question.prompt: "parkparkparkparkparkparklesslesslesslesslessless"
+        for question in FOUNDATION_EXAM
+    }
+    model = _ScriptedModel(tokenizer, loops)
+    result = run_epoch_exam(
+        model=model,  # type: ignore[arg-type]
+        tokenizer=tokenizer,
+        epoch=0,
+        training_stage="foundation",
+        train_loss=None,
+        validation_loss=None,
+        max_new_tokens=32,
+    )
+    assert result.correct_questions == 0
+    assert result.gibberish_answers == result.total_questions
+    assert result.training_signal == "GIBBERISH"
+    assert all(
+        any(
+            flag in answer.gibberish_flags
+            for flag in ("high_character_repetition", "periodic_repetition", "run_on_fragment")
+        )
+        for answer in result.answers
+    )
+    assert result.mean_quality_percent < 50.0
