@@ -1,34 +1,41 @@
 {
   "sources": [
     {
-      "path": "ORG_OR_USER/DATASET_NAME",
-      "revision": "PIN_A_DATASET_COMMIT_SHA_OR_TAG",
+      "path": "ORG_OR_USER/FOUNDATION_DOCUMENT_DATASET",
+      "revision": "PIN_IMMUTABLE_DATASET_COMMIT_SHA",
       "split": "train",
       "weight": 1.0,
       "stages": [
         "foundation"
       ],
+      "text_fields": [
+        "text"
+      ],
       "shuffle_buffer_size": 10000
     },
     {
-      "path": "ORG_OR_USER/REASONING_DATASET",
-      "revision": "PIN_A_DATASET_COMMIT_SHA_OR_TAG",
+      "path": "ORG_OR_USER/REASONING_QA_DATASET",
+      "revision": "PIN_IMMUTABLE_DATASET_COMMIT_SHA",
       "split": "train",
       "weight": 1.0,
       "stages": [
         "reasoning",
         "trading_reasoning"
       ],
+      "prompt_field": "question",
+      "response_field": "answer",
       "shuffle_buffer_size": 10000
     },
     {
-      "path": "ORG_OR_USER/TRADING_DATASET",
-      "revision": "PIN_A_DATASET_COMMIT_SHA_OR_TAG",
+      "path": "ORG_OR_USER/TRADING_QA_DATASET",
+      "revision": "PIN_IMMUTABLE_DATASET_COMMIT_SHA",
       "split": "train",
       "weight": 2.0,
       "stages": [
         "trading_reasoning"
       ],
+      "prompt_field": "instruction",
+      "response_field": "output",
       "shuffle_buffer_size": 10000
     }
   ]
