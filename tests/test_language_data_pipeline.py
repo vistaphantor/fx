@@ -7,6 +7,7 @@ from src.language.data_pipeline import (
     _example_from_embedded_object,
     _parse_source_example,
     build_tokenizer_training_sample,
+    load_all_training_text,
     serialize_training_example,
 )
 
@@ -63,6 +64,39 @@ def test_tokenizer_sample_uses_real_newlines():
     )
     assert "\n<sep>\n" in sample
     assert r"\n<sep>\n" not in sample
+
+
+def test_tokenizer_sample_preserves_complete_structural_examples():
+    examples = [
+        "<bos>\n<user>\nOne?\n</user>\n<assistant>\nOne.\n</assistant>\n<eos>",
+        "<bos>\n<user>\nTwo?\n</user>\n<assistant>\nTwo.\n</assistant>\n<eos>",
+    ]
+    sample = build_tokenizer_training_sample(examples, max_chars=len(examples[0]) + 5, seed=1)
+    pieces = sample.split("\n<sep>\n")
+    assert pieces
+    for piece in pieces:
+        assert piece.startswith("<bos>\n")
+        assert piece.endswith("\n<eos>")
+        assert piece.count("<user>") == piece.count("</user>") == 1
+        assert piece.count("<assistant>") == piece.count("</assistant>") == 1
+
+
+def test_jsonl_training_records_are_loaded_without_losing_later_rows(tmp_path):
+    path = tmp_path / "records.jsonl"
+    path.write_text(
+        "\n".join(
+            [
+                json.dumps({"question": "What is ATR?", "answer": "ATR measures range."}),
+                "{not valid json}",
+                json.dumps({"instruction": "Define bullish.", "output": "Bullish means upward bias."}),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    texts = load_all_training_text(tmp_path, shuffle=False)
+    assert len(texts) == 2
+    assert any("What is ATR?" in text for text in texts)
+    assert any("Define bullish." in text for text in texts)
 
 
 def test_serializer_has_single_canonical_grammar():
