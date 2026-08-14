@@ -177,14 +177,14 @@ DEFAULT_STAGE_TOKENS_PER_PARAMETER = {
     "trading_reasoning": 8.0,
 }
 
-# Foundation is deliberately pure language-model pretraining when an HF
-# foundation source is configured. Mixing the local math/reasoning corpus into
-# TinyStories produced the observed baby/cream <-> equation/LaTeX attractors.
-# Protocol/reasoning replay begins only after the language foundation exists.
+# Vista language training is stream-only. Local corpus replay is deliberately
+# disabled at every stage so deleted/stale local datasets cannot contaminate a
+# new tokenizer, validation split, or training lineage. Stage knowledge must be
+# supplied by pinned, audited streaming sources in config/hf_sources.json.
 DEFAULT_LOCAL_REPLAY_WEIGHTS = {
     "foundation": 0.0,
-    "reasoning": 0.25,
-    "trading_reasoning": 0.35,
+    "reasoning": 0.0,
+    "trading_reasoning": 0.0,
 }
 
 
