@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import json
 import random
-import sys
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
@@ -9,17 +9,16 @@ from typing import TYPE_CHECKING, Optional
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from corpus.auditor import CorpusAuditor, classify_text
+from corpus.auditor import CorpusAuditor
 from corpus.checkpoint import IndexCheckpoint
 from corpus.dashboard import CorpusDashboard
 from corpus.dedup import Deduplicator
 from corpus.discovery import DatasetDiscovery
-from corpus.normalizer import TextNormalizer
 from corpus.quality import QualityFilter
 from corpus.registry import CorpusRegistry, DatasetRecord, file_sha256
 from corpus.shard import ShardWriter, get_tokenizer_fingerprint
 from corpus.source import DatasetSource, HFSource, LocalSource
-from corpus.streamer import ShardDataset, CorpusStreamer
+from corpus.streamer import ShardDataset
 
 if TYPE_CHECKING:
     from src.language.tokenizer import BPETokenizer
@@ -78,7 +77,6 @@ class CorpusManager:
         self.auditor = CorpusAuditor(target_tokens=target_tokens)
         self.quality = QualityFilter()
         self.dedup = Deduplicator()
-        self.normalizer = TextNormalizer()
         self.dashboard = CorpusDashboard()
         self.checkpoint = IndexCheckpoint(self.checkpoint_path)
 
@@ -119,7 +117,6 @@ class CorpusManager:
             )
             dataset_id = self.registry.upsert_dataset(record)
 
-            # Stream & process documents
             doc_offset = 0
             for raw_text in src.stream():
                 file_counter += 1
@@ -140,7 +137,6 @@ class CorpusManager:
                 text = dedup_res.kept[0]
                 self.cached_cleaned_texts.append(text)
 
-                tok_count = 0
                 if self.tokenizer:
                     tok_count = len(self.tokenizer.encode(text, add_bos=True, add_eos=True))
                 else:
@@ -160,7 +156,10 @@ class CorpusManager:
                 )
                 doc_offset += 1
 
-                self.checkpoint.update(files_processed=file_counter, tokens_processed=self.auditor.stats.total_tokens)
+                self.checkpoint.update(
+                    files_processed=file_counter,
+                    tokens_processed=self.auditor.stats.total_tokens,
+                )
 
         elapsed = time.time() - t0
         self.auditor.stats.duplicate_rate = duplicate_count / max(total_raw, 1)
@@ -173,7 +172,10 @@ class CorpusManager:
 
         self.registry.record_statistics(self.auditor.to_registry_dict())
         self.registry.export_json(self.json_export_path)
-        print(f"[CorpusManager] Indexing complete in {elapsed:.2f}s! ({self.auditor.stats.total_documents:,} docs, {self.auditor.stats.total_tokens:,} tokens)")
+        print(
+            f"[CorpusManager] Indexing complete in {elapsed:.2f}s! "
+            f"({self.auditor.stats.total_documents:,} docs, {self.auditor.stats.total_tokens:,} tokens)"
+        )
 
     def scan(self, force_reindex: bool = False) -> None:
         self.index(force_reindex=force_reindex)
@@ -225,7 +227,10 @@ class CorpusManager:
             )
 
         self.registry.export_json(self.json_export_path)
-        print(f"[CorpusManager] Build complete! Written {len(train_shards)} train shards and {len(val_shards)} val shards.")
+        print(
+            f"[CorpusManager] Build complete! Written {len(train_shards)} train shards "
+            f"and {len(val_shards)} val shards."
+        )
         return train_shards + val_shards
 
     def verify(self) -> bool:
@@ -244,22 +249,22 @@ class CorpusManager:
 
         train_shards = list(self.shard_dir.glob("train_*.bin"))
         val_shards = list(self.shard_dir.glob("val_*.bin"))
-        for s in train_shards + val_shards:
+        for shard in train_shards + val_shards:
             try:
-                hdr = ShardWriter.read_shard_header(s)
+                hdr = ShardWriter.read_shard_header(shard)
                 if hdr.seq_len != self.seq_len:
-                    print(f"❌ Sequence length mismatch in {s.name}")
+                    print(f"❌ Sequence length mismatch in {shard.name}")
                     return False
-            except Exception as e:
-                print(f"❌ Shard corruption detected in {s.name}: {e}")
+            except Exception as exc:
+                print(f"❌ Shard corruption detected in {shard.name}: {exc}")
                 return False
 
         print("✅ Integrity verification passed!")
         return True
 
     def status(self) -> None:
-        local_cnt = sum(1 for s in self.sources if isinstance(s, LocalSource))
-        hf_cnt = sum(1 for s in self.sources if isinstance(s, HFSource))
+        local_cnt = sum(1 for source in self.sources if isinstance(source, LocalSource))
+        hf_cnt = sum(1 for source in self.sources if isinstance(source, HFSource))
         self.dashboard.display(self.auditor.stats, local_sources=local_cnt, hf_sources=hf_cnt)
 
     def build_loaders(
@@ -272,16 +277,35 @@ class CorpusManager:
         val_shards = list(self.shard_dir.glob("val_*.bin"))
 
         if train_shards and val_shards:
-            print(f"[CorpusManager] Loading DataLoaders directly from {len(train_shards)} train and {len(val_shards)} val binary shards...")
+            print(
+                f"[CorpusManager] Loading DataLoaders directly from {len(train_shards)} train "
+                f"and {len(val_shards)} val binary shards..."
+            )
             train_ds = ShardDataset(train_shards)
             val_ds = ShardDataset(val_shards)
-            train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False, pin_memory=pin_memory)
-            val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, drop_last=False, pin_memory=pin_memory)
+            train_loader = DataLoader(
+                train_ds,
+                batch_size=batch_size,
+                shuffle=True,
+                drop_last=False,
+                pin_memory=pin_memory,
+                num_workers=num_workers,
+            )
+            val_loader = DataLoader(
+                val_ds,
+                batch_size=batch_size,
+                shuffle=False,
+                drop_last=False,
+                pin_memory=pin_memory,
+                num_workers=num_workers,
+            )
             return train_loader, val_loader
 
         print("[CorpusManager] Binary shards not found. Loading from memory chunks...")
         if not self.cached_cleaned_texts:
             self.index()
+        if self.tokenizer is None:
+            raise ValueError("BPETokenizer required for in-memory loader construction")
 
         texts = list(self.cached_cleaned_texts)
         random.seed(42)
@@ -292,7 +316,7 @@ class CorpusManager:
         val_texts = texts[split_idx:]
 
         def _chunk_texts(doc_list: list[str]) -> list[list[int]]:
-            chunks = []
+            chunks: list[list[int]] = []
             for text in doc_list:
                 ids = self.tokenizer.encode(text, add_bos=True, add_eos=True)
                 for start in range(0, len(ids) - 1, self.stride):
@@ -310,9 +334,22 @@ class CorpusManager:
         train_ds = SequenceDataset(train_chunks)
         val_ds = SequenceDataset(val_chunks)
 
-        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False, pin_memory=pin_memory)
-        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, drop_last=False, pin_memory=pin_memory)
-
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=batch_size,
+            shuffle=True,
+            drop_last=False,
+            pin_memory=pin_memory,
+            num_workers=num_workers,
+        )
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=batch_size,
+            shuffle=False,
+            drop_last=False,
+            pin_memory=pin_memory,
+            num_workers=num_workers,
+        )
         return train_loader, val_loader
 
     def loaders(
@@ -321,4 +358,8 @@ class CorpusManager:
         num_workers: int = 0,
         pin_memory: bool = False,
     ) -> tuple[DataLoader, DataLoader]:
-        return self.build_loaders(batch_size=batch_size, num_workers=num_workers, pin_memory=pin_memory)
+        return self.build_loaders(
+            batch_size=batch_size,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+        )
