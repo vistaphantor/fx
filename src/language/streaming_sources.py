@@ -8,6 +8,8 @@ from typing import Iterator, Sequence
 
 from corpus.source import DatasetSource, HFSource, SourceMetadata
 from corpus.streamer import WeightedSourceStream
+from src.language.canonical_contract import canonical_hash, canonicalize_serialized, prompt_family
+from src.language.curriculum import is_math_example, is_reasoning_example, is_trading_example
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,10 +26,8 @@ class HFSourceSpec:
 
 
 class CanonicalMemorySource(DatasetSource):
-    """Replay already-canonical local examples inside the weighted stream."""
-
     def __init__(self, texts: Sequence[str], *, source_name: str = "local_replay"):
-        self._texts = tuple(text for text in texts if text and text.strip())
+        self._texts = tuple(canonicalize_serialized(text) for text in texts if text and text.strip())
         self._source_name = source_name
 
     @property
@@ -35,21 +35,66 @@ class CanonicalMemorySource(DatasetSource):
         return f"memory:{self._source_name}"
 
     def scan(self) -> SourceMetadata:
-        return SourceMetadata(
-            source_type="memory",
-            path=self.source_id,
-            estimated_docs=len(self._texts),
-        )
+        return SourceMetadata(source_type="memory", path=self.source_id, estimated_docs=len(self._texts))
 
     def stream(self) -> Iterator[str]:
         yield from self._texts
 
     def metadata(self) -> dict:
-        return {
-            "source_type": "memory",
-            "source_name": self._source_name,
-            "examples": len(self._texts),
-        }
+        return {"source_type": "memory", "source_name": self._source_name, "examples": len(self._texts)}
+
+
+class GuardedSource(DatasetSource):
+    """Canonicalize, deduplicate, enforce curriculum and exclude holdout families."""
+
+    def __init__(
+        self,
+        source: DatasetSource,
+        *,
+        stage: str,
+        excluded_hashes: frozenset[str] = frozenset(),
+        excluded_families: frozenset[str] = frozenset(),
+    ):
+        self._source = source
+        self._stage = stage.strip().casefold()
+        self._excluded_hashes = excluded_hashes
+        self._excluded_families = excluded_families
+
+    @property
+    def source_id(self) -> str:
+        return f"guarded:{self._source.source_id}:{self._stage}"
+
+    def scan(self) -> SourceMetadata:
+        return self._source.scan()
+
+    def metadata(self) -> dict:
+        return {**self._source.metadata(), "guarded_stage": self._stage}
+
+    def _stage_accepts(self, text: str) -> bool:
+        if self._stage == "foundation":
+            return True
+        if self._stage == "reasoning":
+            return is_reasoning_example(text) or is_math_example(text)
+        if self._stage == "trading_reasoning":
+            return is_trading_example(text)
+        raise ValueError(f"unsupported_training_stage:{self._stage}")
+
+    def stream(self) -> Iterator[str]:
+        seen: set[str] = set()
+        for raw in self._source.stream():
+            text = canonicalize_serialized(raw)
+            if not text:
+                continue
+            digest = canonical_hash(text)
+            if digest in seen or digest in self._excluded_hashes:
+                continue
+            family = prompt_family(text)
+            if family and family in self._excluded_families:
+                continue
+            if not self._stage_accepts(text):
+                continue
+            seen.add(digest)
+            yield text
 
 
 def _parse_spec(payload: dict) -> HFSourceSpec:
@@ -82,6 +127,8 @@ def _parse_spec(payload: dict) -> HFSourceSpec:
     if buffer_size < 0:
         raise ValueError(f"hf_source_shuffle_buffer_invalid:{path}")
     revision = str(payload["revision"]).strip() if payload.get("revision") else None
+    if not revision:
+        raise ValueError(f"hf_source_revision_required:{path}")
     return HFSourceSpec(
         path=path,
         weight=weight,
@@ -96,14 +143,8 @@ def _parse_spec(payload: dict) -> HFSourceSpec:
 
 
 def load_hf_source_config(path: str | Path) -> tuple[HFSourceSpec, ...]:
-    config_path = Path(path)
-    payload = json.loads(config_path.read_text(encoding="utf-8"))
-    if isinstance(payload, dict):
-        raw_sources = payload.get("sources", [])
-    elif isinstance(payload, list):
-        raw_sources = payload
-    else:
-        raise ValueError("hf_config_must_be_list_or_sources_object")
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    raw_sources = payload.get("sources", []) if isinstance(payload, dict) else payload if isinstance(payload, list) else None
     if not isinstance(raw_sources, list) or not raw_sources:
         raise ValueError("hf_config_contains_no_sources")
     specs = tuple(_parse_spec(item) for item in raw_sources if isinstance(item, dict))
@@ -120,7 +161,7 @@ def specs_fingerprint(specs: Sequence[HFSourceSpec]) -> str:
             "stages": list(spec.stages),
             "split": spec.split,
             "config_name": spec.config_name,
-            "revision": spec.revision or "main",
+            "revision": spec.revision,
             "text_fields": list(spec.text_fields) if spec.text_fields else None,
             "max_examples": spec.max_examples,
             "shuffle_buffer_size": spec.shuffle_buffer_size,
@@ -159,17 +200,31 @@ def build_training_stream(
     seed: int,
     local_replay: Sequence[str] = (),
     local_weight: float = 0.25,
+    excluded_texts: Sequence[str] = (),
     repeat: bool = True,
 ) -> WeightedSourceStream:
     selected = stage_specs(specs, stage)
-    sources: list[tuple[DatasetSource, float]] = [
-        (_hf_source(spec, seed=seed + index * 997), spec.weight)
-        for index, spec in enumerate(selected)
-    ]
+    excluded_hashes = frozenset(canonical_hash(text) for text in excluded_texts if text and text.strip())
+    excluded_families = frozenset(prompt_family(text) for text in excluded_texts if text and text.strip())
+    sources: list[tuple[DatasetSource, float]] = []
+    for index, spec in enumerate(selected):
+        source = GuardedSource(
+            _hf_source(spec, seed=seed + index * 997),
+            stage=stage,
+            excluded_hashes=excluded_hashes,
+            excluded_families=excluded_families,
+        )
+        sources.append((source, spec.weight))
     if local_replay:
         if local_weight <= 0:
             raise ValueError("local_weight must be positive when local replay is enabled")
-        sources.append((CanonicalMemorySource(local_replay), float(local_weight)))
+        source = GuardedSource(
+            CanonicalMemorySource(local_replay),
+            stage=stage,
+            excluded_hashes=excluded_hashes,
+            excluded_families=excluded_families,
+        )
+        sources.append((source, float(local_weight)))
     return WeightedSourceStream(sources, seed=seed, repeat=repeat)
 
 
@@ -182,21 +237,10 @@ def sample_training_stream(
 ) -> list[str]:
     if limit <= 0:
         raise ValueError("stream sample limit must be positive")
-    stream = build_training_stream(
-        specs=specs,
-        stage=stage,
-        seed=seed,
-        local_replay=(),
-        repeat=False,
-    )
+    stream = build_training_stream(specs=specs, stage=stage, seed=seed, local_replay=(), repeat=False)
     result: list[str] = []
-    seen: set[str] = set()
     for text in stream:
-        normalized = text.strip()
-        if not normalized or normalized in seen:
-            continue
-        seen.add(normalized)
-        result.append(normalized)
+        result.append(text)
         if len(result) >= limit:
             break
     if not result:
