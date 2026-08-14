@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import random
-from collections import deque
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable, Iterator, Sequence
 
@@ -9,7 +8,6 @@ import torch
 from torch.utils.data import Dataset, IterableDataset
 
 if TYPE_CHECKING:
-    from corpus.shard import ShardWriter
     from corpus.source import DatasetSource
     from src.language.tokenizer import BPETokenizer
 
@@ -30,17 +28,10 @@ class ShardDataset(Dataset):
         return torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long)
 
 
-def buffered_shuffle(
-    values: Iterable[str],
-    *,
-    buffer_size: int,
-    seed: int,
-) -> Iterator[str]:
-    """Bounded-memory deterministic shuffle for arbitrary text streams."""
+def buffered_shuffle(values: Iterable[str], *, buffer_size: int, seed: int) -> Iterator[str]:
     if buffer_size <= 1:
         yield from values
         return
-
     rng = random.Random(seed)
     iterator = iter(values)
     buffer: list[str] = []
@@ -49,7 +40,6 @@ def buffered_shuffle(
             buffer.append(next(iterator))
         except StopIteration:
             break
-
     while buffer:
         index = rng.randrange(len(buffer))
         yield buffer[index]
@@ -60,12 +50,7 @@ def buffered_shuffle(
 
 
 class WeightedSourceStream:
-    """Deterministically mix independent dataset sources without materializing them.
-
-    A source is reopened only after exhaustion when ``repeat=True``. Weights are
-    sampling probabilities, not duplication factors, so large external datasets
-    do not have to be copied locally to influence the curriculum.
-    """
+    """Deterministically mix independent dataset sources without materializing them."""
 
     def __init__(
         self,
@@ -89,14 +74,9 @@ class WeightedSourceStream:
     def __iter__(self) -> Iterator[str]:
         rng = random.Random(self.seed)
         active = [
-            {
-                "source": source,
-                "weight": weight,
-                "iterator": iter(source.stream()),
-            }
+            {"source": source, "weight": weight, "iterator": iter(source.stream())}
             for source, weight in self.sources
         ]
-
         while active:
             weights = [entry["weight"] for entry in active]
             chosen = rng.choices(range(len(active)), weights=weights, k=1)[0]
@@ -104,23 +84,23 @@ class WeightedSourceStream:
             try:
                 yield next(entry["iterator"])
             except StopIteration:
-                if self.repeat:
-                    entry["iterator"] = iter(entry["source"].stream())
-                    try:
-                        yield next(entry["iterator"])
-                    except StopIteration:
-                        active.pop(chosen)
-                else:
+                if not self.repeat:
+                    active.pop(chosen)
+                    continue
+                entry["iterator"] = iter(entry["source"].stream())
+                try:
+                    yield next(entry["iterator"])
+                except StopIteration:
                     active.pop(chosen)
 
 
 class CorpusStreamer(IterableDataset):
-    """Boundary-preserving streaming next-token dataset.
+    """Boundary-preserving, bounded-memory packed next-token stream.
 
-    Each canonical example is tokenized independently. Short examples may be
-    packed together only at explicit ``<eos><bos>`` boundaries; long examples
-    are chunked by the authoritative language training pipeline. There is no
-    global flat token stream.
+    Short canonical examples are packed together until the context is full.
+    Because each canonical example already carries <bos>/<eos>, no semantic
+    boundary is lost. Long examples are emitted as authoritative contextual
+    chunks and are never mixed with unrelated examples.
     """
 
     def __init__(
@@ -147,36 +127,48 @@ class CorpusStreamer(IterableDataset):
         worker_seed = self.seed if worker_info is None else self.seed + worker_info.id
         source = iter(self.texts)
         if self.shuffle_buffer_size > 1:
-            yield from buffered_shuffle(
-                source,
-                buffer_size=self.shuffle_buffer_size,
-                seed=worker_seed,
-            )
+            yield from buffered_shuffle(source, buffer_size=self.shuffle_buffer_size, seed=worker_seed)
         else:
             yield from source
+
+    def _tensor_pair(self, sequence: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
+        sequence = sequence[: self.seq_len + 1]
+        x = sequence[:-1]
+        y = sequence[1:]
+        if len(x) < self.seq_len:
+            padding = self.seq_len - len(x)
+            x = x + [self.tokenizer.pad_id()] * padding
+            y = y + [self.tokenizer.pad_id()] * padding
+        return torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long)
 
     def __iter__(self) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
         from src.language.training_pipeline import build_example_sequences
 
-        pending: deque[list[int]] = deque()
+        max_tokens = self.seq_len + 1
+        pack: list[int] = []
+
         for text in self._stream_texts():
             if not text or not text.strip():
                 continue
-            sequences = build_example_sequences(
-                [text],
-                self.tokenizer,
-                seq_len=self.seq_len,
-            )
-            pending.extend(sequences)
-            while pending:
-                sequence = pending.popleft()[: self.seq_len + 1]
-                x = sequence[:-1]
-                y = sequence[1:]
-                if len(x) < self.seq_len:
-                    padding = self.seq_len - len(x)
-                    x = x + [self.tokenizer.pad_id()] * padding
-                    y = y + [self.tokenizer.pad_id()] * padding
-                yield (
-                    torch.tensor(x, dtype=torch.long),
-                    torch.tensor(y, dtype=torch.long),
-                )
+            raw_ids = self.tokenizer.encode(text, add_bos=False, add_eos=False)
+            if len(raw_ids) < 2:
+                continue
+
+            if len(raw_ids) > max_tokens:
+                if len(pack) >= 2:
+                    yield self._tensor_pair(pack)
+                    pack = []
+                for chunk in build_example_sequences([text], self.tokenizer, seq_len=self.seq_len):
+                    yield self._tensor_pair(chunk)
+                continue
+
+            if not pack:
+                pack = list(raw_ids)
+            elif len(pack) + len(raw_ids) <= max_tokens:
+                pack.extend(raw_ids)
+            else:
+                yield self._tensor_pair(pack)
+                pack = list(raw_ids)
+
+        if len(pack) >= 2:
+            yield self._tensor_pair(pack)
