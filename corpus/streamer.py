@@ -95,13 +95,7 @@ class WeightedSourceStream:
 
 
 class CorpusStreamer(IterableDataset):
-    """Boundary-preserving, bounded-memory packed next-token stream.
-
-    Short canonical examples are packed together until the context is full.
-    Because each canonical example already carries <bos>/<eos>, no semantic
-    boundary is lost. Long examples are emitted as authoritative contextual
-    chunks and are never mixed with unrelated examples.
-    """
+    """Boundary-preserving, bounded-memory role-aware training stream."""
 
     def __init__(
         self,
@@ -132,13 +126,13 @@ class CorpusStreamer(IterableDataset):
             yield from source
 
     def _tensor_pair(self, sequence: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
-        sequence = sequence[: self.seq_len + 1]
-        x = sequence[:-1]
-        y = sequence[1:]
-        if len(x) < self.seq_len:
-            padding = self.seq_len - len(x)
-            x = x + [self.tokenizer.pad_id()] * padding
-            y = y + [self.tokenizer.pad_id()] * padding
+        from src.language.loss_objective import build_loss_targets
+
+        x, y, _ = build_loss_targets(
+            sequence,
+            self.tokenizer,
+            seq_len=self.seq_len,
+        )
         return torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long)
 
     def __iter__(self) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
