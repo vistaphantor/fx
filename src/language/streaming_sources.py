@@ -7,8 +7,8 @@ from pathlib import Path
 from typing import Iterator, Sequence
 
 from corpus.dedup import NearDuplicateIndex
-from corpus.quality import LANGUAGE_QUALITY_FILTER
-from corpus.source import DatasetSource, HFSource, SourceMetadata
+from corpus.quality import FOUNDATION_ENGLISH_FILTER, LANGUAGE_QUALITY_FILTER, QualityFilter
+from corpus.source import DatasetSource, HFSource
 from corpus.streamer import WeightedSourceStream
 from src.language.canonical_contract import canonical_hash, canonicalize_serialized, prompt_family
 from src.language.curriculum import is_math_example, is_reasoning_example, is_trading_example
@@ -29,31 +29,19 @@ class HFSourceSpec:
     shuffle_buffer_size: int = 10_000
 
 
-class CanonicalMemorySource(DatasetSource):
-    def __init__(self, texts: Sequence[str], *, source_name: str = "local_replay"):
-        self._texts = tuple(canonicalize_serialized(text) for text in texts if text and text.strip())
-        self._source_name = source_name
-
-    @property
-    def source_id(self) -> str:
-        return f"memory:{self._source_name}"
-
-    def scan(self) -> SourceMetadata:
-        return SourceMetadata(source_type="memory", path=self.source_id, estimated_docs=len(self._texts))
-
-    def stream(self) -> Iterator[str]:
-        yield from self._texts
-
-    def metadata(self) -> dict:
-        return {"source_type": "memory", "source_name": self._source_name, "examples": len(self._texts)}
-
-
 def stream_quality_accepts(text: str) -> bool:
     return LANGUAGE_QUALITY_FILTER.accepts(text)
 
 
+def _quality_filter_for_stage(stage: str) -> QualityFilter:
+    normalized = stage.strip().casefold()
+    if normalized == "foundation":
+        return FOUNDATION_ENGLISH_FILTER
+    return LANGUAGE_QUALITY_FILTER
+
+
 class GuardedSource(DatasetSource):
-    """Canonicalize, quality-filter, near-deduplicate and enforce holdouts."""
+    """Canonicalize, stage-filter, near-deduplicate and enforce holdouts."""
 
     def __init__(
         self,
@@ -62,7 +50,6 @@ class GuardedSource(DatasetSource):
         stage: str,
         excluded_hashes: frozenset[str] = frozenset(),
         excluded_families: frozenset[str] = frozenset(),
-        enforce_stage: bool = True,
         near_dedup_entries: int = 50_000,
         near_dedup_hamming: int = 4,
         near_index: NearDuplicateIndex | None = None,
@@ -71,32 +58,29 @@ class GuardedSource(DatasetSource):
         self._stage = stage.strip().casefold()
         self._excluded_hashes = excluded_hashes
         self._excluded_families = excluded_families
-        self._enforce_stage = bool(enforce_stage)
         self._near_dedup_entries = int(near_dedup_entries)
         self._near_dedup_hamming = int(near_dedup_hamming)
         self._near_index = near_index
+        self._quality_filter = _quality_filter_for_stage(self._stage)
 
     @property
     def source_id(self) -> str:
-        mode = "stage" if self._enforce_stage else "replay"
-        return f"guarded:{self._source.source_id}:{self._stage}:{mode}"
+        return f"guarded:{self._source.source_id}:{self._stage}"
 
-    def scan(self) -> SourceMetadata:
+    def scan(self):
         return self._source.scan()
 
     def metadata(self) -> dict:
         return {
             **self._source.metadata(),
             "guarded_stage": self._stage,
-            "enforce_stage": self._enforce_stage,
+            "quality_filter": type(self._quality_filter).__name__,
             "near_dedup_entries": self._near_dedup_entries,
             "near_dedup_hamming": self._near_dedup_hamming,
             "shared_near_dedup": self._near_index is not None,
         }
 
     def _stage_accepts(self, text: str) -> bool:
-        if not self._enforce_stage:
-            return True
         if self._stage == "foundation":
             return True
         if self._stage == "reasoning":
@@ -113,7 +97,7 @@ class GuardedSource(DatasetSource):
         )
         for raw in self._source.stream():
             text = canonicalize_serialized(raw)
-            if not text or not LANGUAGE_QUALITY_FILTER.accepts(text):
+            if not text or not self._quality_filter.accepts(text):
                 continue
             digest = canonical_hash(text)
             if digest in seen or digest in self._excluded_hashes:
@@ -246,19 +230,22 @@ def build_training_stream(
     stage: str,
     seed: int,
     local_replay: Sequence[str] = (),
-    local_weight: float = 0.25,
+    local_weight: float = 0.0,
     excluded_texts: Sequence[str] = (),
     repeat: bool = True,
 ) -> WeightedSourceStream:
+    if local_replay or local_weight > 0:
+        raise RuntimeError(
+            "local_language_training_disabled:configure a pinned streaming source instead"
+        )
+
     selected = stage_specs(specs, stage)
     excluded_hashes = frozenset(canonical_hash(text) for text in excluded_texts if text and text.strip())
     excluded_families = frozenset(prompt_family(text) for text in excluded_texts if text and text.strip())
     sources: list[tuple[DatasetSource, float]] = []
 
-    # Share the recent near-duplicate index across all HF sources so the same
-    # example copied into two public datasets does not consume optimizer budget
-    # twice. Local replay intentionally uses its own index because replay is a
-    # controlled anti-forgetting curriculum component.
+    # A shared recent near-duplicate index prevents the same public example from
+    # consuming optimizer budget twice when it appears in multiple HF sources.
     hf_near_index = NearDuplicateIndex(max_entries=50_000, max_hamming_distance=4)
     for index, spec in enumerate(selected):
         sources.append((
@@ -267,23 +254,9 @@ def build_training_stream(
                 stage=stage,
                 excluded_hashes=excluded_hashes,
                 excluded_families=excluded_families,
-                enforce_stage=True,
                 near_index=hf_near_index,
             ),
             spec.weight,
-        ))
-    if local_replay:
-        if local_weight <= 0:
-            raise ValueError("local_weight must be positive when local replay is enabled")
-        sources.append((
-            GuardedSource(
-                CanonicalMemorySource(local_replay),
-                stage=stage,
-                excluded_hashes=excluded_hashes,
-                excluded_families=excluded_families,
-                enforce_stage=False,
-            ),
-            float(local_weight),
         ))
     return WeightedSourceStream(sources, seed=seed, repeat=repeat)
 
@@ -293,7 +266,14 @@ def sample_training_stream(
 ) -> list[str]:
     if limit <= 0:
         raise ValueError("stream sample limit must be positive")
-    stream = build_training_stream(specs=specs, stage=stage, seed=seed, local_replay=(), repeat=False)
+    stream = build_training_stream(
+        specs=specs,
+        stage=stage,
+        seed=seed,
+        local_replay=(),
+        local_weight=0.0,
+        repeat=False,
+    )
     result: list[str] = []
     for text in stream:
         result.append(text)
