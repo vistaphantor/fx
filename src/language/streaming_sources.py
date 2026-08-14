@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Sequence
@@ -10,6 +11,9 @@ from corpus.source import DatasetSource, HFSource, SourceMetadata
 from corpus.streamer import WeightedSourceStream
 from src.language.canonical_contract import canonical_hash, canonicalize_serialized, prompt_family
 from src.language.curriculum import is_math_example, is_reasoning_example, is_trading_example
+
+MAX_STREAM_EXAMPLE_CHARS = 100_000
+_WORD_RE = re.compile(r"[A-Za-z0-9]+")
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,8 +48,44 @@ class CanonicalMemorySource(DatasetSource):
         return {"source_type": "memory", "source_name": self._source_name, "examples": len(self._texts)}
 
 
+def stream_quality_accepts(text: str) -> bool:
+    if len(text) < 25 or len(text) > MAX_STREAM_EXAMPLE_CHARS:
+        return False
+    if text.count("<bos>") != 1 or text.count("<eos>") != 1:
+        return False
+    if "<user>" in text:
+        if text.count("<user>") != text.count("</user>"):
+            return False
+        if text.count("<assistant>") != text.count("</assistant>"):
+            return False
+        if "<assistant>" not in text:
+            return False
+    if text.count("<think>") != text.count("</think>"):
+        return False
+    alnum = sum(ch.isalnum() for ch in text)
+    if alnum / max(len(text), 1) < 0.12:
+        return False
+    words = [match.group(0).casefold() for match in _WORD_RE.finditer(text)]
+    if len(words) >= 40:
+        counts: dict[str, int] = {}
+        for word in words:
+            counts[word] = counts.get(word, 0) + 1
+        if max(counts.values()) / len(words) >= 0.50:
+            return False
+        if len(set(words)) / len(words) < 0.06:
+            return False
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) >= 12:
+        counts: dict[str, int] = {}
+        for line in lines:
+            counts[line] = counts.get(line, 0) + 1
+        if max(counts.values()) >= 8:
+            return False
+    return True
+
+
 class GuardedSource(DatasetSource):
-    """Canonicalize, deduplicate, enforce curriculum and exclude holdout families."""
+    """Canonicalize, quality-filter, deduplicate, enforce curriculum and holdouts."""
 
     def __init__(
         self,
@@ -83,7 +123,7 @@ class GuardedSource(DatasetSource):
         seen: set[str] = set()
         for raw in self._source.stream():
             text = canonicalize_serialized(raw)
-            if not text:
+            if not text or not stream_quality_accepts(text):
                 continue
             digest = canonical_hash(text)
             if digest in seen or digest in self._excluded_hashes:
@@ -208,32 +248,32 @@ def build_training_stream(
     excluded_families = frozenset(prompt_family(text) for text in excluded_texts if text and text.strip())
     sources: list[tuple[DatasetSource, float]] = []
     for index, spec in enumerate(selected):
-        source = GuardedSource(
-            _hf_source(spec, seed=seed + index * 997),
-            stage=stage,
-            excluded_hashes=excluded_hashes,
-            excluded_families=excluded_families,
-        )
-        sources.append((source, spec.weight))
+        sources.append((
+            GuardedSource(
+                _hf_source(spec, seed=seed + index * 997),
+                stage=stage,
+                excluded_hashes=excluded_hashes,
+                excluded_families=excluded_families,
+            ),
+            spec.weight,
+        ))
     if local_replay:
         if local_weight <= 0:
             raise ValueError("local_weight must be positive when local replay is enabled")
-        source = GuardedSource(
-            CanonicalMemorySource(local_replay),
-            stage=stage,
-            excluded_hashes=excluded_hashes,
-            excluded_families=excluded_families,
-        )
-        sources.append((source, float(local_weight)))
+        sources.append((
+            GuardedSource(
+                CanonicalMemorySource(local_replay),
+                stage=stage,
+                excluded_hashes=excluded_hashes,
+                excluded_families=excluded_families,
+            ),
+            float(local_weight),
+        ))
     return WeightedSourceStream(sources, seed=seed, repeat=repeat)
 
 
 def sample_training_stream(
-    *,
-    specs: Sequence[HFSourceSpec],
-    stage: str,
-    limit: int,
-    seed: int,
+    *, specs: Sequence[HFSourceSpec], stage: str, limit: int, seed: int,
 ) -> list[str]:
     if limit <= 0:
         raise ValueError("stream sample limit must be positive")
