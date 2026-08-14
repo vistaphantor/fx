@@ -2,19 +2,16 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Sequence
 
 from corpus.dedup import NearDuplicateIndex
+from corpus.quality import LANGUAGE_QUALITY_FILTER
 from corpus.source import DatasetSource, HFSource, SourceMetadata
 from corpus.streamer import WeightedSourceStream
 from src.language.canonical_contract import canonical_hash, canonicalize_serialized, prompt_family
 from src.language.curriculum import is_math_example, is_reasoning_example, is_trading_example
-
-MAX_STREAM_EXAMPLE_CHARS = 100_000
-_WORD_RE = re.compile(r"[A-Za-z0-9]+")
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,49 +47,16 @@ class CanonicalMemorySource(DatasetSource):
 
 
 def stream_quality_accepts(text: str) -> bool:
-    if len(text) < 25 or len(text) > MAX_STREAM_EXAMPLE_CHARS:
-        return False
-    if text.count("<bos>") != 1 or text.count("<eos>") != 1:
-        return False
-    if "<user>" in text:
-        if text.count("<user>") != text.count("</user>"):
-            return False
-        if text.count("<assistant>") != text.count("</assistant>"):
-            return False
-        if "<assistant>" not in text:
-            return False
-    if text.count("<think>") != text.count("</think>"):
-        return False
-    alnum = sum(ch.isalnum() for ch in text)
-    if alnum / max(len(text), 1) < 0.12:
-        return False
-    words = [match.group(0).casefold() for match in _WORD_RE.finditer(text)]
-    if len(words) >= 40:
-        counts: dict[str, int] = {}
-        for word in words:
-            counts[word] = counts.get(word, 0) + 1
-        if max(counts.values()) / len(words) >= 0.50:
-            return False
-        if len(set(words)) / len(words) < 0.06:
-            return False
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    if len(lines) >= 12:
-        counts: dict[str, int] = {}
-        for line in lines:
-            counts[line] = counts.get(line, 0) + 1
-        if max(counts.values()) >= 8:
-            return False
-    return True
+    """Compatibility name for the single authoritative corpus quality gate."""
+    return LANGUAGE_QUALITY_FILTER.accepts(text)
 
 
 class GuardedSource(DatasetSource):
     """Canonicalize, quality-filter, near-deduplicate and enforce holdouts.
 
-    `enforce_stage` is deliberately configurable. Raw HF sources are filtered
-    per example for the active curriculum stage. Local replay has *already*
-    been selected by `select_curriculum`, so applying the stage predicate a
-    second time would silently remove the general/reasoning replay examples
-    that protect language competence during later specialist stages.
+    Raw HF sources are classified per example for the active specialist stage.
+    Local replay has already been selected by `select_curriculum`, so it must
+    not be stage-filtered again or the anti-forgetting replay is erased.
     """
 
     def __init__(
@@ -150,7 +114,7 @@ class GuardedSource(DatasetSource):
         )
         for raw in self._source.stream():
             text = canonicalize_serialized(raw)
-            if not text or not stream_quality_accepts(text):
+            if not text or not LANGUAGE_QUALITY_FILTER.accepts(text):
                 continue
             digest = canonical_hash(text)
             if digest in seen or digest in self._excluded_hashes:
@@ -296,8 +260,6 @@ def build_training_stream(
                 stage=stage,
                 excluded_hashes=excluded_hashes,
                 excluded_families=excluded_families,
-                # Local replay is already curriculum-selected. Do not erase
-                # the replay component by re-applying the specialist filter.
                 enforce_stage=False,
             ),
             float(local_weight),
