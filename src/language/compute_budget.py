@@ -6,9 +6,9 @@ from dataclasses import asdict, dataclass
 
 import torch
 
+from src.language.loss_objective import build_loss_targets
 from src.language.pytorch_transformer import VistaReasoningGPT
 from src.language.tokenizer import BPETokenizer
-from src.language.training_pipeline import PackedSequenceDataset
 
 REFERENCE_TOKENS_PER_PARAMETER = 20.0
 DEFAULT_WALL_CLOCK_HOURS = 4.0
@@ -61,14 +61,44 @@ def _build_probe_batch(
     seq_len: int,
     batch_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Build a representative probe from windows that actually carry loss.
+
+    Assistant-supervised training can legitimately create prompt-only windows
+    after context chunking. Those windows are context, not optimizer work, and
+    must not make hardware preflight fail or inflate throughput measurements.
+    """
     if not sequences:
         raise ValueError("sequences must not be empty")
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
-    dataset = PackedSequenceDataset(sequences, seq_len, tokenizer.pad_id())
-    pairs = [dataset[index % len(dataset)] for index in range(batch_size)]
-    x = torch.stack([pair[0] for pair in pairs])
-    y = torch.stack([pair[1] for pair in pairs])
+
+    trainable: list[tuple[torch.Tensor, torch.Tensor, int]] = []
+    for sequence in sequences:
+        x_ids, y_ids, stats = build_loss_targets(
+            sequence,
+            seq_len=seq_len,
+            pad_id=tokenizer.pad_id(),
+        )
+        if stats.prediction_tokens <= 0:
+            continue
+        trainable.append(
+            (
+                torch.tensor(x_ids, dtype=torch.long),
+                torch.tensor(y_ids, dtype=torch.long),
+                stats.prediction_tokens,
+            )
+        )
+        if len(trainable) >= batch_size:
+            break
+
+    if not trainable:
+        raise RuntimeError("compute_probe_has_no_prediction_tokens")
+
+    while len(trainable) < batch_size:
+        trainable.append(trainable[len(trainable) % len(trainable)])
+
+    x = torch.stack([pair[0] for pair in trainable[:batch_size]])
+    y = torch.stack([pair[1] for pair in trainable[:batch_size]])
     valid_tokens = int((y != tokenizer.pad_id()).sum().item())
     if valid_tokens <= 0:
         raise RuntimeError("compute_probe_has_no_prediction_tokens")
