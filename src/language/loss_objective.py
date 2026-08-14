@@ -11,6 +11,8 @@ from dataclasses import dataclass
 
 from src.language.tokenizer import BPETokenizer
 
+LOSS_OBJECTIVE_VERSION = 1
+
 
 @dataclass(frozen=True, slots=True)
 class LossTargetStats:
@@ -27,7 +29,6 @@ def _example_ranges(sequence: list[int], *, bos_id: int, eos_id: int) -> list[tu
     start = 0
     for index, token_id in enumerate(sequence):
         if token_id == bos_id and index != start:
-            # Recover safely from a missing EOS rather than merging examples.
             if index > start:
                 ranges.append((start, index - 1))
             start = index
@@ -45,15 +46,7 @@ def build_loss_targets(
     *,
     seq_len: int,
 ) -> tuple[list[int], list[int], LossTargetStats]:
-    """Build x/y tensors as lists with role-aware supervision.
-
-    For a canonical conversational example, only assistant spans are optimized.
-    The opening <assistant> token, assistant content/reasoning, </assistant>, and
-    final <eos> are supervised. User/system/context spans are masked with pad_id.
-
-    For a document example (no <assistant> token), every ordinary next-token
-    target is supervised except a packed <bos> boundary.
-    """
+    """Build x/y lists with role-aware supervision."""
     if seq_len < 2:
         raise ValueError("seq_len must be >= 2")
     clipped = list(sequence[: seq_len + 1])
@@ -77,7 +70,6 @@ def build_loss_targets(
         is_chat = assistant_id in example
 
         if not is_chat:
-            # Full LM objective for documents. y position p predicts clipped[p+1].
             for target_index in range(start + 1, end + 1):
                 y_index = target_index - 1
                 target = clipped[target_index]
@@ -106,12 +98,10 @@ def build_loss_targets(
                     inside_assistant = False
                 continue
             if target == eos_id and saw_assistant:
-                # Teach clean response termination after the last assistant turn.
                 y[y_index] = target
                 continue
             prompt_masked += 1
 
-    # Any packed BOS target not encountered through malformed ranges is masked.
     for index, target in enumerate(raw_y):
         if target == bos_id and y[index] != pad_id:
             y[index] = pad_id
