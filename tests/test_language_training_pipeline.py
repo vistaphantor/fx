@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from tools.train_pytorch_50m import (
+from src.language.tokenizer import BPETokenizer
+from src.language.training_pipeline import (
     PackedSequenceDataset,
-    _normalize_prompt_family,
     build_example_sequences,
+    normalize_prompt_family,
+    run_training_preflight,
     split_by_prompt_family,
 )
-from src.language.tokenizer import BPETokenizer
 
 
 def _tokenizer() -> BPETokenizer:
@@ -25,7 +26,7 @@ def _tokenizer() -> BPETokenizer:
 def test_prompt_family_normalizes_terminal_punctuation():
     a = "<bos><user>Solve for x: 2x + 5 = 11.</user><assistant>x=3</assistant><eos>"
     b = "<bos><user>solve for x: 2x + 5 = 11</user><assistant>x is 3</assistant><eos>"
-    assert _normalize_prompt_family(a) == _normalize_prompt_family(b)
+    assert normalize_prompt_family(a) == normalize_prompt_family(b)
 
 
 def test_family_split_never_leaks_same_prompt_family():
@@ -36,8 +37,8 @@ def test_family_split_never_leaks_same_prompt_family():
         "<bos><user>What is ATR?</user><assistant>D</assistant><eos>",
     ]
     train, val = split_by_prompt_family(texts, val_fraction=0.5, seed=42)
-    train_families = {_normalize_prompt_family(t) for t in train}
-    val_families = {_normalize_prompt_family(t) for t in val}
+    train_families = {normalize_prompt_family(text) for text in train}
+    val_families = {normalize_prompt_family(text) for text in val}
     assert train_families.isdisjoint(val_families)
 
 
@@ -61,9 +62,7 @@ def test_long_example_is_chunked_without_crossing_other_examples():
     first = f"<bos><user>Long?</user><assistant>{long_answer}</assistant><eos>"
     second = "<bos><user>Short?</user><assistant>Yes.</assistant><eos>"
     sequences = build_example_sequences([first, second], tok, seq_len=64)
-    decoded = [tok.decode(seq, skip_special=False) for seq in sequences]
-    # No long-example chunk may contain the second prompt; the short example is
-    # emitted only after the long example's independent windows.
+    decoded = [tok.decode(sequence, skip_special=False) for sequence in sequences]
     long_chunks = [text for text in decoded if "Long?" in text or "reasoning" in text]
     assert long_chunks
     assert all("Short?" not in text for text in long_chunks)
@@ -76,9 +75,32 @@ def test_packed_dataset_returns_aligned_fixed_shapes():
         tok,
         seq_len=32,
     )
-    ds = PackedSequenceDataset(sequences, seq_len=32, pad_id=tok.pad_id())
-    x, y = ds[0]
+    dataset = PackedSequenceDataset(sequences, seq_len=32, pad_id=tok.pad_id())
+    x, y = dataset[0]
     assert tuple(x.shape) == (32,)
     assert tuple(y.shape) == (32,)
-    # The first target must be the second token of the original sequence.
     assert y[0].item() == sequences[0][1]
+
+
+def test_preflight_proves_roundtrip_alignment_and_learning():
+    tok = _tokenizer()
+    texts = [
+        "<bos><user>What is RSI?</user><assistant>RSI is momentum.</assistant><eos>",
+        "<bos><user>What is ATR?</user><assistant>ATR is volatility.</assistant><eos>",
+        "<bos><user>What is risk?</user><assistant>Risk is potential loss.</assistant><eos>",
+        "<bos><user>What is spread?</user><assistant>Spread is bid minus ask.</assistant><eos>",
+    ]
+    train, val = split_by_prompt_family(texts, val_fraction=0.25, seed=42)
+    train_sequences = build_example_sequences(train, tok, seq_len=64)
+    val_sequences = build_example_sequences(val, tok, seq_len=64)
+    report = run_training_preflight(
+        tokenizer=tok,
+        train_texts=train,
+        val_texts=val,
+        train_sequences=train_sequences,
+        val_sequences=val_sequences,
+        seq_len=64,
+    )
+    assert report.tokenizer_algorithm_version == 4
+    assert report.roundtrip_cases >= 8
+    assert report.overfit_final_loss < report.overfit_initial_loss * 0.70
