@@ -95,20 +95,14 @@ def _contextual_long_chunks(
     full_ids = tokenizer.encode(text, add_bos=False, add_eos=False)
     if len(full_ids) <= max_tokens:
         return [full_ids]
-
-    reasoning = re.match(
-        r"(?s)^(.*?<assistant>\s*<think>\s*)(.*?)(\s*</think>.*)$", text
-    )
+    reasoning = re.match(r"(?s)^(.*?<assistant>\s*<think>\s*)(.*?)(\s*</think>.*)$", text)
     if reasoning:
         prefix_text, body_text, tail_text = reasoning.groups()
     else:
-        assistant = re.match(
-            r"(?s)^(.*?<assistant>\s*)(.*?)(\s*</assistant>\s*<eos>\s*)$", text
-        )
+        assistant = re.match(r"(?s)^(.*?<assistant>\s*)(.*?)(\s*</assistant>\s*<eos>\s*)$", text)
         if not assistant:
             return _content_windows(full_ids, seq_len)
         prefix_text, body_text, tail_text = assistant.groups()
-
     prefix_ids = tokenizer.encode(prefix_text, add_bos=False, add_eos=False)
     body_ids = tokenizer.encode(body_text, add_bos=False, add_eos=False)
     tail_ids = tokenizer.encode(tail_text, add_bos=False, add_eos=False)
@@ -118,7 +112,6 @@ def _contextual_long_chunks(
     final_capacity = max_tokens - len(prefix_ids) - len(tail_ids)
     if final_capacity < 1:
         return _content_windows(full_ids, seq_len)
-
     chunks: list[list[int]] = []
     cursor = 0
     while cursor < len(body_ids):
@@ -144,19 +137,13 @@ def _drop_zero_supervision_sequences(
 ) -> list[list[int]]:
     supervised: list[list[int]] = []
     for sequence in sequences:
-        _, _, stats = build_loss_targets(
-            sequence,
-            seq_len=seq_len,
-            pad_id=tokenizer.pad_id(),
-        )
+        _, _, stats = build_loss_targets(sequence, seq_len=seq_len, pad_id=tokenizer.pad_id())
         if stats.prediction_tokens > 0:
             supervised.append(sequence)
     return supervised
 
 
-def build_example_sequences(
-    texts: list[str], tokenizer: BPETokenizer, *, seq_len: int,
-) -> list[list[int]]:
+def build_example_sequences(texts: list[str], tokenizer: BPETokenizer, *, seq_len: int) -> list[list[int]]:
     if seq_len < 2:
         raise ValueError("seq_len must be >= 2")
     sequences: list[list[int]] = []
@@ -184,11 +171,7 @@ def build_example_sequences(
             pack = list(ids)
     if len(pack) >= 2:
         sequences.append(pack)
-    sequences = _drop_zero_supervision_sequences(
-        sequences,
-        tokenizer=tokenizer,
-        seq_len=seq_len,
-    )
+    sequences = _drop_zero_supervision_sequences(sequences, tokenizer=tokenizer, seq_len=seq_len)
     if not sequences:
         raise RuntimeError("packing_produced_no_supervised_sequences")
     if any(len(sequence) < 2 or len(sequence) > max_tokens for sequence in sequences):
@@ -198,7 +181,6 @@ def build_example_sequences(
 
 class PackedSequenceDataset(Dataset):
     """Packed examples with the authoritative role-aware training objective."""
-
     def __init__(self, sequences: list[list[int]], seq_len: int, pad_id: int):
         if not sequences:
             raise ValueError("sequences must not be empty")
@@ -210,19 +192,13 @@ class PackedSequenceDataset(Dataset):
         return len(self.sequences)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        x, y, stats = build_loss_targets(
-            self.sequences[idx],
-            seq_len=self.seq_len,
-            pad_id=self.pad_id,
-        )
+        x, y, stats = build_loss_targets(self.sequences[idx], seq_len=self.seq_len, pad_id=self.pad_id)
         if stats.prediction_tokens <= 0:
             raise RuntimeError("packed_dataset_zero_supervision_sequence")
         return torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long)
 
 
-def prediction_token_count(
-    sequences: list[list[int]], *, seq_len: int, pad_id: int,
-) -> int:
+def prediction_token_count(sequences: list[list[int]], *, seq_len: int, pad_id: int) -> int:
     total = 0
     for sequence in sequences:
         _, _, stats = build_loss_targets(sequence, seq_len=seq_len, pad_id=pad_id)
@@ -271,9 +247,7 @@ def validate_tokenizer_contract(tokenizer: BPETokenizer, train_texts: list[str])
     return len(cases)
 
 
-def validate_sequence_contract(
-    train_sequences: list[list[int]], val_sequences: list[list[int]], *, seq_len: int, vocab_size: int,
-) -> None:
+def validate_sequence_contract(train_sequences: list[list[int]], val_sequences: list[list[int]], *, seq_len: int, vocab_size: int) -> None:
     for label, sequences in (("train", train_sequences), ("validation", val_sequences)):
         if not sequences:
             raise RuntimeError(f"{label}_sequences_empty")
@@ -287,31 +261,16 @@ def validate_sequence_contract(
 def run_tiny_overfit_gate(tokenizer: BPETokenizer, train_sequences: list[list[int]]) -> tuple[float, float]:
     seq_len = min(48, max(8, len(train_sequences[0]) - 1))
     tiny_sequences = [sequence[: seq_len + 1] for sequence in train_sequences[: min(4, len(train_sequences))]]
-    tiny_sequences = _drop_zero_supervision_sequences(
-        tiny_sequences,
-        tokenizer=tokenizer,
-        seq_len=seq_len,
-    )
+    tiny_sequences = _drop_zero_supervision_sequences(tiny_sequences, tokenizer=tokenizer, seq_len=seq_len)
     if not tiny_sequences:
         raise RuntimeError("tiny_overfit_has_no_supervised_sequences")
     dataset = PackedSequenceDataset(tiny_sequences, seq_len, tokenizer.pad_id())
     loader = torch.utils.data.DataLoader(dataset, batch_size=min(4, len(dataset)), shuffle=False)
     model = VistaReasoningGPT(
-        vocab_size=tokenizer.vocab_size,
-        d_model=64,
-        n_layers=2,
-        n_heads=4,
-        n_kv_heads=2,
-        ffn_dim=192,
-        max_seq_len=seq_len,
-        dropout=0.0,
-        ffn_type="dense",
-        num_experts=1,
-        experts_per_token=1,
-        moe_ffn_dim=192,
-        shared_expert_ffn_dim=0,
-        router_aux_loss_coef=0.0,
-        router_jitter=0.0,
+        vocab_size=tokenizer.vocab_size, d_model=64, n_layers=2, n_heads=4, n_kv_heads=2,
+        ffn_dim=192, max_seq_len=seq_len, dropout=0.0, ffn_type="dense", num_experts=1,
+        experts_per_token=1, moe_ffn_dim=192, shared_expert_ffn_dim=0,
+        router_aux_loss_coef=0.0, router_jitter=0.0,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=4e-3)
     first_loss: float | None = None
@@ -327,7 +286,6 @@ def run_tiny_overfit_gate(tokenizer: BPETokenizer, train_sequences: list[list[in
             loss.backward()
             optimizer.step()
             last_loss = float(loss.item())
-
     if first_loss is None or last_loss is None:
         raise RuntimeError("tiny_overfit_produced_no_loss")
     if not last_loss < first_loss * 0.35:
@@ -343,63 +301,29 @@ def run_training_preflight(
     train_sequences: list[list[int]],
     val_sequences: list[list[int]],
     seq_len: int,
-    conditioning_diagnostics_dir: str | Path,
+    conditioning_diagnostics_dir: str | Path = "conditioning_diagnostics",
 ) -> TrainingPreflightReport:
     from src.language.semantic_audit import audit_training_semantics
-
     roundtrip_cases = validate_tokenizer_contract(tokenizer, train_texts)
-    validate_sequence_contract(
-        train_sequences,
-        val_sequences,
-        seq_len=seq_len,
-        vocab_size=tokenizer.vocab_size,
-    )
-    semantic_report, _ = audit_training_semantics(
-        texts=train_texts,
-        sequences=train_sequences,
-        tokenizer=tokenizer,
-        seq_len=seq_len,
-    )
+    validate_sequence_contract(train_sequences, val_sequences, seq_len=seq_len, vocab_size=tokenizer.vocab_size)
+    semantic_report, _ = audit_training_semantics(texts=train_texts, sequences=train_sequences, tokenizer=tokenizer, seq_len=seq_len)
     print(
-        f"[SemanticAudit] PASS examples={semantic_report.examples} "
-        f"documents={semantic_report.documents} conversations={semantic_report.conversations} "
-        f"sequences={semantic_report.sequences} supervision="
-        f"{semantic_report.mean_sequence_supervision_ratio:.1%} "
+        f"[SemanticAudit] PASS examples={semantic_report.examples} documents={semantic_report.documents} "
+        f"conversations={semantic_report.conversations} sequences={semantic_report.sequences} "
+        f"supervision={semantic_report.mean_sequence_supervision_ratio:.1%} "
         f"zero_target={semantic_report.zero_supervision_sequences}"
     )
-
-    train_prediction_tokens = prediction_token_count(
-        train_sequences,
-        seq_len=seq_len,
-        pad_id=tokenizer.pad_id(),
-    )
-    validation_prediction_tokens = prediction_token_count(
-        val_sequences,
-        seq_len=seq_len,
-        pad_id=tokenizer.pad_id(),
-    )
+    train_prediction_tokens = prediction_token_count(train_sequences, seq_len=seq_len, pad_id=tokenizer.pad_id())
+    validation_prediction_tokens = prediction_token_count(val_sequences, seq_len=seq_len, pad_id=tokenizer.pad_id())
     if train_prediction_tokens <= 0 or validation_prediction_tokens <= 0:
         raise RuntimeError("preflight_has_no_prediction_tokens")
-
     initial_loss, final_loss = run_tiny_overfit_gate(tokenizer, train_sequences)
-    recall_1, recall_8, recall_32 = run_prompt_conditioning_gate(
-        tokenizer,
-        diagnostics_dir=conditioning_diagnostics_dir,
-    )
-
+    recall_1, recall_8, recall_32 = run_prompt_conditioning_gate(tokenizer, diagnostics_dir=conditioning_diagnostics_dir)
     return TrainingPreflightReport(
-        train_examples=len(train_texts),
-        validation_examples=len(val_texts),
-        train_sequences=len(train_sequences),
-        validation_sequences=len(val_sequences),
-        train_prediction_tokens=train_prediction_tokens,
-        validation_prediction_tokens=validation_prediction_tokens,
-        tokenizer_vocab_size=tokenizer.vocab_size,
-        tokenizer_algorithm_version=tokenizer.algorithm_version,
-        roundtrip_cases=roundtrip_cases,
-        overfit_initial_loss=initial_loss,
-        overfit_final_loss=final_loss,
-        conditioning_recall_1=recall_1,
-        conditioning_recall_8=recall_8,
-        conditioning_recall_32=recall_32,
+        train_examples=len(train_texts), validation_examples=len(val_texts),
+        train_sequences=len(train_sequences), validation_sequences=len(val_sequences),
+        train_prediction_tokens=train_prediction_tokens, validation_prediction_tokens=validation_prediction_tokens,
+        tokenizer_vocab_size=tokenizer.vocab_size, tokenizer_algorithm_version=tokenizer.algorithm_version,
+        roundtrip_cases=roundtrip_cases, overfit_initial_loss=initial_loss, overfit_final_loss=final_loss,
+        conditioning_recall_1=recall_1, conditioning_recall_8=recall_8, conditioning_recall_32=recall_32,
     )
