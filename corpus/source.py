@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import os
+import random
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -91,7 +92,15 @@ class LocalSource(DatasetSource):
 
 
 class HFSource(DatasetSource):
-    """Pinned Hugging Face streaming dataset source."""
+    """Pinned Hugging Face streaming source with network-local sequential reads.
+
+    Hugging Face ``IterableDataset.shuffle`` can shuffle both rows and remote
+    shard order. On corpora with thousands of large parquet shards that turns a
+    modest row shuffle into repeated TLS/range requests against unrelated remote
+    files. This source deliberately keeps the remote iterable sequential and
+    performs bounded reservoir shuffling only after rows have been serialized in
+    process memory.
+    """
 
     COLUMN_SCHEMAS = (
         ("prompt", "response"),
@@ -167,6 +176,8 @@ class HFSource(DatasetSource):
                 "revision": self._revision,
                 "max_examples": self._max_examples,
                 "shuffle_buffer_size": self._shuffle_buffer_size,
+                "shuffle_location": "local_reservoir",
+                "remote_shard_order": "sequential",
                 "seed": self._seed,
                 "text_fields": self._text_fields,
                 "prompt_field": self._prompt_field,
@@ -237,7 +248,13 @@ class HFSource(DatasetSource):
                 ) or None
         return None
 
-    def _load_dataset(self, *, shuffle: bool, retry_generation: int = 0):
+    def _load_dataset(self, *, shuffle: bool = False, retry_generation: int = 0):
+        """Open the pinned remote iterable without changing remote shard order.
+
+        ``shuffle`` and ``retry_generation`` remain accepted for compatibility
+        with callers/tests, but network-side shuffling is intentionally disabled.
+        Randomization happens in :meth:`stream` after rows reach local memory.
+        """
         if not self._revision:
             raise RuntimeError(
                 f"hf_revision_must_be_pinned:{self._path}:set an immutable commit/tag revision"
@@ -258,11 +275,7 @@ class HFSource(DatasetSource):
             kwargs["name"] = self._config_name
         if self._token:
             kwargs["token"] = self._token
-        dataset = load_dataset(self._path, **kwargs)
-        if shuffle and self._shuffle_buffer_size > 0:
-            retry_seed = self._seed + int(retry_generation) * 1_000_003
-            dataset = dataset.shuffle(seed=retry_seed, buffer_size=self._shuffle_buffer_size)
-        return dataset
+        return load_dataset(self._path, **kwargs)
 
     @classmethod
     def _is_transient_stream_error(cls, exc: BaseException) -> bool:
@@ -273,6 +286,25 @@ class HFSource(DatasetSource):
 
     def _retry_delay(self, retry_number: int) -> float:
         return min(30.0, self._stream_retry_base_seconds * (2 ** max(0, retry_number - 1)))
+
+    @staticmethod
+    def _close_stream(iterator: object | None, dataset: object | None) -> None:
+        if iterator is not None:
+            close = getattr(iterator, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+        # HF iterable datasets generally expose no public close method, but some
+        # wrappers do. Close it when available and release both references.
+        if dataset is not None:
+            close = getattr(dataset, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
 
     def audit(self, *, max_rows: int = 1_000) -> HFSourceAudit:
         if max_rows <= 0:
@@ -295,9 +327,7 @@ class HFSource(DatasetSource):
                 serialized += 1
                 lengths.append(len(text))
         finally:
-            close = getattr(iterator, "close", None)
-            if callable(close):
-                close()
+            self._close_stream(iterator, dataset)
             del iterator
             del dataset
         return HFSourceAudit(
@@ -312,25 +342,68 @@ class HFSource(DatasetSource):
 
     def stream(self) -> Iterator[str]:
         emitted = 0
+        raw_rows_consumed = 0
         retry_generation = 0
+        rng = random.Random(self._seed)
+        reservoir: list[str] = []
+
         while self._max_examples is None or emitted < self._max_examples:
             dataset = None
             iterator = None
             try:
-                dataset = self._load_dataset(
-                    shuffle=True,
-                    retry_generation=retry_generation,
-                )
+                dataset = self._load_dataset(shuffle=False)
                 iterator = iter(dataset)
+
+                # Remote cursors are not serializable. On a transient reconnect,
+                # replay the deterministic sequential stream only up to the raw
+                # row boundary already consumed. We never change shard order.
+                skipped = 0
+                while skipped < raw_rows_consumed:
+                    next(iterator)
+                    skipped += 1
+
                 for row in iterator:
+                    raw_rows_consumed += 1
                     if self._max_examples is not None and emitted >= self._max_examples:
                         return
                     if not isinstance(row, dict):
                         continue
                     text = self._row_to_text(row)
-                    if text and len(text) > 25:
+                    if not text or len(text) <= 25:
+                        continue
+
+                    if self._shuffle_buffer_size <= 1:
                         yield text
                         emitted += 1
+                        continue
+
+                    if len(reservoir) < self._shuffle_buffer_size:
+                        reservoir.append(text)
+                        continue
+
+                    index = rng.randrange(len(reservoir))
+                    selected = reservoir[index]
+                    reservoir[index] = text
+                    yield selected
+                    emitted += 1
+
+                # Normal EOF: randomize and drain only the in-memory reservoir.
+                rng.shuffle(reservoir)
+                while reservoir and (
+                    self._max_examples is None or emitted < self._max_examples
+                ):
+                    yield reservoir.pop()
+                    emitted += 1
+                return
+            except StopIteration:
+                # A reconnect can discover that the saved raw-row boundary was
+                # exactly EOF. Drain any buffered local examples and finish.
+                rng.shuffle(reservoir)
+                while reservoir and (
+                    self._max_examples is None or emitted < self._max_examples
+                ):
+                    yield reservoir.pop()
+                    emitted += 1
                 return
             except Exception as exc:
                 if (
@@ -343,25 +416,17 @@ class HFSource(DatasetSource):
                 print(
                     f"[HFRetry] source={self.source_id} retry={retry_generation}/"
                     f"{self._stream_retry_attempts} delay={delay:.1f}s "
+                    f"raw_rows={raw_rows_consumed:,} buffered={len(reservoir):,} "
+                    f"transport=sequential_remote+local_reservoir "
                     f"error={type(exc).__name__}: {exc}",
                     flush=True,
                 )
                 if delay > 0:
                     time.sleep(delay)
             finally:
-                if iterator is not None:
-                    close = getattr(iterator, "close", None)
-                    if callable(close):
-                        try:
-                            close()
-                        except Exception:
-                            pass
+                self._close_stream(iterator, dataset)
                 iterator = None
                 dataset = None
-                # Streaming parquet/network stacks can retain large native buffers
-                # after a failed HTTP request. Reclaim unreachable wrappers before
-                # the next retry rather than allowing repeated disconnects to grow
-                # process RSS until the trainer cannot allocate a single logits tensor.
                 gc.collect()
 
     def metadata(self) -> dict:
@@ -373,6 +438,8 @@ class HFSource(DatasetSource):
             "revision": self._revision,
             "max_examples": self._max_examples,
             "shuffle_buffer_size": self._shuffle_buffer_size,
+            "shuffle_location": "local_reservoir",
+            "remote_shard_order": "sequential",
             "seed": self._seed,
             "text_fields": self._text_fields,
             "prompt_field": self._prompt_field,
