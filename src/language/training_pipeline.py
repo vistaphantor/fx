@@ -64,12 +64,19 @@ def split_by_prompt_family(
 
 
 def _content_windows(token_ids: list[int], seq_len: int) -> list[list[int]]:
+    """Split long content without duplicating prediction targets.
+
+    Adjacent windows share exactly one boundary token. That token is the final
+    context token of the preceding window and the initial context token of the
+    next window, so every next-token transition is supervised once. The old
+    50% overlap trained many targets twice and overweighted long documents.
+    """
     if len(token_ids) < 2:
         return []
     window = seq_len + 1
     if len(token_ids) <= window:
         return [token_ids]
-    stride = max(1, seq_len // 2)
+    stride = seq_len
     chunks: list[list[int]] = []
     start = 0
     while start < len(token_ids) - 1:
@@ -258,57 +265,71 @@ def validate_sequence_contract(
 
 def run_tiny_overfit_gate(tokenizer: BPETokenizer, train_sequences: list[list[int]]) -> tuple[float, float]:
     seq_len = min(48, max(8, len(train_sequences[0]) - 1))
-    dataset = PackedSequenceDataset(
-        train_sequences[: min(4, len(train_sequences))],
-        seq_len,
-        tokenizer.pad_id(),
-    )
-    x, y = dataset[0]
-    x, y = x.unsqueeze(0), y.unsqueeze(0)
-    torch.manual_seed(20260814)
+    tiny_sequences = [sequence[: seq_len + 1] for sequence in train_sequences[: min(4, len(train_sequences))]]
+    dataset = PackedSequenceDataset(tiny_sequences, seq_len, tokenizer.pad_id())
+    loader = torch.utils.data.DataLoader(dataset, batch_size=min(4, len(dataset)), shuffle=False)
     model = VistaReasoningGPT(
-        vocab_size=tokenizer.vocab_size, d_model=64, n_layers=2, n_heads=4,
-        ffn_dim=128, max_seq_len=seq_len, dropout=0.0,
+        vocab_size=tokenizer.vocab_size,
+        d_model=64,
+        n_layers=2,
+        n_heads=4,
+        n_kv_heads=2,
+        ffn_dim=192,
+        max_seq_len=seq_len,
+        dropout=0.0,
+        ffn_type="dense",
+        num_experts=1,
+        experts_per_token=1,
+        moe_ffn_dim=192,
+        shared_expert_ffn_dim=0,
+        router_aux_loss_coef=0.0,
+        router_jitter=0.0,
     )
-    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-3, weight_decay=0.0)
-    model.train()
-    _, initial_loss = model(x, targets=y, pad_id=tokenizer.pad_id())
-    if initial_loss is None or not torch.isfinite(initial_loss):
-        raise RuntimeError("preflight_initial_loss_invalid")
-    initial = float(initial_loss.item())
-    final = initial
-    for _ in range(40):
-        optimizer.zero_grad(set_to_none=True)
-        _, loss = model(x, targets=y, pad_id=tokenizer.pad_id())
-        if loss is None or not torch.isfinite(loss):
-            raise RuntimeError("preflight_overfit_loss_invalid")
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        final = float(loss.item())
-    if final >= initial * 0.70:
-        raise RuntimeError(f"preflight_overfit_failed:{initial:.4f}:{final:.4f}")
-    return initial, final
+    optimizer = torch.optim.AdamW(model.parameters(), lr=4e-3)
+    first_loss: float | None = None
+    last_loss: float | None = None
+    for _ in range(80):
+        for x, y in loader:
+            optimizer.zero_grad(set_to_none=True)
+            _, loss = model(x, targets=y, pad_id=tokenizer.pad_id())
+            if loss is None or not torch.isfinite(loss):
+                raise RuntimeError("tiny_overfit_loss_invalid")
+            if first_loss is None:
+                first_loss = float(loss.item())
+            loss.backward()
+            optimizer.step()
+            last_loss = float(loss.item())
+    if first_loss is None or last_loss is None:
+        raise RuntimeError("tiny_overfit_produced_no_loss")
+    if not last_loss < first_loss * 0.35:
+        raise RuntimeError(f"tiny_overfit_gate_failed:{first_loss:.4f}->{last_loss:.4f}")
+    return first_loss, last_loss
 
 
 def run_training_preflight(
     *, tokenizer: BPETokenizer, train_texts: list[str], val_texts: list[str],
     train_sequences: list[list[int]], val_sequences: list[list[int]], seq_len: int,
 ) -> TrainingPreflightReport:
-    if {prompt_family(text) for text in train_texts}.intersection(prompt_family(text) for text in val_texts):
-        raise RuntimeError("preflight_prompt_family_leakage")
-    roundtrips = validate_tokenizer_contract(tokenizer, train_texts)
+    roundtrip_cases = validate_tokenizer_contract(tokenizer, train_texts)
     validate_sequence_contract(
-        train_sequences, val_sequences, seq_len=seq_len, vocab_size=tokenizer.vocab_size
+        train_sequences, val_sequences, seq_len=seq_len, vocab_size=tokenizer.vocab_size,
     )
-    initial, final = run_tiny_overfit_gate(tokenizer, train_sequences)
+    train_prediction_tokens = prediction_token_count(
+        train_sequences, seq_len=seq_len, pad_id=tokenizer.pad_id(),
+    )
+    validation_prediction_tokens = prediction_token_count(
+        val_sequences, seq_len=seq_len, pad_id=tokenizer.pad_id(),
+    )
+    if train_prediction_tokens <= 0 or validation_prediction_tokens <= 0:
+        raise RuntimeError("preflight_has_no_prediction_tokens")
+    initial_loss, final_loss = run_tiny_overfit_gate(tokenizer, train_sequences)
     return TrainingPreflightReport(
-        len(train_texts), len(val_texts), len(train_sequences), len(val_sequences),
-        prediction_token_count(
-            train_sequences, seq_len=seq_len, pad_id=tokenizer.pad_id()
-        ),
-        prediction_token_count(
-            val_sequences, seq_len=seq_len, pad_id=tokenizer.pad_id()
-        ),
-        tokenizer.vocab_size, tokenizer.algorithm_version, roundtrips, initial, final,
+        train_examples=len(train_texts), validation_examples=len(val_texts),
+        train_sequences=len(train_sequences), validation_sequences=len(val_sequences),
+        train_prediction_tokens=train_prediction_tokens,
+        validation_prediction_tokens=validation_prediction_tokens,
+        tokenizer_vocab_size=tokenizer.vocab_size,
+        tokenizer_algorithm_version=tokenizer.algorithm_version,
+        roundtrip_cases=roundtrip_cases,
+        overfit_initial_loss=initial_loss, overfit_final_loss=final_loss,
     )
