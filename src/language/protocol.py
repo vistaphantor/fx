@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from src.language.tokenizer import BPETokenizer, SPECIAL_TOKENS
+from src.language.tokenizer import BOS, BPETokenizer, SPECIAL_TOKENS
 
 
 class ProtocolError(ValueError):
@@ -32,7 +32,14 @@ def assistant_prefix() -> str:
 
 
 def build_chat_prompt(turns: Iterable[tuple[str, str]]) -> str:
-    serialized: list[str] = []
+    """Serialize inference with the exact canonical grammar used in training.
+
+    Canonical training examples always begin with <bos>. Inference previously
+    omitted it while also tokenizing with add_bos=False, so a tiny model was
+    evaluated under a prefix distribution it never saw during training. Keep a
+    single explicit BOS here and never ask the tokenizer to add another one.
+    """
+    serialized: list[str] = [BOS]
     for role, text in turns:
         if role == "user":
             serialized.append(format_user_turn(text))
@@ -47,9 +54,9 @@ def build_chat_prompt(turns: Iterable[tuple[str, str]]) -> str:
 def build_exam_prompt(question: str) -> str:
     """Build the deterministic single-turn prompt used by epoch exams.
 
-    Exams must exercise the exact same user/assistant grammar as interactive
-    inference. Keeping this here prevents the evaluator from inventing a
-    second prompt protocol that the model never saw during training.
+    Exams exercise the exact same BOS/user/assistant grammar as interactive
+    inference and canonical training. Keeping this here prevents evaluator and
+    chat code from inventing a second prompt protocol.
     """
     return build_chat_prompt((("user", question),))
 
