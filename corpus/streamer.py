@@ -71,7 +71,8 @@ class WeightedSourceStream:
         self.seed = int(seed)
         self.repeat = bool(repeat)
 
-    def __iter__(self) -> Iterator[str]:
+    def iter_with_source(self) -> Iterator[tuple[str, str]]:
+        """Yield accepted text together with the authoritative source id."""
         rng = random.Random(self.seed)
         active = [
             {"source": source, "weight": weight, "iterator": iter(source.stream())}
@@ -82,16 +83,20 @@ class WeightedSourceStream:
             chosen = rng.choices(range(len(active)), weights=weights, k=1)[0]
             entry = active[chosen]
             try:
-                yield next(entry["iterator"])
+                yield entry["source"].source_id, next(entry["iterator"])
             except StopIteration:
                 if not self.repeat:
                     active.pop(chosen)
                     continue
                 entry["iterator"] = iter(entry["source"].stream())
                 try:
-                    yield next(entry["iterator"])
+                    yield entry["source"].source_id, next(entry["iterator"])
                 except StopIteration:
                     active.pop(chosen)
+
+    def __iter__(self) -> Iterator[str]:
+        for _, text in self.iter_with_source():
+            yield text
 
 
 class CorpusStreamer(IterableDataset):
@@ -125,15 +130,22 @@ class CorpusStreamer(IterableDataset):
         else:
             yield from source
 
-    def _tensor_pair(self, sequence: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
+    def _tensor_pair(self, sequence: list[int]) -> tuple[torch.Tensor, torch.Tensor] | None:
         from src.language.loss_objective import build_loss_targets
 
-        x, y, _ = build_loss_targets(
+        x, y, stats = build_loss_targets(
             sequence,
             seq_len=self.seq_len,
             pad_id=self.tokenizer.pad_id(),
         )
+        if stats.prediction_tokens <= 0:
+            return None
         return torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long)
+
+    def _yield_pair(self, sequence: list[int]) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+        pair = self._tensor_pair(sequence)
+        if pair is not None:
+            yield pair
 
     def __iter__(self) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
         from src.language.training_pipeline import build_example_sequences
@@ -150,10 +162,10 @@ class CorpusStreamer(IterableDataset):
 
             if len(raw_ids) > max_tokens:
                 if len(pack) >= 2:
-                    yield self._tensor_pair(pack)
+                    yield from self._yield_pair(pack)
                     pack = []
                 for chunk in build_example_sequences([text], self.tokenizer, seq_len=self.seq_len):
-                    yield self._tensor_pair(chunk)
+                    yield from self._yield_pair(chunk)
                 continue
 
             if not pack:
@@ -161,8 +173,8 @@ class CorpusStreamer(IterableDataset):
             elif len(pack) + len(raw_ids) <= max_tokens:
                 pack.extend(raw_ids)
             else:
-                yield self._tensor_pair(pack)
+                yield from self._yield_pair(pack)
                 pack = list(raw_ids)
 
         if len(pack) >= 2:
-            yield self._tensor_pair(pack)
+            yield from self._yield_pair(pack)
