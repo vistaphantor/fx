@@ -30,7 +30,7 @@
       "path": "HuggingFaceTB/everyday-conversations-llama3.1-2k",
       "revision": "14f543216b9ba42b6b951dc5bd199460d193b162",
       "split": "train_sft",
-      "weight": 0.02,
+      "weight": 0.05,
       "stages": [
         "foundation"
       ],
