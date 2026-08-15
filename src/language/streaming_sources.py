@@ -18,18 +18,17 @@ from src.language.canonical_contract import (
     serialize_messages,
 )
 from src.language.curriculum import is_math_example, is_reasoning_example, is_trading_example
+from src.language.foundation_skill_sources import (
+    FOUNDATION_SKILL_SOURCE_VERSION,
+    FoundationEconomicsSource,
+    PrimitiveArithmeticSource,
+)
 
-
-# Foundation must learn two different skills at the same time:
-#   1. ordinary causal English from documents;
-#   2. that a <user> turn followed by <assistant> requires a useful continuation.
-# A finite dialogue dataset alone cannot sustain the second lane for a long stream,
-# so a deterministic fraction of real documents becomes a self-supervised
-# continuation task. The target text is always genuine corpus text, never an
-# invented answer.
 FOUNDATION_INTERACTION_FRACTION = 0.25
 FOUNDATION_CONTINUATION_PREFIX_WORDS = 32
 FOUNDATION_CONTINUATION_TARGET_WORDS = 48
+FOUNDATION_ARITHMETIC_WEIGHT = 0.18
+FOUNDATION_ECONOMICS_WEIGHT = 0.12
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,13 +73,6 @@ def _document_payload(text: str) -> str:
 
 
 def _continuation_interaction(text: str) -> str | None:
-    """Turn a real document into a bounded self-supervised assistant task.
-
-    This is not synthetic knowledge. The user receives a genuine prefix from the
-    document and the assistant target is the genuine text that follows it. The
-    bounded word counts keep the full interaction comfortably inside the 192-token
-    foundation context for the current byte-BPE profiles.
-    """
     if _is_chat(text):
         return None
     payload = _document_payload(text)
@@ -90,27 +82,19 @@ def _continuation_interaction(text: str) -> str | None:
         return None
 
     prefix_end = min(FOUNDATION_CONTINUATION_PREFIX_WORDS, len(words) - 12)
-    target_end = min(
-        len(words),
-        prefix_end + FOUNDATION_CONTINUATION_TARGET_WORDS,
-    )
+    target_end = min(len(words), prefix_end + FOUNDATION_CONTINUATION_TARGET_WORDS)
     prefix = " ".join(words[:prefix_end]).strip()
     continuation = " ".join(words[prefix_end:target_end]).strip()
     if not prefix or not continuation:
         return None
 
     return serialize_messages((
-        CanonicalMessage(
-            "user",
-            "Continue this passage naturally:\n" + prefix,
-        ),
+        CanonicalMessage("user", "Continue this passage naturally:\n" + prefix),
         CanonicalMessage("assistant", continuation),
     )) or None
 
 
 def _use_foundation_interaction(digest: str) -> bool:
-    # Hash selection is deterministic across machines/runs and does not touch the
-    # trainer RNG. That keeps validation/preflight reproducible.
     bucket = int(digest[:8], 16) / 0xFFFFFFFF
     return bucket < FOUNDATION_INTERACTION_FRACTION
 
@@ -128,6 +112,8 @@ class GuardedSource(DatasetSource):
         near_dedup_entries: int = 50_000,
         near_dedup_hamming: int = 4,
         near_index: NearDuplicateIndex | None = None,
+        quality_filter: QualityFilter | None = None,
+        transform_foundation_documents: bool = True,
     ):
         self._source = source
         self._stage = stage.strip().casefold()
@@ -136,7 +122,8 @@ class GuardedSource(DatasetSource):
         self._near_dedup_entries = int(near_dedup_entries)
         self._near_dedup_hamming = int(near_dedup_hamming)
         self._near_index = near_index
-        self._quality_filter = _quality_filter_for_stage(self._stage)
+        self._quality_filter = quality_filter or _quality_filter_for_stage(self._stage)
+        self._transform_foundation_documents = bool(transform_foundation_documents)
 
     @property
     def source_id(self) -> str:
@@ -154,7 +141,9 @@ class GuardedSource(DatasetSource):
             "near_dedup_hamming": self._near_dedup_hamming,
             "shared_near_dedup": self._near_index is not None,
             "foundation_interaction_fraction": (
-                FOUNDATION_INTERACTION_FRACTION if self._stage == "foundation" else 0.0
+                FOUNDATION_INTERACTION_FRACTION
+                if self._stage == "foundation" and self._transform_foundation_documents
+                else 0.0
             ),
         }
 
@@ -191,6 +180,7 @@ class GuardedSource(DatasetSource):
 
             if (
                 self._stage == "foundation"
+                and self._transform_foundation_documents
                 and not _is_chat(text)
                 and _use_foundation_interaction(digest)
             ):
@@ -273,6 +263,9 @@ def specs_fingerprint(specs: Sequence[HFSourceSpec]) -> str:
         "foundation_interaction_fraction": FOUNDATION_INTERACTION_FRACTION,
         "foundation_continuation_prefix_words": FOUNDATION_CONTINUATION_PREFIX_WORDS,
         "foundation_continuation_target_words": FOUNDATION_CONTINUATION_TARGET_WORDS,
+        "foundation_skill_source_version": FOUNDATION_SKILL_SOURCE_VERSION,
+        "foundation_arithmetic_weight": FOUNDATION_ARITHMETIC_WEIGHT,
+        "foundation_economics_weight": FOUNDATION_ECONOMICS_WEIGHT,
         "sources": [
             {
                 "path": spec.path,
@@ -317,6 +310,44 @@ def stage_specs(specs: Sequence[HFSourceSpec], stage: str) -> tuple[HFSourceSpec
     return selected
 
 
+def _foundation_skill_sources(
+    *,
+    excluded_hashes: frozenset[str],
+    excluded_families: frozenset[str],
+) -> list[tuple[DatasetSource, float]]:
+    # These are trusted, exact-by-construction sources. Use the general quality
+    # gate rather than FoundationEnglishFilter because primitive arithmetic is
+    # intentionally numeric. Keep holdout/family checks and exact dedup active.
+    return [
+        (
+            GuardedSource(
+                PrimitiveArithmeticSource(),
+                stage="foundation",
+                excluded_hashes=excluded_hashes,
+                excluded_families=excluded_families,
+                near_dedup_entries=250_000,
+                near_dedup_hamming=0,
+                quality_filter=LANGUAGE_QUALITY_FILTER,
+                transform_foundation_documents=False,
+            ),
+            FOUNDATION_ARITHMETIC_WEIGHT,
+        ),
+        (
+            GuardedSource(
+                FoundationEconomicsSource(),
+                stage="foundation",
+                excluded_hashes=excluded_hashes,
+                excluded_families=excluded_families,
+                near_dedup_entries=50_000,
+                near_dedup_hamming=0,
+                quality_filter=LANGUAGE_QUALITY_FILTER,
+                transform_foundation_documents=False,
+            ),
+            FOUNDATION_ECONOMICS_WEIGHT,
+        ),
+    ]
+
+
 def build_training_stream(
     *,
     specs: Sequence[HFSourceSpec],
@@ -332,6 +363,7 @@ def build_training_stream(
             "local_language_training_disabled:configure a pinned streaming source instead"
         )
 
+    normalized_stage = stage.strip().casefold()
     selected = stage_specs(specs, stage)
     excluded_hashes = frozenset(canonical_hash(text) for text in excluded_texts if text and text.strip())
     excluded_families = frozenset(prompt_family(text) for text in excluded_texts if text and text.strip())
@@ -349,28 +381,25 @@ def build_training_stream(
             ),
             spec.weight,
         ))
+
+    if normalized_stage == "foundation":
+        sources.extend(_foundation_skill_sources(
+            excluded_hashes=excluded_hashes,
+            excluded_families=excluded_families,
+        ))
+
     return WeightedSourceStream(sources, seed=seed, repeat=repeat)
 
 
 def sample_training_stream(
     *, specs: Sequence[HFSourceSpec], stage: str, limit: int, seed: int,
 ) -> list[str]:
-    """Build a deterministic, network-light preflight sample.
-
-    Preflight is for tokenizer/data-contract inspection, not stochastic training.
-    Disabling per-source HF shuffle here prevents the datasets library from
-    scattering a small sample across thousands of remote parquet shards.
-    WeightedSourceStream still mixes the configured sources according to their
-    weights, while each individual source is consumed sequentially.
-    """
+    """Build a deterministic, network-light preflight sample."""
     if limit <= 0:
         raise ValueError("stream sample limit must be positive")
 
     selected = stage_specs(specs, stage)
-    preflight_specs = tuple(
-        replace(spec, shuffle_buffer_size=0)
-        for spec in selected
-    )
+    preflight_specs = tuple(replace(spec, shuffle_buffer_size=0) for spec in selected)
     stream = build_training_stream(
         specs=preflight_specs,
         stage=stage,
