@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
+from src.language.canonical_contract import mojibake_score
+
 _STRUCTURAL_TOKEN_RE = re.compile(
     r"</?(?:bos|eos|sep|user|assistant|think|market|account|position|evidence|"
     r"hypothesis|countercase|tool|tool_result|decision|confidence|invalidation)>",
@@ -93,6 +95,12 @@ class QualityFilter:
         if structural:
             return QualityScore(False, 0.0, tuple(structural))
 
+        corruption = mojibake_score(value)
+        if "�" in value:
+            return QualityScore(False, 0.0, ("unicode_replacement_character",))
+        if corruption >= 4:
+            return QualityScore(False, 0.0, ("residual_mojibake",))
+
         content = _STRUCTURAL_TOKEN_RE.sub(" ", value)
         printable = sum(1 for char in content if char.isprintable() or char in "\n\t")
         printable_ratio = printable / max(len(content), 1)
@@ -156,13 +164,7 @@ class QualityFilter:
 
 
 class FoundationEnglishFilter(QualityFilter):
-    """Stricter gate for the first language stage of a very small model.
-
-    Foundation should teach ordinary English and turn-taking, not web markup,
-    source code, dense formulae, identifiers, or boilerplate. Later stages may
-    intentionally admit mathematics and trading notation through their own
-    streamed sources, so these restrictions are foundation-only.
-    """
+    """Stricter gate for the first language stage of a very small model."""
 
     def __init__(self) -> None:
         super().__init__(
