@@ -24,22 +24,23 @@ def test_primitive_arithmetic_source_contains_exact_small_math() -> None:
 
 
 def test_primitive_arithmetic_source_reaches_three_term_and_tables() -> None:
-    # Assert capabilities, not generator offsets. The source deliberately evolves
-    # its prompt/answer forms, so a magic islice boundary would make this test
-    # depend on unrelated earlier template counts rather than arithmetic coverage.
-    expected = {
-        "2 + 2 + 3 = 7": False,
-        "The answer is -5.": False,
-        "3 times 4 is 12": False,
-        "12 divided by 3 is 4": False,
+    # Assert exact prompt->answer capabilities, not generator offsets. Earlier
+    # prompt/answer template counts are allowed to evolve without silently moving
+    # later arithmetic families outside an arbitrary islice window.
+    checks = {
+        "three_term_add": lambda row: "What is 2 + 2 + 3?" in row and "2 + 2 + 3 = 7." in row,
+        "three_term_negative": lambda row: "What is 2 + 2 - 9?" in row and "The answer is -5." in row,
+        "multiplication": lambda row: "Calculate 3 multiplied by 4." in row and "3 times 4 is 12." in row,
+        "division": lambda row: "Calculate 12 divided by 3." in row and "12 divided by 3 is 4." in row,
     }
+    found = {name: False for name in checks}
     for row in PrimitiveArithmeticSource().stream():
-        for marker in expected:
-            if marker in row:
-                expected[marker] = True
-        if all(expected.values()):
+        for name, predicate in checks.items():
+            if not found[name] and predicate(row):
+                found[name] = True
+        if all(found.values()):
             break
-    assert expected == {marker: True for marker in expected}
+    assert found == {name: True for name in checks}
 
 
 def test_foundation_economics_source_starts_with_primitive_concepts() -> None:
