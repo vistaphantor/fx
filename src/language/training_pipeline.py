@@ -9,9 +9,9 @@ from dataclasses import dataclass
 import torch
 from torch.utils.data import Dataset
 
-from src.language.canonical_contract import CanonicalMessage, prompt_family, serialize_messages
+from src.language.canonical_contract import prompt_family
+from src.language.conditioning_gate import run_prompt_conditioning_gate
 from src.language.loss_objective import build_loss_targets
-from src.language.protocol import build_exam_prompt, extract_assistant_response, generation_stop_ids
 from src.language.pytorch_transformer import VistaReasoningGPT
 from src.language.tokenizer import BPETokenizer, TOKENIZER_ALGORITHM_VERSION
 
@@ -74,7 +74,6 @@ def _content_windows(token_ids: list[int], seq_len: int) -> list[list[int]]:
     window = seq_len + 1
     if len(token_ids) <= window:
         return [token_ids]
-    stride = seq_len
     chunks: list[list[int]] = []
     start = 0
     while start < len(token_ids) - 1:
@@ -83,13 +82,14 @@ def _content_windows(token_ids: list[int], seq_len: int) -> list[list[int]]:
             chunks.append(chunk)
         if start + window >= len(token_ids):
             break
-        start += stride
+        start += seq_len
     return chunks
 
 
 def _contextual_long_chunks(
     text: str, tokenizer: BPETokenizer, *, seq_len: int,
 ) -> list[list[int]]:
+    """Chunk long assistant examples while retaining their conditioning prefix."""
     max_tokens = seq_len + 1
     full_ids = tokenizer.encode(text, add_bos=False, add_eos=False)
     if len(full_ids) <= max_tokens:
@@ -113,6 +113,7 @@ def _contextual_long_chunks(
     tail_ids = tokenizer.encode(tail_text, add_bos=False, add_eos=False)
     if len(prefix_ids) >= max_tokens - 2:
         return _content_windows(full_ids, seq_len)
+
     intermediate_capacity = max_tokens - len(prefix_ids)
     final_capacity = max_tokens - len(prefix_ids) - len(tail_ids)
     if final_capacity < 1:
@@ -131,6 +132,7 @@ def _contextual_long_chunks(
             return _content_windows(full_ids, seq_len)
         chunks.append(prefix_ids + body_ids[cursor : cursor + take])
         cursor += take
+
     if not chunks:
         return _content_windows(full_ids, seq_len)
     if any(len(chunk) < 2 or len(chunk) > max_tokens for chunk in chunks):
@@ -156,11 +158,13 @@ def _drop_zero_supervision_sequences(
 def build_example_sequences(
     texts: list[str], tokenizer: BPETokenizer, *, seq_len: int,
 ) -> list[list[int]]:
+    """Pack canonical examples without crossing the authoritative sequence budget."""
     if seq_len < 2:
         raise ValueError("seq_len must be >= 2")
     sequences: list[list[int]] = []
     pack: list[int] = []
     max_tokens = seq_len + 1
+
     for text in texts:
         if not text.strip():
             continue
@@ -181,6 +185,7 @@ def build_example_sequences(
             if len(pack) >= 2:
                 sequences.append(pack)
             pack = list(ids)
+
     if len(pack) >= 2:
         sequences.append(pack)
     sequences = _drop_zero_supervision_sequences(
@@ -196,7 +201,7 @@ def build_example_sequences(
 
 
 class PackedSequenceDataset(Dataset):
-    """Packed examples with the authoritative role-aware training objective."""
+    """Packed examples using the single authoritative role-aware loss target builder."""
 
     def __init__(self, sequences: list[list[int]], seq_len: int, pad_id: int):
         if not sequences:
@@ -247,9 +252,13 @@ def split_fingerprint(train_texts: list[str], val_texts: list[str]) -> str:
 
 def _roundtrip_samples(train_texts: list[str]) -> list[str]:
     fixed = [
-        "The market is bullish.", "one  two\n\nthree", "Walae Mkuu Mtaji",
-        "KES 50,000 | XAUUSD @ 2,431.75", "€ £ ¥ KSh α β Σ ∂ 你好 مرحبا",
-        r"\mathrm{ATR} \frac{1}{2}", "<user>What is RSI?</user>",
+        "The market is bullish.",
+        "one  two\n\nthree",
+        "Walae Mkuu Mtaji",
+        "KES 50,000 | XAUUSD @ 2,431.75",
+        "€ £ ¥ KSh α β Σ ∂ 你好 مرحبا",
+        r"\mathrm{ATR} \frac{1}{2}",
+        "<user>What is RSI?</user>",
         "<assistant><think>Calculate.</think>Answer.</assistant>",
     ]
     fixed.extend(text[:2000] for text in train_texts[:8])
@@ -266,12 +275,18 @@ def validate_tokenizer_contract(tokenizer: BPETokenizer, train_texts: list[str])
             raise RuntimeError("tokenizer_emitted_unk_for_valid_utf8")
         decoded = tokenizer.decode(ids, skip_special=False)
         if decoded != sample:
-            raise RuntimeError(f"tokenizer_roundtrip_mismatch:{sample[:80]!r}:{decoded[:80]!r}")
+            raise RuntimeError(
+                f"tokenizer_roundtrip_mismatch:{sample[:80]!r}:{decoded[:80]!r}"
+            )
     return len(cases)
 
 
 def validate_sequence_contract(
-    train_sequences: list[list[int]], val_sequences: list[list[int]], *, seq_len: int, vocab_size: int,
+    train_sequences: list[list[int]],
+    val_sequences: list[list[int]],
+    *,
+    seq_len: int,
+    vocab_size: int,
 ) -> None:
     for label, sequences in (("train", train_sequences), ("validation", val_sequences)):
         if not sequences:
@@ -283,9 +298,16 @@ def validate_sequence_contract(
                 raise RuntimeError(f"{label}_sequence_token_out_of_range")
 
 
-def run_tiny_overfit_gate(tokenizer: BPETokenizer, train_sequences: list[list[int]]) -> tuple[float, float]:
+def run_tiny_overfit_gate(
+    tokenizer: BPETokenizer,
+    train_sequences: list[list[int]],
+) -> tuple[float, float]:
+    """Verify that the real causal objective can aggressively overfit tiny data."""
     seq_len = min(48, max(8, len(train_sequences[0]) - 1))
-    tiny_sequences = [sequence[: seq_len + 1] for sequence in train_sequences[: min(4, len(train_sequences))]]
+    tiny_sequences = [
+        sequence[: seq_len + 1]
+        for sequence in train_sequences[: min(4, len(train_sequences))]
+    ]
     tiny_sequences = _drop_zero_supervision_sequences(
         tiny_sequences,
         tokenizer=tokenizer,
@@ -293,8 +315,13 @@ def run_tiny_overfit_gate(tokenizer: BPETokenizer, train_sequences: list[list[in
     )
     if not tiny_sequences:
         raise RuntimeError("tiny_overfit_has_no_supervised_sequences")
+
     dataset = PackedSequenceDataset(tiny_sequences, seq_len, tokenizer.pad_id())
-    loader = torch.utils.data.DataLoader(dataset, batch_size=min(4, len(dataset)), shuffle=False)
+    loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=min(4, len(dataset)),
+        shuffle=False,
+    )
     model = VistaReasoningGPT(
         vocab_size=tokenizer.vocab_size,
         d_model=64,
@@ -326,6 +353,7 @@ def run_tiny_overfit_gate(tokenizer: BPETokenizer, train_sequences: list[list[in
             loss.backward()
             optimizer.step()
             last_loss = float(loss.item())
+
     if first_loss is None or last_loss is None:
         raise RuntimeError("tiny_overfit_produced_no_loss")
     if not last_loss < first_loss * 0.35:
@@ -333,124 +361,23 @@ def run_tiny_overfit_gate(tokenizer: BPETokenizer, train_sequences: list[list[in
     return first_loss, last_loss
 
 
-def _conditioning_cases() -> list[tuple[str, str]]:
-    # Deliberately arbitrary mappings test conditioning, not arithmetic skill.
-    # The values are unique so a global answer prior cannot pass this gate.
-    return [
-        (f"Conditioning key {index:02d}. Reply with its assigned value only.", f"{100 + index}.")
-        for index in range(32)
-    ]
-
-
-def _conditioning_recall(
-    model: VistaReasoningGPT,
-    tokenizer: BPETokenizer,
-    cases: list[tuple[str, str]],
-) -> int:
-    was_training = model.training
-    correct = 0
-    stops = generation_stop_ids(tokenizer)
-    try:
-        model.eval()
-        for prompt, expected in cases:
-            prompt_ids = tokenizer.encode(
-                build_exam_prompt(prompt), add_bos=False, add_eos=False,
-            )
-            if len(prompt_ids) >= model.max_seq_len:
-                raise RuntimeError("conditioning_prompt_exceeds_tiny_context")
-            generated = model.generate(
-                torch.tensor([prompt_ids], dtype=torch.long),
-                max_new_tokens=12,
-                stop_ids=stops,
-                use_kv_cache=True,
-                do_sample=False,
-            )
-            decoded = tokenizer.decode(generated[0].tolist(), skip_special=False)
-            response = extract_assistant_response(decoded).strip()
-            if response == expected:
-                correct += 1
-    finally:
-        model.train(was_training)
-    return correct
-
-
-def run_prompt_conditioning_gate(tokenizer: BPETokenizer) -> tuple[int, int, int]:
-    """Prove exact prompt->answer memorization before expensive training.
-
-    This uses the same canonical serializer, BOS chat prompt, role-aware labels,
-    transformer forward pass and greedy generation path as the real model. A
-    lower language-model loss is insufficient: each stage must generate every
-    assigned value exactly, otherwise full training is blocked.
-    """
-    torch.manual_seed(1701)
-    random.seed(1701)
-    seq_len = 64
-    model = VistaReasoningGPT(
-        vocab_size=tokenizer.vocab_size,
-        d_model=64,
-        n_layers=2,
-        n_heads=4,
-        n_kv_heads=2,
-        ffn_dim=192,
-        max_seq_len=seq_len,
-        dropout=0.0,
-        ffn_type="dense",
-        num_experts=1,
-        experts_per_token=1,
-        moe_ffn_dim=192,
-        shared_expert_ffn_dim=0,
-        router_aux_loss_coef=0.0,
-        router_jitter=0.0,
-    )
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-3, weight_decay=0.0)
-    all_cases = _conditioning_cases()
-    recalls: list[int] = []
-
-    for size, steps in ((1, 120), (8, 220), (32, 420)):
-        cases = all_cases[:size]
-        texts = [
-            serialize_messages((
-                CanonicalMessage("user", prompt),
-                CanonicalMessage("assistant", answer),
-            ))
-            for prompt, answer in cases
-        ]
-        sequences = build_example_sequences(texts, tokenizer, seq_len=seq_len)
-        dataset = PackedSequenceDataset(sequences, seq_len, tokenizer.pad_id())
-        loader = torch.utils.data.DataLoader(
-            dataset,
-            batch_size=min(8, len(dataset)),
-            shuffle=True,
-            generator=torch.Generator().manual_seed(1701 + size),
-        )
-        for _ in range(steps):
-            model.train()
-            for x, y in loader:
-                optimizer.zero_grad(set_to_none=True)
-                _, loss = model(x, targets=y, pad_id=tokenizer.pad_id())
-                if loss is None or not torch.isfinite(loss):
-                    raise RuntimeError("conditioning_gate_non_finite_loss")
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
-        recalled = _conditioning_recall(model, tokenizer, cases)
-        recalls.append(recalled)
-        print(f"[ConditioningGate] recall={recalled}/{size}")
-        if recalled != size:
-            raise RuntimeError(f"prompt_conditioning_gate_failed:{recalled}/{size}")
-
-    return recalls[0], recalls[1], recalls[2]
-
-
 def run_training_preflight(
-    *, tokenizer: BPETokenizer, train_texts: list[str], val_texts: list[str],
-    train_sequences: list[list[int]], val_sequences: list[list[int]], seq_len: int,
+    *,
+    tokenizer: BPETokenizer,
+    train_texts: list[str],
+    val_texts: list[str],
+    train_sequences: list[list[int]],
+    val_sequences: list[list[int]],
+    seq_len: int,
 ) -> TrainingPreflightReport:
     from src.language.semantic_audit import audit_training_semantics
 
     roundtrip_cases = validate_tokenizer_contract(tokenizer, train_texts)
     validate_sequence_contract(
-        train_sequences, val_sequences, seq_len=seq_len, vocab_size=tokenizer.vocab_size,
+        train_sequences,
+        val_sequences,
+        seq_len=seq_len,
+        vocab_size=tokenizer.vocab_size,
     )
     semantic_report, _ = audit_training_semantics(
         texts=train_texts,
@@ -465,25 +392,35 @@ def run_training_preflight(
         f"{semantic_report.mean_sequence_supervision_ratio:.1%} "
         f"zero_target={semantic_report.zero_supervision_sequences}"
     )
+
     train_prediction_tokens = prediction_token_count(
-        train_sequences, seq_len=seq_len, pad_id=tokenizer.pad_id(),
+        train_sequences,
+        seq_len=seq_len,
+        pad_id=tokenizer.pad_id(),
     )
     validation_prediction_tokens = prediction_token_count(
-        val_sequences, seq_len=seq_len, pad_id=tokenizer.pad_id(),
+        val_sequences,
+        seq_len=seq_len,
+        pad_id=tokenizer.pad_id(),
     )
     if train_prediction_tokens <= 0 or validation_prediction_tokens <= 0:
         raise RuntimeError("preflight_has_no_prediction_tokens")
+
     initial_loss, final_loss = run_tiny_overfit_gate(tokenizer, train_sequences)
     recall_1, recall_8, recall_32 = run_prompt_conditioning_gate(tokenizer)
+
     return TrainingPreflightReport(
-        train_examples=len(train_texts), validation_examples=len(val_texts),
-        train_sequences=len(train_sequences), validation_sequences=len(val_sequences),
+        train_examples=len(train_texts),
+        validation_examples=len(val_texts),
+        train_sequences=len(train_sequences),
+        validation_sequences=len(val_sequences),
         train_prediction_tokens=train_prediction_tokens,
         validation_prediction_tokens=validation_prediction_tokens,
         tokenizer_vocab_size=tokenizer.vocab_size,
         tokenizer_algorithm_version=tokenizer.algorithm_version,
         roundtrip_cases=roundtrip_cases,
-        overfit_initial_loss=initial_loss, overfit_final_loss=final_loss,
+        overfit_initial_loss=initial_loss,
+        overfit_final_loss=final_loss,
         conditioning_recall_1=recall_1,
         conditioning_recall_8=recall_8,
         conditioning_recall_32=recall_32,
