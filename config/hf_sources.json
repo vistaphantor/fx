@@ -4,7 +4,7 @@
       "path": "roneneldan/TinyStories",
       "revision": "f54c09fd23315a6f9c86f9dc80f725de7d8f9c64",
       "split": "train",
-      "weight": 1.0,
+      "weight": 0.50,
       "stages": [
         "foundation"
       ],
@@ -17,7 +17,7 @@
       "path": "tiiuae/falcon-refinedweb",
       "revision": "c735840575b629292b41da8dde11dcd523d4f91c",
       "split": "train",
-      "weight": 0.20,
+      "weight": 0.40,
       "stages": [
         "foundation"
       ],
@@ -30,7 +30,7 @@
       "path": "HuggingFaceTB/everyday-conversations-llama3.1-2k",
       "revision": "14f543216b9ba42b6b951dc5bd199460d193b162",
       "split": "train_sft",
-      "weight": 0.05,
+      "weight": 0.10,
       "stages": [
         "foundation"
       ],
