@@ -21,7 +21,7 @@ from corpus.streamer import CorpusStreamer
 from src.language.canonical_contract import canonicalize_serialized, prompt_family
 from src.language.compute_budget import benchmark_training_throughput, reference_token_target
 from src.language.curriculum import CURRICULUM_STAGES, select_curriculum
-from src.language.data_pipeline import build_tokenizer_training_sample, load_all_training_text
+from src.language.data_pipeline import build_tokenizer_training_sample
 from src.language.exam import EpochExamResult, build_exam_prompt, exam_questions, run_epoch_exam, save_epoch_exam
 from src.language.loss_objective import LOSS_OBJECTIVE_VERSION
 from src.language.model_bundle import load_model_bundle, save_model_bundle
@@ -45,15 +45,14 @@ from src.language.training_pipeline import (
     split_fingerprint,
 )
 from src.language.training_profiles import (
-    DEFAULT_LOCAL_REPLAY_WEIGHTS,
     DEFAULT_STAGE_TOKENS_PER_PARAMETER,
     PROFILES,
     profile as load_profile,
 )
 
-TRAINER_VERSION = 7
-TRAINING_STATE_VERSION = 7
-PREFLIGHT_MANIFEST_VERSION = 7
+TRAINER_VERSION = 8
+TRAINING_STATE_VERSION = 8
+PREFLIGHT_MANIFEST_VERSION = 8
 SEED = 42
 
 
@@ -262,18 +261,28 @@ def _run_exam(
 
 
 def _stream_loader(
-    *, specs: tuple[HFSourceSpec, ...], stage: str, epoch: int,
-    local_replay: list[str], excluded: list[str], tokenizer: BPETokenizer,
-    cfg: dict, replay_weight: float,
+    *, specs: tuple[HFSourceSpec, ...], stage: str, stream_generation: int,
+    excluded: list[str], tokenizer: BPETokenizer, cfg: dict,
 ) -> DataLoader:
     stream = build_training_stream(
-        specs=specs, stage=stage, seed=SEED + epoch * 100_003,
-        local_replay=local_replay, local_weight=replay_weight,
-        excluded_texts=excluded, repeat=True,
+        specs=specs,
+        stage=stage,
+        seed=SEED + stream_generation * 100_003,
+        local_replay=(),
+        local_weight=0.0,
+        excluded_texts=excluded,
+        repeat=True,
     )
     return DataLoader(
-        CorpusStreamer(stream, tokenizer, seq_len=int(cfg["seq_len"]), seed=SEED + epoch),
-        batch_size=int(cfg["batch_size"]), num_workers=0, drop_last=False,
+        CorpusStreamer(
+            stream,
+            tokenizer,
+            seq_len=int(cfg["seq_len"]),
+            seed=SEED + stream_generation,
+        ),
+        batch_size=int(cfg["batch_size"]),
+        num_workers=0,
+        drop_last=False,
     )
 
 
@@ -285,7 +294,8 @@ def _save_state(
     _atomic_torch_save(
         {
             **contract,
-            "epoch": epoch, "step": step,
+            "epoch": epoch,
+            "step": step,
             "cumulative_prediction_tokens": cumulative_tokens,
             "optimizer_steps": optimizer_steps,
             "best_validation_loss": best_val,
@@ -294,25 +304,24 @@ def _save_state(
             "optimizer_state_dict": optimizer.state_dict(),
             "torch_rng_state": torch.get_rng_state(),
             "python_random_state": random.getstate(),
-        }, path,
+        },
+        path,
     )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--profile", choices=sorted(PROFILES), default="2m")
-    parser.add_argument("--data-root", default="data/data/trainingdata")
     parser.add_argument("--bundle-dir", default=None)
     parser.add_argument("--training-stage", default="foundation")
     parser.add_argument("--init-bundle", default=None)
-    parser.add_argument("--hf-config", default=None)
+    parser.add_argument("--hf-config", required=True)
     parser.add_argument("--hf-sample-examples", type=int, default=None)
-    parser.add_argument("--local-replay-weight", type=float, default=None)
     parser.add_argument("--threads", type=int, default=max(1, min(4, os.cpu_count() or 2)))
     parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--session-hours", type=float, default=4.0)
-    parser.add_argument("--exam-interval-minutes", type=float, default=20.0)
+    parser.add_argument("--exam-interval-minutes", type=float, default=5.0)
     parser.add_argument("--target-tokens-per-parameter", type=float, default=None)
     parser.add_argument("--compute-probe-steps", type=int, default=3)
     parser.add_argument("--source-audit-rows", type=int, default=500)
@@ -327,11 +336,6 @@ def main() -> None:
         args.target_tokens_per_parameter
         if args.target_tokens_per_parameter is not None
         else DEFAULT_STAGE_TOKENS_PER_PARAMETER[stage]
-    )
-    replay_weight = float(
-        args.local_replay_weight
-        if args.local_replay_weight is not None
-        else DEFAULT_LOCAL_REPLAY_WEIGHTS[stage]
     )
     if args.session_hours <= 0 or args.exam_interval_minutes <= 0 or target_tpp <= 0:
         raise ValueError("training budgets must be positive")
@@ -354,39 +358,45 @@ def main() -> None:
     hf_sample_path = work / "hf_preflight_sample.json"
     hf_sample_meta = work / "hf_preflight_sample_meta.json"
 
-    local = _stable_unique(load_all_training_text(Path(args.data_root), cfg["max_examples"], False, SEED))
-    hf_specs: tuple[HFSourceSpec, ...] = ()
-    hf_sample: list[str] = []
-    hf_fp: str | None = None
-    source_audit: list[dict] = []
-    if args.hf_config:
-        hf_specs = load_hf_source_config(args.hf_config)
-        source_audit = _audit_hf_sources(
-            hf_specs, stage=stage, rows=args.source_audit_rows,
-            min_rate=args.min_source_serialization_rate,
-        )
-        hf_sample, hf_fp = _load_hf_sample(
-            specs=hf_specs, stage=stage,
-            limit=args.hf_sample_examples or int(cfg["hf_preflight_sample_examples"]),
-            sample_path=hf_sample_path, metadata_path=hf_sample_meta,
-        )
-        print(f"[HF] sources={len(stage_specs(hf_specs, stage))} accepted_preflight_sample={len(hf_sample):,} fingerprint={hf_fp[:12]}")
+    hf_specs = load_hf_source_config(args.hf_config)
+    source_audit = _audit_hf_sources(
+        hf_specs,
+        stage=stage,
+        rows=args.source_audit_rows,
+        min_rate=args.min_source_serialization_rate,
+    )
+    hf_sample, hf_fp = _load_hf_sample(
+        specs=hf_specs,
+        stage=stage,
+        limit=args.hf_sample_examples or int(cfg["hf_preflight_sample_examples"]),
+        sample_path=hf_sample_path,
+        metadata_path=hf_sample_meta,
+    )
+    print(
+        f"[HF] sources={len(stage_specs(hf_specs, stage))} "
+        f"accepted_preflight_sample={len(hf_sample):,} fingerprint={hf_fp[:12]}"
+    )
 
-    all_texts, removed = _remove_exam_families(_stable_unique(local + hf_sample), stage)
+    all_texts, removed = _remove_exam_families(_stable_unique(hf_sample), stage)
     print(f"[ExamHoldout] families={len(exam_questions(stage))} removed_from_preflight={removed}")
     selected = select_curriculum(all_texts, stage=stage, seed=SEED)
     texts = selected.texts
     print(
         f"[Curriculum] stage={stage} selected={len(texts):,}/{selected.total_available:,} "
         f"trading={selected.trading_available:,} reasoning={selected.reasoning_available:,} "
-        f"math={selected.math_available:,} replay={selected.replay_examples:,}"
+        f"math={selected.math_available:,} replay=0"
     )
-    train_texts, val_texts = split_by_prompt_family(texts, val_fraction=float(cfg["val_split"]), seed=SEED)
-    train_set = set(train_texts)
-    local_replay = [text for text in local if text in train_set] if replay_weight > 0 else []
+    train_texts, val_texts = split_by_prompt_family(
+        texts,
+        val_fraction=float(cfg["val_split"]),
+        seed=SEED,
+    )
     split_fp = split_fingerprint(train_texts, val_texts)
-    print(f"[Split] train={len(train_texts):,} val={len(val_texts):,} family_isolated=true split={split_fp[:12]}")
-    print(f"[Replay] local_only={len(local_replay):,} weight={replay_weight:.3f} hf_preflight_replayed=0")
+    print(
+        f"[Split] train={len(train_texts):,} val={len(val_texts):,} "
+        f"family_isolated=true split={split_fp[:12]}"
+    )
+    print("[Replay] local=disabled hf_preflight_replayed=0")
 
     lineage_model = None
     lineage_tokenizer = None
@@ -411,8 +421,8 @@ def main() -> None:
         "source_corpus_fingerprint": corpus_fingerprint(all_texts),
         "curriculum_fingerprint": corpus_fingerprint(texts),
         "split_fingerprint": split_fp,
-        "local_replay_fingerprint": corpus_fingerprint(local_replay),
         "hf_sources_fingerprint": hf_fp,
+        "stream_only": True,
     }
 
     if tokenizer_path.exists():
@@ -429,25 +439,45 @@ def main() -> None:
         tokenizer.save(tokenizer_path)
         reused = False
     else:
-        sample = build_tokenizer_training_sample(train_texts, max_chars=int(cfg["tokenizer_chars"]), seed=SEED)
+        sample = build_tokenizer_training_sample(
+            train_texts,
+            max_chars=int(cfg["tokenizer_chars"]),
+            seed=SEED,
+        )
         tokenizer = BPETokenizer()
         tokenizer.train(sample, vocab_size=int(cfg["vocab_size"]))
         tokenizer.save(tokenizer_path)
         reused = False
     print(f"[Tokenizer] reuse={str(reused).lower()} fingerprint={tokenizer.fingerprint()}")
 
-    train_sequences = build_example_sequences(train_texts, tokenizer, seq_len=int(cfg["seq_len"]))
-    val_sequences = build_example_sequences(val_texts, tokenizer, seq_len=int(cfg["seq_len"]))
+    train_sequences = build_example_sequences(
+        train_texts,
+        tokenizer,
+        seq_len=int(cfg["seq_len"]),
+    )
+    val_sequences = build_example_sequences(
+        val_texts,
+        tokenizer,
+        seq_len=int(cfg["seq_len"]),
+    )
     report = run_training_preflight(
-        tokenizer=tokenizer, train_texts=train_texts, val_texts=val_texts,
-        train_sequences=train_sequences, val_sequences=val_sequences, seq_len=int(cfg["seq_len"]),
+        tokenizer=tokenizer,
+        train_texts=train_texts,
+        val_texts=val_texts,
+        train_sequences=train_sequences,
+        val_sequences=val_sequences,
+        seq_len=int(cfg["seq_len"]),
     )
     tokenizer_stats = _tokenizer_efficiency(train_texts, tokenizer)
     model_config = _model_config(cfg, tokenizer)
     probe = benchmark_training_throughput(
-        model_config=model_config, tokenizer=tokenizer, sequences=train_sequences,
-        batch_size=int(cfg["batch_size"]), steps=args.compute_probe_steps,
-        wall_clock_hours=args.session_hours, reference_tokens_per_parameter=target_tpp,
+        model_config=model_config,
+        tokenizer=tokenizer,
+        sequences=train_sequences,
+        batch_size=int(cfg["batch_size"]),
+        steps=args.compute_probe_steps,
+        wall_clock_hours=args.session_hours,
+        reference_tokens_per_parameter=target_tpp,
     )
 
     torch.manual_seed(SEED)
@@ -458,7 +488,13 @@ def main() -> None:
     activation_ratio = active_params / max(total_params, 1)
     target_tokens = reference_token_target(total_params, tokens_per_parameter=target_tpp)
     step_seconds = probe.elapsed_seconds / max(probe.benchmark_steps, 1)
-    exam_steps = max(1, min(20_000, int(round(args.exam_interval_minutes * 60 / max(step_seconds, 1e-9)))))
+    exam_steps = max(
+        1,
+        min(
+            20_000,
+            int(round(args.exam_interval_minutes * 60 / max(step_seconds, 1e-9))),
+        ),
+    )
 
     preflight = {
         **contract,
@@ -478,11 +514,16 @@ def main() -> None:
         "exam_steps": exam_steps,
     }
     _atomic_json_save(preflight, preflight_path)
-    print(f"[Preflight] PASS roundtrips={report.roundtrip_cases} overfit={report.overfit_initial_loss:.4f}->{report.overfit_final_loss:.4f} objective=v{LOSS_OBJECTIVE_VERSION}")
+    print(
+        f"[Preflight] PASS roundtrips={report.roundtrip_cases} "
+        f"overfit={report.overfit_initial_loss:.4f}->{report.overfit_final_loss:.4f} "
+        f"objective=v{LOSS_OBJECTIVE_VERSION}"
+    )
     print(
         f"[Architecture] ffn={cfg['ffn_type']} total_params={total_params:,} "
         f"active_params/token={active_params:,} activation={activation_ratio:.1%} "
-        f"GQA={cfg['n_heads']}Q/{cfg['n_kv_heads']}KV experts={cfg['num_experts']} top_k={cfg['experts_per_token']}"
+        f"GQA={cfg['n_heads']}Q/{cfg['n_kv_heads']}KV "
+        f"experts={cfg['num_experts']} top_k={cfg['experts_per_token']}"
     )
     print(
         f"[Compute] measured_supervised_tokens/s={probe.useful_tokens_per_second:,.1f} "
@@ -490,18 +531,29 @@ def main() -> None:
         f"tokens/total_param={probe.projected_useful_tokens/max(total_params,1):.2f} "
         f"tokens/active_param={probe.projected_useful_tokens/max(active_params,1):.2f}"
     )
-    print(f"[Compute] target={target_tokens:,} ({target_tpp:.1f} tokens/total_param) exam_steps={exam_steps:,}")
+    print(
+        f"[Compute] target={target_tokens:,} ({target_tpp:.1f} tokens/total_param) "
+        f"exam_steps={exam_steps:,}"
+    )
     if args.preflight_only:
-        print("[Preflight] Full training intentionally not started. Verified sparse artifacts are reusable.")
+        print("[Preflight] Full training intentionally not started. Verified stream-only artifacts are reusable.")
         return
 
     torch.manual_seed(SEED)
     random.seed(SEED)
     model = lineage_model if lineage_model is not None else VistaReasoningGPT(**model_config)
     optimizer = _new_optimizer(model, cfg)
-    val_ds = PackedSequenceDataset(val_sequences, int(cfg["seq_len"]), tokenizer.pad_id())
-    val_loader = DataLoader(val_ds, batch_size=int(cfg["batch_size"]), shuffle=False, num_workers=0)
-    finite_ds = None if hf_specs else PackedSequenceDataset(train_sequences, int(cfg["seq_len"]), tokenizer.pad_id())
+    val_ds = PackedSequenceDataset(
+        val_sequences,
+        int(cfg["seq_len"]),
+        tokenizer.pad_id(),
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=int(cfg["batch_size"]),
+        shuffle=False,
+        num_workers=0,
+    )
 
     state_contract = {
         **contract,
@@ -509,7 +561,6 @@ def main() -> None:
         "model_config": model_config,
         "target_prediction_tokens": target_tokens,
         "exam_steps": exam_steps,
-        "local_replay_weight": replay_weight,
     }
     epoch = 0
     resume_step = 0
@@ -534,56 +585,97 @@ def main() -> None:
         stale = int(state["epochs_without_improvement"])
         torch.set_rng_state(state["torch_rng_state"])
         random.setstate(state["python_random_state"])
-        print(f"[Resume] epoch={epoch} step={resume_step}/{exam_steps} tokens={cumulative_tokens:,}/{target_tokens:,}")
+        print(
+            f"[Resume] epoch={epoch} step={resume_step}/{exam_steps} "
+            f"tokens={cumulative_tokens:,}/{target_tokens:,}"
+        )
     elif state_path.exists():
         raise RuntimeError("training_state_already_exists:use_--resume_or_clean_bundle")
 
     previous_exam = None
     if epoch == 0 and resume_step == 0:
         previous_exam = _run_exam(
-            model, tokenizer, epoch=0, stage=stage, train_loss=None, val_loss=None,
-            exams_dir=exams_dir, previous=None, max_new_tokens=int(cfg["exam_max_new_tokens"]),
+            model,
+            tokenizer,
+            epoch=0,
+            stage=stage,
+            train_loss=None,
+            val_loss=None,
+            exams_dir=exams_dir,
+            previous=None,
+            max_new_tokens=int(cfg["exam_max_new_tokens"]),
         )
 
-    deadline = time.monotonic() + args.session_hours * 3600
-    while cumulative_tokens < target_tokens and time.monotonic() < deadline:
-        if hf_specs:
-            loader = _stream_loader(
-                specs=hf_specs, stage=stage, epoch=epoch, local_replay=local_replay,
-                excluded=list(val_texts) + _exam_holdout_texts(stage), tokenizer=tokenizer,
-                cfg=cfg, replay_weight=replay_weight,
-            )
-        else:
-            generator = torch.Generator().manual_seed(SEED + epoch)
-            loader = DataLoader(
-                finite_ds, batch_size=int(cfg["batch_size"]), shuffle=True,
-                generator=generator, num_workers=0, drop_last=False,
-            )
-        iterator = iter(loader)
+    excluded_stream_texts = list(val_texts) + _exam_holdout_texts(stage)
+    stream_generation = epoch if args.resume else 0
+    train_loader = _stream_loader(
+        specs=hf_specs,
+        stage=stage,
+        stream_generation=stream_generation,
+        excluded=excluded_stream_texts,
+        tokenizer=tokenizer,
+        cfg=cfg,
+    )
+    iterator = iter(train_loader)
+
+    # Resume cannot persist a remote HTTP cursor across processes. Replaying only
+    # the in-interval batch count keeps recovery bounded; GuardedSource removes
+    # exact/near duplicates during the reconstructed stream.
+    if resume_step > 0:
         for _ in range(resume_step):
             try:
                 next(iterator)
             except StopIteration:
-                iterator = iter(loader)
+                stream_generation += 1
+                train_loader = _stream_loader(
+                    specs=hf_specs,
+                    stage=stage,
+                    stream_generation=stream_generation,
+                    excluded=excluded_stream_texts,
+                    tokenizer=tokenizer,
+                    cfg=cfg,
+                )
+                iterator = iter(train_loader)
                 next(iterator)
 
+    deadline = time.monotonic() + args.session_hours * 3600
+    while cumulative_tokens < target_tokens and time.monotonic() < deadline:
         model.train()
         loss_sum = 0.0
         epoch_tokens = 0
         completed = resume_step
-        while completed < exam_steps and cumulative_tokens < target_tokens and time.monotonic() < deadline:
+
+        while (
+            completed < exam_steps
+            and cumulative_tokens < target_tokens
+            and time.monotonic() < deadline
+        ):
             try:
                 x, y = next(iterator)
             except StopIteration:
-                iterator = iter(loader)
+                stream_generation += 1
+                train_loader = _stream_loader(
+                    specs=hf_specs,
+                    stage=stage,
+                    stream_generation=stream_generation,
+                    excluded=excluded_stream_texts,
+                    tokenizer=tokenizer,
+                    cfg=cfg,
+                )
+                iterator = iter(train_loader)
                 x, y = next(iterator)
+
             completed += 1
             valid = int((y != tokenizer.pad_id()).sum().item())
             if valid <= 0:
                 continue
+
             _set_token_scheduled_lr(
-                optimizer, base_lr=float(cfg["lr"]), min_lr=float(cfg["lr_min"]),
-                cumulative_tokens=cumulative_tokens, target_tokens=target_tokens,
+                optimizer,
+                base_lr=float(cfg["lr"]),
+                min_lr=float(cfg["lr_min"]),
+                cumulative_tokens=cumulative_tokens,
+                target_tokens=target_tokens,
                 warmup_fraction=args.warmup_fraction,
             )
             optimizer.zero_grad(set_to_none=True)
@@ -593,57 +685,110 @@ def main() -> None:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg["grad_clip"]))
             optimizer.step()
+
             loss_sum += float(loss.item()) * valid
             epoch_tokens += valid
             cumulative_tokens += valid
             optimizer_steps += 1
+
             if completed % int(cfg["checkpoint_every_steps"]) == 0:
                 _save_state(
-                    state_path, contract=state_contract, epoch=epoch, step=completed,
-                    cumulative_tokens=cumulative_tokens, optimizer_steps=optimizer_steps,
-                    best_val=best_val, stale=stale, model=model, optimizer=optimizer,
+                    state_path,
+                    contract=state_contract,
+                    epoch=epoch,
+                    step=completed,
+                    cumulative_tokens=cumulative_tokens,
+                    optimizer_steps=optimizer_steps,
+                    best_val=best_val,
+                    stale=stale,
+                    model=model,
+                    optimizer=optimizer,
                 )
-                print(f"[Checkpoint] exam_epoch={epoch+1} step={completed}/{exam_steps} cumulative_supervised_tokens={cumulative_tokens:,}")
+                print(
+                    f"[Checkpoint] exam_epoch={epoch+1} step={completed}/{exam_steps} "
+                    f"cumulative_supervised_tokens={cumulative_tokens:,}"
+                )
 
         if epoch_tokens <= 0:
             raise RuntimeError("exam_epoch_has_no_prediction_tokens")
         train_loss = loss_sum / epoch_tokens
+
         if completed < exam_steps and time.monotonic() >= deadline:
             _save_state(
-                state_path, contract=state_contract, epoch=epoch, step=completed,
-                cumulative_tokens=cumulative_tokens, optimizer_steps=optimizer_steps,
-                best_val=best_val, stale=stale, model=model, optimizer=optimizer,
+                state_path,
+                contract=state_contract,
+                epoch=epoch,
+                step=completed,
+                cumulative_tokens=cumulative_tokens,
+                optimizer_steps=optimizer_steps,
+                best_val=best_val,
+                stale=stale,
+                model=model,
+                optimizer=optimizer,
             )
             _run_exam(
-                model, tokenizer, epoch=epoch, stage=stage, train_loss=train_loss, val_loss=None,
-                exams_dir=exams_dir, previous=previous_exam,
-                max_new_tokens=int(cfg["exam_max_new_tokens"]), prefix="session_end_exam",
+                model,
+                tokenizer,
+                epoch=epoch,
+                stage=stage,
+                train_loss=train_loss,
+                val_loss=None,
+                exams_dir=exams_dir,
+                previous=previous_exam,
+                max_new_tokens=int(cfg["exam_max_new_tokens"]),
+                prefix="session_end_exam",
             )
-            print(f"[SessionStop] step={completed}/{exam_steps} tokens={cumulative_tokens:,}/{target_tokens:,}. Resume with --resume.")
+            print(
+                f"[SessionStop] step={completed}/{exam_steps} "
+                f"tokens={cumulative_tokens:,}/{target_tokens:,}. Resume with --resume."
+            )
             return
 
-        val_loss, val_tokens = _validation_loss(model, val_loader, pad_id=tokenizer.pad_id())
+        val_loss, val_tokens = _validation_loss(
+            model,
+            val_loader,
+            pad_id=tokenizer.pad_id(),
+        )
         if val_loss < best_val - float(cfg["early_stop_min_delta"]):
             best_val = val_loss
             stale = 0
             _atomic_torch_save(
-                {"model_state_dict": model.state_dict(), "model_config": model_config,
-                 "validation_loss": best_val, "epoch": epoch + 1,
-                 "cumulative_prediction_tokens": cumulative_tokens},
+                {
+                    "model_state_dict": model.state_dict(),
+                    "model_config": model_config,
+                    "validation_loss": best_val,
+                    "epoch": epoch + 1,
+                    "cumulative_prediction_tokens": cumulative_tokens,
+                },
                 best_path,
             )
         else:
             stale += 1
+
         previous_exam = _run_exam(
-            model, tokenizer, epoch=epoch+1, stage=stage, train_loss=train_loss, val_loss=val_loss,
-            exams_dir=exams_dir, previous=previous_exam, max_new_tokens=int(cfg["exam_max_new_tokens"]),
+            model,
+            tokenizer,
+            epoch=epoch + 1,
+            stage=stage,
+            train_loss=train_loss,
+            val_loss=val_loss,
+            exams_dir=exams_dir,
+            previous=previous_exam,
+            max_new_tokens=int(cfg["exam_max_new_tokens"]),
         )
         epoch += 1
         resume_step = 0
         _save_state(
-            state_path, contract=state_contract, epoch=epoch, step=0,
-            cumulative_tokens=cumulative_tokens, optimizer_steps=optimizer_steps,
-            best_val=best_val, stale=stale, model=model, optimizer=optimizer,
+            state_path,
+            contract=state_contract,
+            epoch=epoch,
+            step=0,
+            cumulative_tokens=cumulative_tokens,
+            optimizer_steps=optimizer_steps,
+            best_val=best_val,
+            stale=stale,
+            model=model,
+            optimizer=optimizer,
         )
         current_tpp = cumulative_tokens / max(total_params, 1)
         print(
@@ -652,24 +797,41 @@ def main() -> None:
             f"cumulative={cumulative_tokens:,}/{target_tokens:,} "
             f"tokens/total_param={current_tpp:.3f} val_tokens={val_tokens:,}"
         )
-        if current_tpp >= float(cfg["early_stop_min_tokens_per_parameter"]) and stale >= int(cfg["early_stop_patience"]):
-            print(f"[EarlyStop] validation stalled for {stale} exam epochs after {current_tpp:.2f} tokens/total-param")
+        if (
+            current_tpp >= float(cfg["early_stop_min_tokens_per_parameter"])
+            and stale >= int(cfg["early_stop_patience"])
+        ):
+            print(
+                f"[EarlyStop] validation stalled for {stale} exam epochs "
+                f"after {current_tpp:.2f} tokens/total-param"
+            )
             break
 
     if not best_path.exists():
         _atomic_torch_save(
-            {"model_state_dict": model.state_dict(), "model_config": model_config,
-             "validation_loss": best_val, "epoch": epoch,
-             "cumulative_prediction_tokens": cumulative_tokens},
+            {
+                "model_state_dict": model.state_dict(),
+                "model_config": model_config,
+                "validation_loss": best_val,
+                "epoch": epoch,
+                "cumulative_prediction_tokens": cumulative_tokens,
+            },
             best_path,
         )
+
     best = torch.load(best_path, map_location="cpu", weights_only=False)
     model.load_state_dict(best["model_state_dict"])
     model.eval()
     final_exam = _run_exam(
-        model, tokenizer, epoch=int(best.get("epoch", epoch)), stage=stage,
-        train_loss=None, val_loss=float(best.get("validation_loss", best_val)),
-        exams_dir=exams_dir, previous=None, max_new_tokens=int(cfg["exam_max_new_tokens"]),
+        model,
+        tokenizer,
+        epoch=int(best.get("epoch", epoch)),
+        stage=stage,
+        train_loss=None,
+        val_loss=float(best.get("validation_loss", best_val)),
+        exams_dir=exams_dir,
+        previous=None,
+        max_new_tokens=int(cfg["exam_max_new_tokens"]),
         prefix="best_model_exam",
     )
     metrics = {
@@ -685,9 +847,17 @@ def main() -> None:
         "optimizer_steps": optimizer_steps,
         "best_validation_loss": float(best.get("validation_loss", best_val)),
         "tokenizer_efficiency": tokenizer_stats,
+        "stream_only": True,
+        "persistent_stream_per_session": True,
         "sparse_moe": str(cfg["ffn_type"]) == "moe",
-        "gqa": {"query_heads": int(cfg["n_heads"]), "kv_heads": int(cfg["n_kv_heads"])},
-        "routing": {"experts": int(cfg["num_experts"]), "top_k": int(cfg["experts_per_token"])},
+        "gqa": {
+            "query_heads": int(cfg["n_heads"]),
+            "kv_heads": int(cfg["n_kv_heads"]),
+        },
+        "routing": {
+            "experts": int(cfg["num_experts"]),
+            "top_k": int(cfg["experts_per_token"]),
+        },
         "best_model_exam": {
             "correctness_percent": final_exam.correctness_percent,
             "mean_quality_percent": final_exam.mean_quality_percent,
@@ -696,8 +866,13 @@ def main() -> None:
         },
     }
     save_model_bundle(
-        bundle_dir=bundle, model=model, tokenizer=tokenizer, model_config=model_config,
-        training_stage=stage, corpus_fingerprint=contract["curriculum_fingerprint"], metrics=metrics,
+        bundle_dir=bundle,
+        model=model,
+        tokenizer=tokenizer,
+        model_config=model_config,
+        training_stage=stage,
+        corpus_fingerprint=contract["curriculum_fingerprint"],
+        metrics=metrics,
     )
     print(f"bundle={bundle}")
 
