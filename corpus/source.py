@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -54,7 +55,12 @@ class DatasetSource(ABC):
 
 
 class LocalSource(DatasetSource):
-    """Local file adapter backed by the authoritative language data parser."""
+    """Local file adapter retained for non-language corpus tooling.
+
+    The language trainer itself is stream-only and must not construct this
+    adapter. Keeping the adapter here avoids coupling unrelated corpus tooling
+    to the language training policy.
+    """
 
     SKIP_NAMES = {"master_index.json", "__pycache__", ".DS_Store"}
     SUPPORTED_EXTENSIONS = {".json", ".jsonl", ".txt"}
@@ -86,8 +92,6 @@ class LocalSource(DatasetSource):
         ]
 
     def stream(self) -> Iterator[str]:
-        # Deliberately reuse the exact parser used by train_language_reasoner.
-        # This avoids a second local grammar/normalizer drifting from training.
         from src.language.data_pipeline import (
             _load_json_file,
             _load_jsonl_file,
@@ -107,7 +111,7 @@ class LocalSource(DatasetSource):
 
 
 class HFSource(DatasetSource):
-    """Canonical, bounded-memory Hugging Face streaming adapter."""
+    """Canonical, bounded-memory, transport-resilient HF streaming adapter."""
 
     COLUMN_SCHEMAS = (
         ("problem", "solution"),
@@ -118,6 +122,33 @@ class HFSource(DatasetSource):
         ("input", "output"),
         ("prompt", "response"),
         ("prompt", "answer"),
+    )
+
+    _TRANSIENT_MARKERS = (
+        "timed out",
+        "timeout",
+        "peer closed connection",
+        "incomplete message body",
+        "remoteprotocolerror",
+        "connection reset",
+        "connection aborted",
+        "connection refused",
+        "server disconnected",
+        "got disconnected from remote data host",
+        "winerror 10038",
+        "winerror 10053",
+        "winerror 10054",
+        "winerror 10060",
+        "temporarily unavailable",
+        "http 429",
+        "status code: 429",
+        "http 500",
+        "http 502",
+        "http 503",
+        "http 504",
+        "service unavailable",
+        "bad gateway",
+        "gateway timeout",
     )
 
     def __init__(
@@ -133,6 +164,8 @@ class HFSource(DatasetSource):
         token: Optional[str] = None,
         shuffle_buffer_size: int = 10_000,
         seed: int = 42,
+        stream_retry_attempts: int = 20,
+        stream_retry_base_seconds: float = 1.0,
     ):
         if not path.strip():
             raise ValueError("HFSource path must not be empty")
@@ -142,6 +175,10 @@ class HFSource(DatasetSource):
             raise ValueError("prompt_field and response_field must be configured together")
         if text_fields and prompt_field:
             raise ValueError("text_fields cannot be combined with prompt/response fields")
+        if stream_retry_attempts < 0:
+            raise ValueError("stream_retry_attempts must be >= 0")
+        if stream_retry_base_seconds < 0:
+            raise ValueError("stream_retry_base_seconds must be >= 0")
         self._path = path.strip()
         self._split = split
         self._text_fields = list(text_fields) if text_fields else None
@@ -153,6 +190,8 @@ class HFSource(DatasetSource):
         self._token = token or os.environ.get("HF_TOKEN")
         self._shuffle_buffer_size = int(shuffle_buffer_size)
         self._seed = int(seed)
+        self._stream_retry_attempts = int(stream_retry_attempts)
+        self._stream_retry_base_seconds = float(stream_retry_base_seconds)
 
     @property
     def source_id(self) -> str:
@@ -173,6 +212,7 @@ class HFSource(DatasetSource):
                 "text_fields": self._text_fields,
                 "prompt_field": self._prompt_field,
                 "response_field": self._response_field,
+                "stream_retry_attempts": self._stream_retry_attempts,
             },
         )
 
@@ -238,7 +278,7 @@ class HFSource(DatasetSource):
                 ) or None
         return None
 
-    def _load_dataset(self, *, shuffle: bool):
+    def _load_dataset(self, *, shuffle: bool, retry_generation: int = 0):
         if not self._revision:
             raise RuntimeError(
                 f"hf_revision_must_be_pinned:{self._path}:set an immutable commit/tag revision"
@@ -261,8 +301,19 @@ class HFSource(DatasetSource):
             kwargs["token"] = self._token
         dataset = load_dataset(self._path, **kwargs)
         if shuffle and self._shuffle_buffer_size > 0:
-            dataset = dataset.shuffle(seed=self._seed, buffer_size=self._shuffle_buffer_size)
+            retry_seed = self._seed + int(retry_generation) * 1_000_003
+            dataset = dataset.shuffle(seed=retry_seed, buffer_size=self._shuffle_buffer_size)
         return dataset
+
+    @classmethod
+    def _is_transient_stream_error(cls, exc: BaseException) -> bool:
+        if isinstance(exc, (ConnectionError, TimeoutError, OSError)):
+            return True
+        message = f"{type(exc).__name__}: {exc}".casefold()
+        return any(marker in message for marker in cls._TRANSIENT_MARKERS)
+
+    def _retry_delay(self, retry_number: int) -> float:
+        return min(30.0, self._stream_retry_base_seconds * (2 ** max(0, retry_number - 1)))
 
     def audit(self, *, max_rows: int = 1_000) -> HFSourceAudit:
         if max_rows <= 0:
@@ -292,17 +343,40 @@ class HFSource(DatasetSource):
         )
 
     def stream(self) -> Iterator[str]:
-        dataset = self._load_dataset(shuffle=True)
         emitted = 0
-        for row in dataset:
-            if self._max_examples is not None and emitted >= self._max_examples:
-                break
-            if not isinstance(row, dict):
-                continue
-            text = self._row_to_text(row)
-            if text and len(text) > 25:
-                yield text
-                emitted += 1
+        retry_generation = 0
+        while self._max_examples is None or emitted < self._max_examples:
+            try:
+                dataset = self._load_dataset(
+                    shuffle=True,
+                    retry_generation=retry_generation,
+                )
+                for row in dataset:
+                    if self._max_examples is not None and emitted >= self._max_examples:
+                        return
+                    if not isinstance(row, dict):
+                        continue
+                    text = self._row_to_text(row)
+                    if text and len(text) > 25:
+                        yield text
+                        emitted += 1
+                return
+            except Exception as exc:
+                if (
+                    not self._is_transient_stream_error(exc)
+                    or retry_generation >= self._stream_retry_attempts
+                ):
+                    raise
+                retry_generation += 1
+                delay = self._retry_delay(retry_generation)
+                print(
+                    f"[HFRetry] source={self.source_id} retry={retry_generation}/"
+                    f"{self._stream_retry_attempts} delay={delay:.1f}s "
+                    f"error={type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                if delay > 0:
+                    time.sleep(delay)
 
     def metadata(self) -> dict:
         return {
@@ -317,4 +391,5 @@ class HFSource(DatasetSource):
             "text_fields": self._text_fields,
             "prompt_field": self._prompt_field,
             "response_field": self._response_field,
+            "stream_retry_attempts": self._stream_retry_attempts,
         }
