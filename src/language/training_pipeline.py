@@ -140,6 +140,22 @@ def _contextual_long_chunks(
     return chunks
 
 
+def _drop_zero_supervision_sequences(
+    sequences: list[list[int]], *, tokenizer: BPETokenizer, seq_len: int,
+) -> list[list[int]]:
+    """Remove prompt-only windows before they can consume optimizer/exam steps."""
+    supervised: list[list[int]] = []
+    for sequence in sequences:
+        _, _, stats = build_loss_targets(
+            sequence,
+            seq_len=seq_len,
+            pad_id=tokenizer.pad_id(),
+        )
+        if stats.prediction_tokens > 0:
+            supervised.append(sequence)
+    return supervised
+
+
 def build_example_sequences(
     texts: list[str], tokenizer: BPETokenizer, *, seq_len: int,
 ) -> list[list[int]]:
@@ -170,8 +186,13 @@ def build_example_sequences(
             pack = list(ids)
     if len(pack) >= 2:
         sequences.append(pack)
+    sequences = _drop_zero_supervision_sequences(
+        sequences,
+        tokenizer=tokenizer,
+        seq_len=seq_len,
+    )
     if not sequences:
-        raise RuntimeError("packing_produced_no_sequences")
+        raise RuntimeError("packing_produced_no_supervised_sequences")
     if any(len(sequence) < 2 or len(sequence) > max_tokens for sequence in sequences):
         raise RuntimeError("invalid_packed_sequence_length")
     return sequences
@@ -191,11 +212,13 @@ class PackedSequenceDataset(Dataset):
         return len(self.sequences)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        x, y, _ = build_loss_targets(
+        x, y, stats = build_loss_targets(
             self.sequences[idx],
             seq_len=self.seq_len,
             pad_id=self.pad_id,
         )
+        if stats.prediction_tokens <= 0:
+            raise RuntimeError("packed_dataset_zero_supervision_sequence")
         return torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long)
 
 
@@ -266,6 +289,13 @@ def validate_sequence_contract(
 def run_tiny_overfit_gate(tokenizer: BPETokenizer, train_sequences: list[list[int]]) -> tuple[float, float]:
     seq_len = min(48, max(8, len(train_sequences[0]) - 1))
     tiny_sequences = [sequence[: seq_len + 1] for sequence in train_sequences[: min(4, len(train_sequences))]]
+    tiny_sequences = _drop_zero_supervision_sequences(
+        tiny_sequences,
+        tokenizer=tokenizer,
+        seq_len=seq_len,
+    )
+    if not tiny_sequences:
+        raise RuntimeError("tiny_overfit_has_no_supervised_sequences")
     dataset = PackedSequenceDataset(tiny_sequences, seq_len, tokenizer.pad_id())
     loader = torch.utils.data.DataLoader(dataset, batch_size=min(4, len(dataset)), shuffle=False)
     model = VistaReasoningGPT(
@@ -310,9 +340,24 @@ def run_training_preflight(
     *, tokenizer: BPETokenizer, train_texts: list[str], val_texts: list[str],
     train_sequences: list[list[int]], val_sequences: list[list[int]], seq_len: int,
 ) -> TrainingPreflightReport:
+    from src.language.semantic_audit import audit_training_semantics
+
     roundtrip_cases = validate_tokenizer_contract(tokenizer, train_texts)
     validate_sequence_contract(
         train_sequences, val_sequences, seq_len=seq_len, vocab_size=tokenizer.vocab_size,
+    )
+    semantic_report, _ = audit_training_semantics(
+        texts=train_texts,
+        sequences=train_sequences,
+        tokenizer=tokenizer,
+        seq_len=seq_len,
+    )
+    print(
+        f"[SemanticAudit] PASS examples={semantic_report.examples} "
+        f"documents={semantic_report.documents} conversations={semantic_report.conversations} "
+        f"sequences={semantic_report.sequences} supervision="
+        f"{semantic_report.mean_sequence_supervision_ratio:.1%} "
+        f"zero_target={semantic_report.zero_supervision_sequences}"
     )
     train_prediction_tokens = prediction_token_count(
         train_sequences, seq_len=seq_len, pad_id=tokenizer.pad_id(),
