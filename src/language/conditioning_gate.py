@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
+import os
 import random
 
 import torch
@@ -13,12 +15,20 @@ from src.language.tokenizer import BPETokenizer
 
 
 @dataclass(frozen=True, slots=True)
+class ConditioningCheck:
+    optimizer_updates: int
+    recall: int
+    loss: float
+
+
+@dataclass(frozen=True, slots=True)
 class ConditioningStageResult:
     size: int
     recall: int
     optimizer_updates: int
     final_loss: float
     responses: tuple[tuple[str, str, str], ...]
+    checks: tuple[ConditioningCheck, ...]
 
 
 def _cases() -> list[tuple[str, str]]:
@@ -129,6 +139,7 @@ def _run_stage(
     updates = 0
     final_loss = float("inf")
     perfect_checks = 0
+    checks: list[ConditioningCheck] = []
     while updates < max_updates:
         order = torch.randperm(len(examples), generator=generator).tolist()
         for start in range(0, len(order), min(8, len(order))):
@@ -148,6 +159,7 @@ def _run_stage(
 
             if updates % check_every == 0 or updates >= max_updates:
                 recalled, rows = _recall(model, tokenizer, cases)
+                checks.append(ConditioningCheck(updates, recalled, final_loss))
                 print(
                     f"[ConditioningGate] size={size} recall={recalled}/{size} "
                     f"updates={updates} loss={final_loss:.4f}"
@@ -155,24 +167,96 @@ def _run_stage(
                 if recalled == size:
                     perfect_checks += 1
                     if perfect_checks >= 2:
-                        return ConditioningStageResult(size, recalled, updates, final_loss, rows)
+                        return ConditioningStageResult(
+                            size, recalled, updates, final_loss, rows, tuple(checks)
+                        )
                 else:
                     perfect_checks = 0
             if updates >= max_updates:
                 break
 
     recalled, rows = _recall(model, tokenizer, cases)
-    return ConditioningStageResult(size, recalled, updates, final_loss, rows)
+    if not checks or checks[-1].optimizer_updates != updates:
+        checks.append(ConditioningCheck(updates, recalled, final_loss))
+    return ConditioningStageResult(
+        size, recalled, updates, final_loss, rows, tuple(checks)
+    )
 
 
-def run_prompt_conditioning_gate(tokenizer: BPETokenizer) -> tuple[int, int, int]:
+def _render_stage_result(
+    result: ConditioningStageResult,
+    *,
+    tokenizer: BPETokenizer,
+) -> str:
+    status = "PASS" if result.recall == result.size else "FAIL"
+    lines = [
+        "Vista Prompt Conditioning Gate",
+        f"Stage size: {result.size}",
+        f"Status: {status}",
+        f"Recall: {result.recall}/{result.size}",
+        f"Optimizer updates: {result.optimizer_updates}",
+        f"Final loss: {result.final_loss:.8f}",
+        f"Tokenizer vocab: {tokenizer.vocab_size}",
+        f"Tokenizer fingerprint: {tokenizer.fingerprint()}",
+        "",
+        "CONVERGENCE TRACE",
+        "update\trecall\tloss",
+    ]
+    for check in result.checks:
+        lines.append(
+            f"{check.optimizer_updates}\t{check.recall}/{result.size}\t{check.loss:.8f}"
+        )
+
+    lines.extend(("", "CASE RESULTS"))
+    for index, (prompt, expected, actual) in enumerate(result.responses, start=1):
+        marker = "OK" if expected == actual else "MISS"
+        lines.extend((
+            "",
+            "-" * 80,
+            f"CASE {index:02d} [{marker}]",
+            f"PROMPT: {prompt}",
+            f"EXPECTED: {expected!r}",
+            f"ACTUAL: {actual!r}",
+        ))
+
+    lines.extend((
+        "",
+        "INTERPRETATION",
+        "This gate tests exact prompt-to-answer conditioning, not arithmetic or world knowledge.",
+        "A PASS requires two consecutive perfect-recall checks for this stage size.",
+        "A FAIL means the long training run remains blocked at this cardinality.",
+    ))
+    return "\n".join(lines) + "\n"
+
+
+def _save_stage_result(
+    result: ConditioningStageResult,
+    *,
+    tokenizer: BPETokenizer,
+    diagnostics_dir: str | Path,
+) -> Path:
+    directory = Path(diagnostics_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"conditioning_stage_{result.size:02d}.txt"
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(_render_stage_result(result, tokenizer=tokenizer), encoding="utf-8")
+    os.replace(tmp, path)
+    return path
+
+
+def run_prompt_conditioning_gate(
+    tokenizer: BPETokenizer,
+    *,
+    diagnostics_dir: str | Path = "conditioning_diagnostics",
+) -> tuple[int, int, int]:
     """Prove 1/1, 8/8 and 32/32 prompt conditioning before long training.
 
     Every cardinality starts from a fresh deterministic initialization. This
     avoids measuring curriculum carry-over/catastrophic forgetting inside the
     diagnostic itself. Training is convergence-driven rather than tied to one
     arbitrary epoch count, and exact generation recall remains the acceptance
-    criterion.
+    criterion. Every stage is persisted before pass/fail handling so failures
+    remain inspectable instead of disappearing with the raised exception.
     """
     random.seed(1701)
     recalls: list[int] = []
@@ -189,6 +273,12 @@ def run_prompt_conditioning_gate(tokenizer: BPETokenizer) -> tuple[int, int, int
             max_updates=max_updates,
             check_every=check_every,
         )
+        stage_path = _save_stage_result(
+            result,
+            tokenizer=tokenizer,
+            diagnostics_dir=diagnostics_dir,
+        )
+        print(f"[ConditioningGate] stage_file={stage_path}")
         recalls.append(result.recall)
         if result.recall != size:
             for prompt, expected, actual in result.responses:
@@ -199,6 +289,7 @@ def run_prompt_conditioning_gate(tokenizer: BPETokenizer) -> tuple[int, int, int
                 )
             raise RuntimeError(
                 f"prompt_conditioning_gate_failed:{result.recall}/{size}:"
-                f"updates={result.optimizer_updates}:loss={result.final_loss:.4f}"
+                f"updates={result.optimizer_updates}:loss={result.final_loss:.4f}:"
+                f"diagnostics={stage_path}"
             )
     return recalls[0], recalls[1], recalls[2]
