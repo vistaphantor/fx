@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from typing import Iterable
 
-CANONICAL_CONTRACT_VERSION = 2
+CANONICAL_CONTRACT_VERSION = 3
 
 STRUCTURAL_TOKENS: tuple[str, ...] = (
     "<bos>", "<eos>", "<sep>",
@@ -30,6 +30,14 @@ _STRUCTURAL_RE = re.compile(
 )
 _ROLE_PREFIX_RE = re.compile(r"^\s*(?:Human|User|Assistant|AI|System)\s*:\s*", re.IGNORECASE)
 
+# Strong signals that UTF-8 bytes were decoded as Latin-1/Windows-1252. These
+# characters are not blanket-banned: they only trigger a conservative repair
+# attempt whose result must strictly reduce the corruption score.
+_MOJIBAKE_MARKERS: tuple[str, ...] = (
+    "Ã", "Â", "â€", "â€™", "â€œ", "â€�", "â€“", "â€”", "â€¦",
+    "ðŸ", "ï»¿", "ï¿½", "�",
+)
+
 
 @dataclass(frozen=True, slots=True)
 class CanonicalMessage:
@@ -37,14 +45,55 @@ class CanonicalMessage:
     content: str
 
 
-def _escape_structural_literals(value: object) -> str:
-    """Make reserved grammar strings inert when they originate in corpus payloads.
+def mojibake_score(value: object) -> int:
+    """Return a bounded corruption score for common UTF-8 mojibake patterns."""
+    text = "" if value is None else str(value)
+    score = text.count("�") * 8
+    for marker in _MOJIBAKE_MARKERS:
+        if marker == "�":
+            continue
+        score += text.count(marker) * 2
+    # C1 controls often appear after a bad single-byte decode and should never
+    # survive in natural-language training text.
+    score += sum(1 for char in text if 0x80 <= ord(char) <= 0x9F) * 3
+    return score
 
-    Structural tokens are protocol, not ordinary dataset text. Raw web/chat data
-    must never be able to create role/control state by merely containing a literal
-    string such as ``<assistant>``. HTML-style escaping preserves the visible
-    meaning while ensuring only the serializer itself can emit grammar tokens.
+
+def repair_mojibake(value: object) -> str:
+    """Conservatively repair common UTF-8-as-single-byte decoding corruption.
+
+    We never modify clean text. A candidate repair is accepted only when the
+    corruption score strictly decreases. At most two passes are attempted so
+    doubly-encoded text can be repaired without creating an unbounded heuristic.
     """
+    text = "" if value is None else str(value)
+    if mojibake_score(text) <= 0:
+        return text
+
+    current = text
+    current_score = mojibake_score(current)
+    for _ in range(2):
+        best = current
+        best_score = current_score
+        for encoding in ("cp1252", "latin-1"):
+            try:
+                candidate = current.encode(encoding, errors="strict").decode("utf-8", errors="strict")
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                continue
+            candidate_score = mojibake_score(candidate)
+            if candidate_score < best_score:
+                best = candidate
+                best_score = candidate_score
+        if best == current:
+            break
+        current, current_score = best, best_score
+        if current_score == 0:
+            break
+    return current
+
+
+def _escape_structural_literals(value: object) -> str:
+    """Make reserved grammar strings inert when they originate in corpus payloads."""
     text = "" if value is None else str(value)
     for token in STRUCTURAL_TOKENS:
         if token in text:
@@ -54,13 +103,7 @@ def _escape_structural_literals(value: object) -> str:
 
 
 def normalize_text(value: object, *, strip_role_prefix: bool = False) -> str:
-    """Normalize already-serialized text and structural tokens idempotently.
-
-    This function is for canonical protocol strings. Dataset payloads must pass
-    through :func:`normalize_payload_text` before wrappers are introduced.
-    Structural tokens are always emitted on their own lines. Applying this
-    function repeatedly produces byte-identical output.
-    """
+    """Normalize already-serialized text and structural tokens idempotently."""
     if value is None:
         return ""
     text = str(value).replace("\x00", "").replace("\r\n", "\n").replace("\r", "\n").strip()
@@ -88,9 +131,10 @@ def normalize_text(value: object, *, strip_role_prefix: bool = False) -> str:
 
 
 def normalize_payload_text(value: object, *, strip_role_prefix: bool = False) -> str:
-    """Normalize untrusted corpus content without allowing grammar injection."""
+    """Normalize untrusted corpus content without grammar injection or mojibake."""
+    repaired = repair_mojibake(value)
     return normalize_text(
-        _escape_structural_literals(value),
+        _escape_structural_literals(repaired),
         strip_role_prefix=strip_role_prefix,
     )
 
