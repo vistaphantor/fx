@@ -9,8 +9,9 @@ from dataclasses import dataclass
 import torch
 from torch.utils.data import Dataset
 
-from src.language.canonical_contract import prompt_family
+from src.language.canonical_contract import CanonicalMessage, prompt_family, serialize_messages
 from src.language.loss_objective import build_loss_targets
+from src.language.protocol import build_exam_prompt, extract_assistant_response, generation_stop_ids
 from src.language.pytorch_transformer import VistaReasoningGPT
 from src.language.tokenizer import BPETokenizer, TOKENIZER_ALGORITHM_VERSION
 
@@ -28,6 +29,9 @@ class TrainingPreflightReport:
     roundtrip_cases: int
     overfit_initial_loss: float
     overfit_final_loss: float
+    conditioning_recall_1: int
+    conditioning_recall_8: int
+    conditioning_recall_32: int
 
 
 def normalize_prompt_family(text: str) -> str:
@@ -64,13 +68,7 @@ def split_by_prompt_family(
 
 
 def _content_windows(token_ids: list[int], seq_len: int) -> list[list[int]]:
-    """Split long content without duplicating prediction targets.
-
-    Adjacent windows share exactly one boundary token. That token is the final
-    context token of the preceding window and the initial context token of the
-    next window, so every next-token transition is supervised once. The old
-    50% overlap trained many targets twice and overweighted long documents.
-    """
+    """Split long content without duplicating prediction targets."""
     if len(token_ids) < 2:
         return []
     window = seq_len + 1
@@ -143,7 +141,6 @@ def _contextual_long_chunks(
 def _drop_zero_supervision_sequences(
     sequences: list[list[int]], *, tokenizer: BPETokenizer, seq_len: int,
 ) -> list[list[int]]:
-    """Remove prompt-only windows before they can consume optimizer/exam steps."""
     supervised: list[list[int]] = []
     for sequence in sequences:
         _, _, stats = build_loss_targets(
@@ -336,6 +333,115 @@ def run_tiny_overfit_gate(tokenizer: BPETokenizer, train_sequences: list[list[in
     return first_loss, last_loss
 
 
+def _conditioning_cases() -> list[tuple[str, str]]:
+    # Deliberately arbitrary mappings test conditioning, not arithmetic skill.
+    # The values are unique so a global answer prior cannot pass this gate.
+    return [
+        (f"Conditioning key {index:02d}. Reply with its assigned value only.", f"{100 + index}.")
+        for index in range(32)
+    ]
+
+
+def _conditioning_recall(
+    model: VistaReasoningGPT,
+    tokenizer: BPETokenizer,
+    cases: list[tuple[str, str]],
+) -> int:
+    was_training = model.training
+    correct = 0
+    stops = generation_stop_ids(tokenizer)
+    try:
+        model.eval()
+        for prompt, expected in cases:
+            prompt_ids = tokenizer.encode(
+                build_exam_prompt(prompt), add_bos=False, add_eos=False,
+            )
+            if len(prompt_ids) >= model.max_seq_len:
+                raise RuntimeError("conditioning_prompt_exceeds_tiny_context")
+            generated = model.generate(
+                torch.tensor([prompt_ids], dtype=torch.long),
+                max_new_tokens=12,
+                stop_ids=stops,
+                use_kv_cache=True,
+                do_sample=False,
+            )
+            decoded = tokenizer.decode(generated[0].tolist(), skip_special=False)
+            response = extract_assistant_response(decoded).strip()
+            if response == expected:
+                correct += 1
+    finally:
+        model.train(was_training)
+    return correct
+
+
+def run_prompt_conditioning_gate(tokenizer: BPETokenizer) -> tuple[int, int, int]:
+    """Prove exact prompt->answer memorization before expensive training.
+
+    This uses the same canonical serializer, BOS chat prompt, role-aware labels,
+    transformer forward pass and greedy generation path as the real model. A
+    lower language-model loss is insufficient: each stage must generate every
+    assigned value exactly, otherwise full training is blocked.
+    """
+    torch.manual_seed(1701)
+    random.seed(1701)
+    seq_len = 64
+    model = VistaReasoningGPT(
+        vocab_size=tokenizer.vocab_size,
+        d_model=64,
+        n_layers=2,
+        n_heads=4,
+        n_kv_heads=2,
+        ffn_dim=192,
+        max_seq_len=seq_len,
+        dropout=0.0,
+        ffn_type="dense",
+        num_experts=1,
+        experts_per_token=1,
+        moe_ffn_dim=192,
+        shared_expert_ffn_dim=0,
+        router_aux_loss_coef=0.0,
+        router_jitter=0.0,
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-3, weight_decay=0.0)
+    all_cases = _conditioning_cases()
+    recalls: list[int] = []
+
+    for size, steps in ((1, 120), (8, 220), (32, 420)):
+        cases = all_cases[:size]
+        texts = [
+            serialize_messages((
+                CanonicalMessage("user", prompt),
+                CanonicalMessage("assistant", answer),
+            ))
+            for prompt, answer in cases
+        ]
+        sequences = build_example_sequences(texts, tokenizer, seq_len=seq_len)
+        dataset = PackedSequenceDataset(sequences, seq_len, tokenizer.pad_id())
+        loader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=min(8, len(dataset)),
+            shuffle=True,
+            generator=torch.Generator().manual_seed(1701 + size),
+        )
+        for _ in range(steps):
+            model.train()
+            for x, y in loader:
+                optimizer.zero_grad(set_to_none=True)
+                _, loss = model(x, targets=y, pad_id=tokenizer.pad_id())
+                if loss is None or not torch.isfinite(loss):
+                    raise RuntimeError("conditioning_gate_non_finite_loss")
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+        recalled = _conditioning_recall(model, tokenizer, cases)
+        recalls.append(recalled)
+        print(f"[ConditioningGate] recall={recalled}/{size}")
+        if recalled != size:
+            raise RuntimeError(f"prompt_conditioning_gate_failed:{recalled}/{size}")
+
+    return recalls[0], recalls[1], recalls[2]
+
+
 def run_training_preflight(
     *, tokenizer: BPETokenizer, train_texts: list[str], val_texts: list[str],
     train_sequences: list[list[int]], val_sequences: list[list[int]], seq_len: int,
@@ -368,6 +474,7 @@ def run_training_preflight(
     if train_prediction_tokens <= 0 or validation_prediction_tokens <= 0:
         raise RuntimeError("preflight_has_no_prediction_tokens")
     initial_loss, final_loss = run_tiny_overfit_gate(tokenizer, train_sequences)
+    recall_1, recall_8, recall_32 = run_prompt_conditioning_gate(tokenizer)
     return TrainingPreflightReport(
         train_examples=len(train_texts), validation_examples=len(val_texts),
         train_sequences=len(train_sequences), validation_sequences=len(val_sequences),
@@ -377,4 +484,7 @@ def run_training_preflight(
         tokenizer_algorithm_version=tokenizer.algorithm_version,
         roundtrip_cases=roundtrip_cases,
         overfit_initial_loss=initial_loss, overfit_final_loss=final_loss,
+        conditioning_recall_1=recall_1,
+        conditioning_recall_8=recall_8,
+        conditioning_recall_32=recall_32,
     )
