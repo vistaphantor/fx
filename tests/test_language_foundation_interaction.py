@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import hashlib
 
+import torch
+
 from src.language.loss_objective import build_loss_targets
+from src.language.pytorch_transformer import VistaReasoningGPT
 from src.language.streaming_sources import (
     FOUNDATION_INTERACTION_FRACTION,
     _continuation_interaction,
@@ -27,6 +30,14 @@ def _document() -> str:
     return "<bos>\n" + " ".join(words) + "\n<eos>"
 
 
+def _interaction_and_tokenizer() -> tuple[str, BPETokenizer]:
+    transformed = _continuation_interaction(_document())
+    assert transformed is not None
+    tok = BPETokenizer()
+    tok.train(transformed, vocab_size=512, min_frequency=1)
+    return transformed, tok
+
+
 def test_foundation_interaction_is_real_prefix_to_real_continuation() -> None:
     transformed = _continuation_interaction(_document())
     assert transformed is not None
@@ -37,11 +48,7 @@ def test_foundation_interaction_is_real_prefix_to_real_continuation() -> None:
 
 
 def test_foundation_interaction_targets_only_assistant_lane() -> None:
-    transformed = _continuation_interaction(_document())
-    assert transformed is not None
-
-    tok = BPETokenizer()
-    tok.train(transformed, vocab_size=512, min_frequency=1)
+    transformed, tok = _interaction_and_tokenizer()
     ids = tok.encode(transformed, add_bos=False, add_eos=False)
     _, targets, stats = build_loss_targets(ids, seq_len=191, pad_id=tok.pad_id())
 
@@ -51,6 +58,51 @@ def test_foundation_interaction_targets_only_assistant_lane() -> None:
     for index, token_id in enumerate(ids[1:], start=0):
         if token_id in {user_id, assistant_id}:
             assert targets[index] == tok.pad_id()
+
+
+def test_tiny_model_can_learn_assistant_continuation_objective() -> None:
+    torch.manual_seed(7)
+    transformed, tok = _interaction_and_tokenizer()
+    ids = tok.encode(transformed, add_bos=False, add_eos=False)
+    seq_len = min(191, len(ids) - 1)
+    x, y, stats = build_loss_targets(ids, seq_len=seq_len, pad_id=tok.pad_id())
+    assert stats.prediction_tokens > 0
+
+    model = VistaReasoningGPT(
+        vocab_size=tok.vocab_size,
+        d_model=48,
+        n_layers=2,
+        n_heads=4,
+        n_kv_heads=2,
+        ffn_dim=128,
+        max_seq_len=seq_len,
+        dropout=0.0,
+        ffn_type="dense",
+        num_experts=1,
+        experts_per_token=1,
+        moe_ffn_dim=128,
+        shared_expert_ffn_dim=0,
+        router_aux_loss_coef=0.0,
+        router_jitter=0.0,
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-3)
+    xb = torch.tensor([x], dtype=torch.long)
+    yb = torch.tensor([y], dtype=torch.long)
+
+    first = None
+    last = None
+    for _ in range(60):
+        optimizer.zero_grad(set_to_none=True)
+        _, loss = model(xb, targets=yb, pad_id=tok.pad_id())
+        assert loss is not None and torch.isfinite(loss)
+        if first is None:
+            first = float(loss.item())
+        loss.backward()
+        optimizer.step()
+        last = float(loss.item())
+
+    assert first is not None and last is not None
+    assert last < first * 0.30
 
 
 def test_interaction_selection_is_deterministic_and_near_configured_fraction() -> None:
