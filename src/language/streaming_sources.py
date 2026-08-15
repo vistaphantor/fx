@@ -10,8 +10,26 @@ from corpus.dedup import NearDuplicateIndex
 from corpus.quality import FOUNDATION_ENGLISH_FILTER, LANGUAGE_QUALITY_FILTER, QualityFilter
 from corpus.source import DatasetSource, HFSource
 from corpus.streamer import WeightedSourceStream
-from src.language.canonical_contract import canonical_hash, canonicalize_serialized, prompt_family
+from src.language.canonical_contract import (
+    CanonicalMessage,
+    canonical_hash,
+    canonicalize_serialized,
+    prompt_family,
+    serialize_messages,
+)
 from src.language.curriculum import is_math_example, is_reasoning_example, is_trading_example
+
+
+# Foundation must learn two different skills at the same time:
+#   1. ordinary causal English from documents;
+#   2. that a <user> turn followed by <assistant> requires a useful continuation.
+# A finite dialogue dataset alone cannot sustain the second lane for a long stream,
+# so a deterministic fraction of real documents becomes a self-supervised
+# continuation task. The target text is always genuine corpus text, never an
+# invented answer.
+FOUNDATION_INTERACTION_FRACTION = 0.25
+FOUNDATION_CONTINUATION_PREFIX_WORDS = 32
+FOUNDATION_CONTINUATION_TARGET_WORDS = 48
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +56,63 @@ def _quality_filter_for_stage(stage: str) -> QualityFilter:
     if normalized == "foundation":
         return FOUNDATION_ENGLISH_FILTER
     return LANGUAGE_QUALITY_FILTER
+
+
+def _is_chat(text: str) -> bool:
+    return "<user>" in text and "<assistant>" in text
+
+
+def _document_payload(text: str) -> str:
+    value = canonicalize_serialized(text)
+    if not value:
+        return ""
+    if value.startswith("<bos>"):
+        value = value[len("<bos>"):].lstrip()
+    if value.endswith("<eos>"):
+        value = value[:-len("<eos>")].rstrip()
+    return value.strip()
+
+
+def _continuation_interaction(text: str) -> str | None:
+    """Turn a real document into a bounded self-supervised assistant task.
+
+    This is not synthetic knowledge. The user receives a genuine prefix from the
+    document and the assistant target is the genuine text that follows it. The
+    bounded word counts keep the full interaction comfortably inside the 192-token
+    foundation context for the current byte-BPE profiles.
+    """
+    if _is_chat(text):
+        return None
+    payload = _document_payload(text)
+    words = payload.split()
+    minimum = FOUNDATION_CONTINUATION_PREFIX_WORDS + 12
+    if len(words) < minimum:
+        return None
+
+    prefix_end = min(FOUNDATION_CONTINUATION_PREFIX_WORDS, len(words) - 12)
+    target_end = min(
+        len(words),
+        prefix_end + FOUNDATION_CONTINUATION_TARGET_WORDS,
+    )
+    prefix = " ".join(words[:prefix_end]).strip()
+    continuation = " ".join(words[prefix_end:target_end]).strip()
+    if not prefix or not continuation:
+        return None
+
+    return serialize_messages((
+        CanonicalMessage(
+            "user",
+            "Continue this passage naturally:\n" + prefix,
+        ),
+        CanonicalMessage("assistant", continuation),
+    )) or None
+
+
+def _use_foundation_interaction(digest: str) -> bool:
+    # Hash selection is deterministic across machines/runs and does not touch the
+    # trainer RNG. That keeps validation/preflight reproducible.
+    bucket = int(digest[:8], 16) / 0xFFFFFFFF
+    return bucket < FOUNDATION_INTERACTION_FRACTION
 
 
 class GuardedSource(DatasetSource):
@@ -78,6 +153,9 @@ class GuardedSource(DatasetSource):
             "near_dedup_entries": self._near_dedup_entries,
             "near_dedup_hamming": self._near_dedup_hamming,
             "shared_near_dedup": self._near_index is not None,
+            "foundation_interaction_fraction": (
+                FOUNDATION_INTERACTION_FRACTION if self._stage == "foundation" else 0.0
+            ),
         }
 
     def _stage_accepts(self, text: str) -> bool:
@@ -110,6 +188,16 @@ class GuardedSource(DatasetSource):
             if not near.accept(text):
                 continue
             seen.add(digest)
+
+            if (
+                self._stage == "foundation"
+                and not _is_chat(text)
+                and _use_foundation_interaction(digest)
+            ):
+                interaction = _continuation_interaction(text)
+                if interaction:
+                    yield interaction
+                    continue
             yield text
 
 
@@ -181,22 +269,27 @@ def load_hf_source_config(path: str | Path) -> tuple[HFSourceSpec, ...]:
 
 
 def specs_fingerprint(specs: Sequence[HFSourceSpec]) -> str:
-    payload = [
-        {
-            "path": spec.path,
-            "weight": spec.weight,
-            "stages": list(spec.stages),
-            "split": spec.split,
-            "config_name": spec.config_name,
-            "revision": spec.revision,
-            "text_fields": list(spec.text_fields) if spec.text_fields else None,
-            "prompt_field": spec.prompt_field,
-            "response_field": spec.response_field,
-            "max_examples": spec.max_examples,
-            "shuffle_buffer_size": spec.shuffle_buffer_size,
-        }
-        for spec in specs
-    ]
+    payload = {
+        "foundation_interaction_fraction": FOUNDATION_INTERACTION_FRACTION,
+        "foundation_continuation_prefix_words": FOUNDATION_CONTINUATION_PREFIX_WORDS,
+        "foundation_continuation_target_words": FOUNDATION_CONTINUATION_TARGET_WORDS,
+        "sources": [
+            {
+                "path": spec.path,
+                "weight": spec.weight,
+                "stages": list(spec.stages),
+                "split": spec.split,
+                "config_name": spec.config_name,
+                "revision": spec.revision,
+                "text_fields": list(spec.text_fields) if spec.text_fields else None,
+                "prompt_field": spec.prompt_field,
+                "response_field": spec.response_field,
+                "max_examples": spec.max_examples,
+                "shuffle_buffer_size": spec.shuffle_buffer_size,
+            }
+            for spec in specs
+        ],
+    }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
@@ -266,9 +359,9 @@ def sample_training_stream(
 
     Preflight is for tokenizer/data-contract inspection, not stochastic training.
     Disabling per-source HF shuffle here prevents the datasets library from
-    scattering a small 2,500-example sample across thousands of remote parquet
-    shards. WeightedSourceStream still mixes the configured sources according to
-    their weights, while each individual source is consumed sequentially.
+    scattering a small sample across thousands of remote parquet shards.
+    WeightedSourceStream still mixes the configured sources according to their
+    weights, while each individual source is consumed sequentially.
     """
     if limit <= 0:
         raise ValueError("stream sample limit must be positive")
