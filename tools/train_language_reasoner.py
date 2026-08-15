@@ -495,6 +495,7 @@ def main() -> None:
             int(round(args.exam_interval_minutes * 60 / max(step_seconds, 1e-9))),
         ),
     )
+    measured_exam_steps = exam_steps
 
     preflight = {
         **contract,
@@ -511,7 +512,7 @@ def main() -> None:
         "tokenizer_efficiency": tokenizer_stats,
         "source_audit": source_audit,
         "compute_probe": probe.to_dict(),
-        "exam_steps": exam_steps,
+        "exam_steps": measured_exam_steps,
     }
     _atomic_json_save(preflight, preflight_path)
     print(
@@ -533,7 +534,7 @@ def main() -> None:
     )
     print(
         f"[Compute] target={target_tokens:,} ({target_tpp:.1f} tokens/total_param) "
-        f"exam_steps={exam_steps:,}"
+        f"exam_steps={measured_exam_steps:,}"
     )
     if args.preflight_only:
         print("[Preflight] Full training intentionally not started. Verified stream-only artifacts are reusable.")
@@ -560,7 +561,7 @@ def main() -> None:
         "tokenizer_fingerprint": tokenizer.fingerprint(),
         "model_config": model_config,
         "target_prediction_tokens": target_tokens,
-        "exam_steps": exam_steps,
+        "exam_steps": measured_exam_steps,
     }
     epoch = 0
     resume_step = 0
@@ -573,6 +574,8 @@ def main() -> None:
             raise RuntimeError("resume_training_state_missing")
         state = torch.load(state_path, map_location="cpu", weights_only=False)
         for key, value in state_contract.items():
+            if key == "exam_steps":
+                continue
             if state.get(key) != value:
                 raise RuntimeError(f"resume_contract_mismatch:{key}")
         model.load_state_dict(state["model_state_dict"])
@@ -583,8 +586,22 @@ def main() -> None:
         optimizer_steps = int(state["optimizer_steps"])
         best_val = float(state["best_validation_loss"])
         stale = int(state["epochs_without_improvement"])
+        saved_exam_steps = int(state.get("exam_steps", measured_exam_steps))
+        if resume_step > 0:
+            if saved_exam_steps <= 0 or resume_step >= saved_exam_steps:
+                raise RuntimeError(
+                    f"invalid_saved_exam_cadence:step={resume_step}:exam_steps={saved_exam_steps}"
+                )
+            exam_steps = saved_exam_steps
+        else:
+            exam_steps = measured_exam_steps
+        state_contract["exam_steps"] = exam_steps
         torch.set_rng_state(state["torch_rng_state"])
         random.setstate(state["python_random_state"])
+        print(
+            f"[ResumeCadence] measured={measured_exam_steps} saved={saved_exam_steps} "
+            f"active={exam_steps} resume_step={resume_step}"
+        )
         print(
             f"[Resume] epoch={epoch} step={resume_step}/{exam_steps} "
             f"tokens={cumulative_tokens:,}/{target_tokens:,}"
@@ -778,6 +795,13 @@ def main() -> None:
         )
         epoch += 1
         resume_step = 0
+        # Once an interrupted interval has completed, future intervals may adopt
+        # the cadence measured by this process. Cadence is runtime scheduling,
+        # never checkpoint identity.
+        if exam_steps != measured_exam_steps:
+            exam_steps = measured_exam_steps
+            state_contract["exam_steps"] = exam_steps
+            print(f"[ResumeCadence] next_interval={exam_steps}")
         _save_state(
             state_path,
             contract=state_contract,
