@@ -19,7 +19,8 @@ from src.language.canonical_contract import STRUCTURAL_TOKENS, canonicalize_seri
 from src.language.loss_objective import build_loss_targets
 from src.language.tokenizer import ASSISTANT, BOS, EOS, USER, BPETokenizer, SPECIAL_TOKENS
 
-SEMANTIC_AUDIT_VERSION = 2
+SEMANTIC_AUDIT_VERSION = 3
+MIN_INTERACTION_EXAMPLE_FRACTION = 0.15
 
 _BOS_ID = SPECIAL_TOKENS.index(BOS)
 _EOS_ID = SPECIAL_TOKENS.index(EOS)
@@ -33,6 +34,7 @@ class SemanticAuditReport:
     examples: int
     documents: int
     conversations: int
+    conversation_fraction: float
     sequences: int
     prediction_tokens: int
     masked_prompt_tokens: int
@@ -138,12 +140,23 @@ def audit_training_semantics(
             text[:2400],
         ])
 
+    conversation_fraction = conversations / max(1, len(selected_texts))
+    if conversation_fraction < MIN_INTERACTION_EXAMPLE_FRACTION:
+        raise RuntimeError(
+            "semantic_audit_insufficient_interaction_coverage:"
+            f"{conversation_fraction:.3f}<{MIN_INTERACTION_EXAMPLE_FRACTION:.3f}"
+        )
+
     prediction_tokens = 0
     masked_prompt_tokens = 0
     masked_boundary_tokens = 0
     zero_supervision = 0
     ratios: list[float] = []
-    rendered.extend(["", "PACKED TARGET-MASK PREVIEW"])
+    rendered.extend([
+        "",
+        f"Interaction coverage: {conversation_fraction:.1%}",
+        "PACKED TARGET-MASK PREVIEW",
+    ])
 
     for sequence_index, sequence in enumerate(selected_sequences, start=1):
         if len(sequence) < 2 or len(sequence) > seq_len + 1:
@@ -163,8 +176,6 @@ def audit_training_semantics(
         if stats.prediction_tokens <= 0:
             raise RuntimeError(f"semantic_audit_zero_supervision_sequence:{sequence_index}")
 
-        # Opening grammar tokens are context, never desired model output. This
-        # catches packed-boundary and role-mask regressions immediately.
         for target_position in range(1, len(sequence)):
             token_id = sequence[target_position]
             y_index = target_position - 1
@@ -195,6 +206,7 @@ def audit_training_semantics(
         examples=len(selected_texts),
         documents=documents,
         conversations=conversations,
+        conversation_fraction=conversation_fraction,
         sequences=len(selected_sequences),
         prediction_tokens=prediction_tokens,
         masked_prompt_tokens=masked_prompt_tokens,
