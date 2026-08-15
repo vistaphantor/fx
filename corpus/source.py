@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import os
 import time
 from abc import ABC, abstractmethod
@@ -40,141 +41,99 @@ class HFSourceAudit:
 
 
 class DatasetSource(ABC):
-    @abstractmethod
-    def scan(self) -> SourceMetadata: ...
-
-    @abstractmethod
-    def stream(self) -> Iterator[str]: ...
-
-    @abstractmethod
-    def metadata(self) -> dict: ...
-
     @property
     @abstractmethod
-    def source_id(self) -> str: ...
+    def source_id(self) -> str:
+        raise NotImplementedError
+
+    @abstractmethod
+    def scan(self) -> SourceMetadata:
+        raise NotImplementedError
+
+    @abstractmethod
+    def stream(self) -> Iterator[str]:
+        raise NotImplementedError
 
 
 class LocalSource(DatasetSource):
-    """Local file adapter retained for non-language corpus tooling.
-
-    The language trainer itself is stream-only and must not construct this
-    adapter. Keeping the adapter here avoids coupling unrelated corpus tooling
-    to the language training policy.
-    """
-
-    SKIP_NAMES = {"master_index.json", "__pycache__", ".DS_Store"}
-    SUPPORTED_EXTENSIONS = {".json", ".jsonl", ".txt"}
-
     def __init__(self, path: str | Path):
-        self._path = Path(path)
+        self.path = Path(path)
 
     @property
     def source_id(self) -> str:
-        return f"local:{self._path}"
+        return f"local:{self.path.resolve()}"
 
     def scan(self) -> SourceMetadata:
-        size = self._path.stat().st_size if self._path.is_file() else sum(
-            f.stat().st_size for f in self._path.rglob("*") if f.is_file()
+        if not self.path.exists():
+            raise FileNotFoundError(self.path)
+        if self.path.is_file():
+            return SourceMetadata(
+                source_type="local",
+                path=str(self.path),
+                size_bytes=self.path.stat().st_size,
+                estimated_docs=1,
+                description=self.path.name,
+            )
+        files = [path for path in self.path.rglob("*") if path.is_file()]
+        return SourceMetadata(
+            source_type="local",
+            path=str(self.path),
+            size_bytes=sum(path.stat().st_size for path in files),
+            estimated_docs=len(files),
+            description=self.path.name,
         )
-        return SourceMetadata(source_type="local", path=str(self._path), size_bytes=size)
-
-    def _files(self) -> list[Path]:
-        if self._path.is_file():
-            if self._path.suffix.casefold() not in self.SUPPORTED_EXTENSIONS:
-                raise ValueError(f"unsupported_local_training_file:{self._path}")
-            return [self._path]
-        return [
-            file_path
-            for file_path in sorted(self._path.rglob("*"))
-            if file_path.is_file()
-            and file_path.suffix.casefold() in self.SUPPORTED_EXTENSIONS
-            and file_path.name not in self.SKIP_NAMES
-        ]
 
     def stream(self) -> Iterator[str]:
-        from src.language.data_pipeline import (
-            _load_json_file,
-            _load_jsonl_file,
-            _load_txt_file,
-        )
+        from corpus.loader import DataLoader
 
-        loaders = {
-            ".json": _load_json_file,
-            ".jsonl": _load_jsonl_file,
-            ".txt": _load_txt_file,
-        }
-        for file_path in self._files():
-            yield from loaders[file_path.suffix.casefold()](file_path)
-
-    def metadata(self) -> dict:
-        return {"source_type": "local", "path": str(self._path)}
+        loader = DataLoader(str(self.path))
+        yield from loader.load()
 
 
 class HFSource(DatasetSource):
-    """Canonical, bounded-memory, transport-resilient HF streaming adapter."""
+    """Pinned Hugging Face streaming dataset source."""
 
     COLUMN_SCHEMAS = (
-        ("problem", "solution"),
-        ("question", "solution"),
-        ("question", "answer"),
-        ("instruction", "output"),
-        ("instruction", "response"),
-        ("input", "output"),
         ("prompt", "response"),
-        ("prompt", "answer"),
+        ("instruction", "output"),
+        ("question", "answer"),
+        ("input", "output"),
     )
-
     _TRANSIENT_MARKERS = (
         "timed out",
         "timeout",
         "peer closed connection",
-        "incomplete message body",
-        "remoteprotocolerror",
         "connection reset",
         "connection aborted",
-        "connection refused",
-        "server disconnected",
-        "got disconnected from remote data host",
+        "got disconnected",
         "winerror 10038",
-        "winerror 10053",
-        "winerror 10054",
-        "winerror 10060",
-        "temporarily unavailable",
-        "http 429",
-        "status code: 429",
-        "http 500",
-        "http 502",
-        "http 503",
-        "http 504",
-        "service unavailable",
-        "bad gateway",
-        "gateway timeout",
+        "ssl",
+        "temporary failure",
     )
 
     def __init__(
         self,
         path: str,
+        *,
         split: str = "train",
-        text_fields: Optional[list[str]] = None,
-        prompt_field: Optional[str] = None,
-        response_field: Optional[str] = None,
-        max_examples: Optional[int] = None,
-        config_name: Optional[str] = None,
-        revision: Optional[str] = None,
-        token: Optional[str] = None,
-        shuffle_buffer_size: int = 10_000,
+        text_fields: list[str] | tuple[str, ...] | None = None,
+        prompt_field: str | None = None,
+        response_field: str | None = None,
+        max_examples: int | None = None,
+        config_name: str | None = None,
+        revision: str | None = None,
+        token: str | None = None,
+        shuffle_buffer_size: int = 0,
         seed: int = 42,
         stream_retry_attempts: int = 20,
         stream_retry_base_seconds: float = 1.0,
     ):
-        if not path.strip():
-            raise ValueError("HFSource path must not be empty")
+        if not path or not path.strip():
+            raise ValueError("path must be non-empty")
+        if max_examples is not None and max_examples <= 0:
+            raise ValueError("max_examples must be positive when supplied")
         if shuffle_buffer_size < 0:
             raise ValueError("shuffle_buffer_size must be >= 0")
-        if bool(prompt_field) != bool(response_field):
-            raise ValueError("prompt_field and response_field must be configured together")
-        if text_fields and prompt_field:
-            raise ValueError("text_fields cannot be combined with prompt/response fields")
         if stream_retry_attempts < 0:
             raise ValueError("stream_retry_attempts must be >= 0")
         if stream_retry_base_seconds < 0:
@@ -321,17 +280,26 @@ class HFSource(DatasetSource):
         scanned = 0
         serialized = 0
         lengths: list[int] = []
-        for row in self._load_dataset(shuffle=False):
-            if scanned >= max_rows:
-                break
-            scanned += 1
-            if not isinstance(row, dict):
-                continue
-            text = self._row_to_text(row)
-            if not text:
-                continue
-            serialized += 1
-            lengths.append(len(text))
+        dataset = self._load_dataset(shuffle=False)
+        iterator = iter(dataset)
+        try:
+            for row in iterator:
+                if scanned >= max_rows:
+                    break
+                scanned += 1
+                if not isinstance(row, dict):
+                    continue
+                text = self._row_to_text(row)
+                if not text:
+                    continue
+                serialized += 1
+                lengths.append(len(text))
+        finally:
+            close = getattr(iterator, "close", None)
+            if callable(close):
+                close()
+            del iterator
+            del dataset
         return HFSourceAudit(
             source_id=self.source_id,
             rows_scanned=scanned,
@@ -346,12 +314,15 @@ class HFSource(DatasetSource):
         emitted = 0
         retry_generation = 0
         while self._max_examples is None or emitted < self._max_examples:
+            dataset = None
+            iterator = None
             try:
                 dataset = self._load_dataset(
                     shuffle=True,
                     retry_generation=retry_generation,
                 )
-                for row in dataset:
+                iterator = iter(dataset)
+                for row in iterator:
                     if self._max_examples is not None and emitted >= self._max_examples:
                         return
                     if not isinstance(row, dict):
@@ -377,6 +348,21 @@ class HFSource(DatasetSource):
                 )
                 if delay > 0:
                     time.sleep(delay)
+            finally:
+                if iterator is not None:
+                    close = getattr(iterator, "close", None)
+                    if callable(close):
+                        try:
+                            close()
+                        except Exception:
+                            pass
+                iterator = None
+                dataset = None
+                # Streaming parquet/network stacks can retain large native buffers
+                # after a failed HTTP request. Reclaim unreachable wrappers before
+                # the next retry rather than allowing repeated disconnects to grow
+                # process RSS until the trainer cannot allocate a single logits tensor.
+                gc.collect()
 
     def metadata(self) -> dict:
         return {
