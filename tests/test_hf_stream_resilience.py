@@ -5,6 +5,12 @@ import pytest
 from corpus.source import HFSource
 
 
+def test_language_trainer_imports_after_stream_only_cutover() -> None:
+    import tools.train_language_reasoner as trainer
+
+    assert trainer.TRAINER_VERSION >= 8
+
+
 def test_hf_stream_reopens_after_transient_transport_failure() -> None:
     source = HFSource(
         path="example/dataset",
