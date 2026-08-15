@@ -11,6 +11,7 @@ from corpus.quality import FOUNDATION_ENGLISH_FILTER, LANGUAGE_QUALITY_FILTER, Q
 from corpus.source import DatasetSource, HFSource
 from corpus.streamer import WeightedSourceStream
 from src.language.canonical_contract import (
+    CANONICAL_CONTRACT_VERSION,
     CanonicalMessage,
     canonical_hash,
     canonicalize_serialized,
@@ -140,6 +141,7 @@ class GuardedSource(DatasetSource):
             "near_dedup_entries": self._near_dedup_entries,
             "near_dedup_hamming": self._near_dedup_hamming,
             "shared_near_dedup": self._near_index is not None,
+            "canonical_contract_version": CANONICAL_CONTRACT_VERSION,
             "foundation_interaction_fraction": (
                 FOUNDATION_INTERACTION_FRACTION
                 if self._stage == "foundation" and self._transform_foundation_documents
@@ -260,6 +262,7 @@ def load_hf_source_config(path: str | Path) -> tuple[HFSourceSpec, ...]:
 
 def specs_fingerprint(specs: Sequence[HFSourceSpec]) -> str:
     payload = {
+        "canonical_contract_version": CANONICAL_CONTRACT_VERSION,
         "foundation_interaction_fraction": FOUNDATION_INTERACTION_FRACTION,
         "foundation_continuation_prefix_words": FOUNDATION_CONTINUATION_PREFIX_WORDS,
         "foundation_continuation_target_words": FOUNDATION_CONTINUATION_TARGET_WORDS,
@@ -315,9 +318,6 @@ def _foundation_skill_sources(
     excluded_hashes: frozenset[str],
     excluded_families: frozenset[str],
 ) -> list[tuple[DatasetSource, float]]:
-    # These are trusted, exact-by-construction sources. Use the general quality
-    # gate rather than FoundationEnglishFilter because primitive arithmetic is
-    # intentionally numeric. Keep holdout/family checks and exact dedup active.
     return [
         (
             GuardedSource(
