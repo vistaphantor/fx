@@ -1,28 +1,24 @@
-"""Authoritative target construction and weighted loss for Vista language training.
+"""Authoritative target construction for Vista language training.
 
 Documents use full next-token language modelling. Conversational examples use
 assistant-content supervision: user/system prompt tokens and the opening
 <assistant> control token provide causal context but do not consume gradient
-budget. Packed <eos> -> <bos> transitions are always masked because they are
-batching artifacts, not language.
+budget. Inference seeds <assistant>, so teaching the model to emit that same
+opener creates a duplicated-control-token attractor. Packed <eos> -> <bos>
+transitions are always masked because they are batching artifacts, not language.
 
-A tiny model can otherwise reduce corpus LM loss while barely learning the
-conditional user -> assistant mapping. The authoritative weighted objective
-therefore gives assistant-response targets more optimization mass than ordinary
-document continuation targets. This is loss weighting, not example replay: all
-examples still pass through the same causal transformer and tokenizer contract.
+A clipped/context window may legitimately contain only prompt context and no
+assistant target tokens. Such windows return prediction_tokens=0 and are
+filtered by the authoritative dataset/stream layer; target construction itself
+must not turn an expected windowing condition into a runtime crash.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-import torch
-import torch.nn.functional as F
-
 from src.language.tokenizer import ASSISTANT, BOS, ENDASSISTANT, EOS, SPECIAL_TOKENS
 
-LOSS_OBJECTIVE_VERSION = 4
-DEFAULT_ASSISTANT_TARGET_WEIGHT = 4.0
+LOSS_OBJECTIVE_VERSION = 3
 
 _BOS_ID = SPECIAL_TOKENS.index(BOS)
 _EOS_ID = SPECIAL_TOKENS.index(EOS)
@@ -35,14 +31,6 @@ class LossTargetStats:
     prediction_tokens: int
     masked_prompt_tokens: int
     masked_boundary_tokens: int
-
-
-@dataclass(frozen=True, slots=True)
-class WeightedLossStats:
-    prediction_tokens: int
-    assistant_prediction_tokens: int
-    document_prediction_tokens: int
-    effective_weight_sum: float
 
 
 def _example_ranges(sequence: list[int]) -> list[tuple[int, int]]:
@@ -136,79 +124,3 @@ def build_loss_targets(
         masked_prompt_tokens=prompt_masked,
         masked_boundary_tokens=boundary_masked,
     )
-
-
-def _assistant_weight_mask(
-    x: torch.Tensor,
-    targets: torch.Tensor,
-    *,
-    pad_id: int,
-    assistant_weight: float,
-) -> tuple[torch.Tensor, WeightedLossStats]:
-    if x.shape != targets.shape or x.ndim != 2:
-        raise ValueError("weighted_loss_requires_matching_rank2_x_targets")
-    if assistant_weight < 1.0:
-        raise ValueError("assistant_weight_must_be_at_least_one")
-
-    weights = torch.ones_like(targets, dtype=torch.float32)
-    valid = targets != pad_id
-    weights.masked_fill_(~valid, 0.0)
-    assistant_positions = torch.zeros_like(valid)
-
-    # Packing can place documents and conversations in one row, so classify
-    # positions from the actual control-token state rather than at row level.
-    for row in range(x.shape[0]):
-        inside_assistant = False
-        for column in range(x.shape[1]):
-            current = int(x[row, column].item())
-            target = int(targets[row, column].item())
-            if current == _ASSISTANT_ID:
-                inside_assistant = True
-            if target != pad_id and (
-                inside_assistant or current == _END_ASSISTANT_ID
-            ):
-                assistant_positions[row, column] = True
-            if target == _END_ASSISTANT_ID:
-                inside_assistant = False
-            if target == _EOS_ID and current == _END_ASSISTANT_ID:
-                inside_assistant = False
-
-    weights[assistant_positions] = float(assistant_weight)
-    prediction_tokens = int(valid.sum().item())
-    assistant_tokens = int((assistant_positions & valid).sum().item())
-    document_tokens = prediction_tokens - assistant_tokens
-    return weights, WeightedLossStats(
-        prediction_tokens=prediction_tokens,
-        assistant_prediction_tokens=assistant_tokens,
-        document_prediction_tokens=document_tokens,
-        effective_weight_sum=float(weights.sum().item()),
-    )
-
-
-def weighted_next_token_loss(
-    logits: torch.Tensor,
-    x: torch.Tensor,
-    targets: torch.Tensor,
-    *,
-    pad_id: int,
-    assistant_weight: float = DEFAULT_ASSISTANT_TARGET_WEIGHT,
-) -> tuple[torch.Tensor, WeightedLossStats]:
-    """Cross entropy where assistant targets carry deliberate extra gradient mass."""
-    if logits.ndim != 3 or logits.shape[:2] != targets.shape:
-        raise ValueError("weighted_loss_logits_shape_mismatch")
-    weights, stats = _assistant_weight_mask(
-        x,
-        targets,
-        pad_id=pad_id,
-        assistant_weight=assistant_weight,
-    )
-    if stats.prediction_tokens <= 0 or stats.effective_weight_sum <= 0:
-        raise RuntimeError("weighted_loss_has_no_prediction_tokens")
-    token_losses = F.cross_entropy(
-        logits.reshape(-1, logits.shape[-1]),
-        targets.reshape(-1),
-        ignore_index=pad_id,
-        reduction="none",
-    ).view_as(targets)
-    loss = (token_losses * weights.to(token_losses.device)).sum() / weights.sum().to(token_losses.device)
-    return loss, stats
