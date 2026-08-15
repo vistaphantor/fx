@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import asdict, dataclass
@@ -11,7 +12,8 @@ from src.language.protocol import build_exam_prompt
 from src.language.pytorch_transformer import VistaReasoningGPT
 from src.language.tokenizer import BPETokenizer, ENDASSISTANT, EOS
 
-EXAM_VERSION = 5
+EXAM_VERSION = 6
+EXAM_DECODING_MODE = "greedy_argmax_v1"
 
 
 @dataclass(frozen=True)
@@ -40,6 +42,8 @@ class ExamAnswer:
 @dataclass(frozen=True)
 class EpochExamResult:
     exam_version: int
+    exam_contract_fingerprint: str
+    decoding_mode: str
     epoch: int
     training_stage: str
     train_loss: float | None
@@ -136,6 +140,40 @@ def exam_questions(training_stage: str) -> tuple[ExamQuestion, ...]:
     return FOUNDATION_EXAM
 
 
+def exam_contract_payload(training_stage: str) -> dict:
+    """Return the immutable benchmark contract for one training stage."""
+    stage = training_stage.strip().casefold()
+    questions = exam_questions(stage)
+    return {
+        "exam_version": EXAM_VERSION,
+        "decoding_mode": EXAM_DECODING_MODE,
+        "training_stage": stage,
+        "questions": [
+            {
+                **asdict(question),
+                "serialized_prompt": build_exam_prompt(question.prompt),
+            }
+            for question in questions
+        ],
+        "numeric_answers": {
+            key: value
+            for key, value in sorted(_NUMERIC_ANSWERS.items())
+            if any(question.question_id == key for question in questions)
+        },
+        "stop_tokens": [ENDASSISTANT, EOS],
+    }
+
+
+def exam_contract_fingerprint(training_stage: str) -> str:
+    encoded = json.dumps(
+        exam_contract_payload(training_stage),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def exam_prompt_families(training_stage: str) -> set[str]:
     from src.language.canonical_contract import prompt_family_key
 
@@ -161,10 +199,7 @@ def _numeric_answer_matches(question_id: str, normalized: str) -> bool:
         return True
     if re.search(rf"\b(?:answer|result|value)\s+(?:is|=)\s*{re.escape(expected)}\b", normalized):
         return True
-    # A numeric answer embedded among many unrelated numbers is not evidence of
-    # correctness. This closes the epoch-3 false positive where a repeated '3'
-    # attractor happened to contain the expected value.
-    return len(numbers) <= 2 and numbers and numbers[-1] == expected
+    return len(numbers) <= 2 and bool(numbers) and numbers[-1] == expected
 
 
 def _is_correct(
@@ -308,47 +343,52 @@ def run_epoch_exam(
     if epoch < 0 or max_new_tokens <= 0:
         raise ValueError("invalid exam epoch/token budget")
 
-    questions = exam_questions(training_stage)
+    stage = training_stage.strip().casefold()
+    questions = exam_questions(stage)
+    contract_fingerprint = exam_contract_fingerprint(stage)
     stop_ids = {tokenizer.vocab[ENDASSISTANT], tokenizer.vocab[EOS]}
     answers: list[ExamAnswer] = []
-    model.eval()
+    was_training = model.training
 
-    for question in questions:
-        prompt_ids = tokenizer.encode(
-            build_exam_prompt(question.prompt),
-            add_bos=False,
-            add_eos=False,
-        )
-        if len(prompt_ids) >= model.max_seq_len:
-            raise RuntimeError(f"exam_prompt_exceeds_model_context:{question.question_id}")
-
-        ids = torch.tensor([prompt_ids], dtype=torch.long)
-        generated = model.generate(
-            ids,
-            max_new_tokens=min(max_new_tokens, model.max_seq_len - len(prompt_ids)),
-            temperature=1.0,
-            top_k=1,
-            top_p=1.0,
-            stop_ids=stop_ids,
-        )
-        continuation = generated[0, len(prompt_ids):].tolist()
-        raw = tokenizer.decode(continuation, skip_special=False, errors="replace")
-        normalized = _normalize_output(raw)
-        quality, repetition, flags = _quality(raw)
-        answers.append(
-            ExamAnswer(
-                question_id=question.question_id,
-                category=question.category,
-                prompt=question.prompt,
-                raw_output=raw,
-                normalized_output=normalized,
-                generated_tokens=len(continuation),
-                correct=_is_correct(question, normalized, flags),
-                quality_score=quality,
-                repetition_ratio=repetition,
-                gibberish_flags=flags,
+    try:
+        model.eval()
+        for question in questions:
+            serialized_prompt = build_exam_prompt(question.prompt)
+            prompt_ids = tokenizer.encode(
+                serialized_prompt,
+                add_bos=False,
+                add_eos=False,
             )
-        )
+            if len(prompt_ids) >= model.max_seq_len:
+                raise RuntimeError(f"exam_prompt_exceeds_model_context:{question.question_id}")
+
+            ids = torch.tensor([prompt_ids], dtype=torch.long)
+            generated = model.generate(
+                ids,
+                max_new_tokens=min(max_new_tokens, model.max_seq_len - len(prompt_ids)),
+                stop_ids=stop_ids,
+                do_sample=False,
+            )
+            continuation = generated[0, len(prompt_ids):].tolist()
+            raw = tokenizer.decode(continuation, skip_special=False, errors="replace")
+            normalized = _normalize_output(raw)
+            quality, repetition, flags = _quality(raw)
+            answers.append(
+                ExamAnswer(
+                    question_id=question.question_id,
+                    category=question.category,
+                    prompt=question.prompt,
+                    raw_output=raw,
+                    normalized_output=normalized,
+                    generated_tokens=len(continuation),
+                    correct=_is_correct(question, normalized, flags),
+                    quality_score=quality,
+                    repetition_ratio=repetition,
+                    gibberish_flags=flags,
+                )
+            )
+    finally:
+        model.train(was_training)
 
     correct = sum(answer.correct for answer in answers)
     gibberish = sum(bool(answer.gibberish_flags) for answer in answers)
@@ -358,8 +398,10 @@ def run_epoch_exam(
 
     return EpochExamResult(
         exam_version=EXAM_VERSION,
+        exam_contract_fingerprint=contract_fingerprint,
+        decoding_mode=EXAM_DECODING_MODE,
         epoch=epoch,
-        training_stage=training_stage,
+        training_stage=stage,
         train_loss=train_loss,
         validation_loss=validation_loss,
         total_questions=len(answers),
@@ -378,8 +420,13 @@ def render_exam_text(
     *,
     previous: EpochExamResult | None = None,
 ) -> str:
+    if previous is not None and previous.exam_contract_fingerprint != result.exam_contract_fingerprint:
+        raise RuntimeError("exam_contract_changed_between_results")
+
     lines = [
         f"Vista Reasoner Exam v{result.exam_version}",
+        f"Contract: {result.exam_contract_fingerprint[:16]}",
+        f"Decoding: {result.decoding_mode}",
         f"Epoch: {result.epoch}",
         f"Stage: {result.training_stage}",
         f"Train loss: {result.train_loss}",
@@ -440,7 +487,7 @@ def save_epoch_exam(
 
     text_path.write_text(render_exam_text(result, previous=previous), encoding="utf-8")
     json_path.write_text(
-        json.dumps(asdict(result), ensure_ascii=False, indent=2),
+        json.dumps(asdict(result), ensure_ascii=False, indent=2, sort_keys=True),
         encoding="utf-8",
     )
     return text_path, json_path
