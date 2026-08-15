@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterator, Sequence
 
@@ -244,8 +244,6 @@ def build_training_stream(
     excluded_families = frozenset(prompt_family(text) for text in excluded_texts if text and text.strip())
     sources: list[tuple[DatasetSource, float]] = []
 
-    # A shared recent near-duplicate index prevents the same public example from
-    # consuming optimizer budget twice when it appears in multiple HF sources.
     hf_near_index = NearDuplicateIndex(max_entries=50_000, max_hamming_distance=4)
     for index, spec in enumerate(selected):
         sources.append((
@@ -264,10 +262,24 @@ def build_training_stream(
 def sample_training_stream(
     *, specs: Sequence[HFSourceSpec], stage: str, limit: int, seed: int,
 ) -> list[str]:
+    """Build a deterministic, network-light preflight sample.
+
+    Preflight is for tokenizer/data-contract inspection, not stochastic training.
+    Disabling per-source HF shuffle here prevents the datasets library from
+    scattering a small 2,500-example sample across thousands of remote parquet
+    shards. WeightedSourceStream still mixes the configured sources according to
+    their weights, while each individual source is consumed sequentially.
+    """
     if limit <= 0:
         raise ValueError("stream sample limit must be positive")
+
+    selected = stage_specs(specs, stage)
+    preflight_specs = tuple(
+        replace(spec, shuffle_buffer_size=0)
+        for spec in selected
+    )
     stream = build_training_stream(
-        specs=specs,
+        specs=preflight_specs,
         stage=stage,
         seed=seed,
         local_replay=(),
