@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import math
 import os
 import random
 
@@ -18,7 +19,22 @@ from src.language.tokenizer import BPETokenizer
 class ConditioningCheck:
     optimizer_updates: int
     recall: int
-    loss: float
+    full_loss: float
+    learning_rate: float
+
+
+@dataclass(frozen=True, slots=True)
+class ConditioningResponse:
+    prompt: str
+    expected: str
+    actual: str
+    expected_token_id: int
+    expected_rank: int
+    expected_probability: float
+    winner: str
+    winner_token_id: int
+    winner_probability: float
+    margin: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,17 +43,12 @@ class ConditioningStageResult:
     recall: int
     optimizer_updates: int
     final_loss: float
-    responses: tuple[tuple[str, str, str], ...]
+    responses: tuple[ConditioningResponse, ...]
     checks: tuple[ConditioningCheck, ...]
 
 
 def _cases() -> list[tuple[str, str]]:
-    """Arbitrary one-token labels that cannot be passed by a global answer prior.
-
-    Single-character targets make this a direct test of prompt -> next-token
-    conditioning rather than a test of multi-token decoding endurance. The
-    ordinary tiny-overfit gate separately checks full sequence learning.
-    """
+    """Arbitrary one-token labels that cannot be passed by a global answer prior."""
     labels = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ012345")
     return [
         (f"Conditioning key {index:02d}. Reply with its assigned label only.", label)
@@ -74,6 +85,11 @@ def _build_examples(
 ) -> list[tuple[torch.Tensor, torch.Tensor]]:
     examples: list[tuple[torch.Tensor, torch.Tensor]] = []
     for prompt, answer in cases:
+        answer_ids = tokenizer.encode(answer, add_bos=False, add_eos=False)
+        if len(answer_ids) != 1:
+            raise RuntimeError(
+                f"conditioning_label_must_be_one_token:{answer!r}:{answer_ids}"
+            )
         text = serialize_messages((
             CanonicalMessage("user", prompt),
             CanonicalMessage("assistant", answer),
@@ -89,23 +105,60 @@ def _build_examples(
 
 
 @torch.no_grad()
+def _full_dataset_loss(
+    model: VistaReasoningGPT,
+    tokenizer: BPETokenizer,
+    examples: list[tuple[torch.Tensor, torch.Tensor]],
+) -> float:
+    was_training = model.training
+    try:
+        model.eval()
+        x = torch.stack([example[0] for example in examples])
+        y = torch.stack([example[1] for example in examples])
+        _, loss = model(x, targets=y, pad_id=tokenizer.pad_id())
+        if loss is None or not torch.isfinite(loss):
+            raise RuntimeError("conditioning_gate_full_loss_invalid")
+        return float(loss.item())
+    finally:
+        model.train(was_training)
+
+
+@torch.no_grad()
 def _recall(
     model: VistaReasoningGPT,
     tokenizer: BPETokenizer,
     cases: list[tuple[str, str]],
-) -> tuple[int, tuple[tuple[str, str, str], ...]]:
+) -> tuple[int, tuple[ConditioningResponse, ...]]:
     was_training = model.training
-    rows: list[tuple[str, str, str]] = []
+    rows: list[ConditioningResponse] = []
     correct = 0
     stops = generation_stop_ids(tokenizer)
     try:
         model.eval()
         for prompt, expected in cases:
-            prompt_ids = tokenizer.encode(build_exam_prompt(prompt), add_bos=False, add_eos=False)
+            prompt_ids = tokenizer.encode(
+                build_exam_prompt(prompt), add_bos=False, add_eos=False,
+            )
             if len(prompt_ids) >= model.max_seq_len:
                 raise RuntimeError("conditioning_prompt_exceeds_tiny_context")
+            prompt_tensor = torch.tensor([prompt_ids], dtype=torch.long)
+            logits, _ = model(prompt_tensor)
+            next_logits = logits[0, len(prompt_ids) - 1].float()
+            probabilities = torch.softmax(next_logits, dim=-1)
+
+            expected_ids = tokenizer.encode(expected, add_bos=False, add_eos=False)
+            if len(expected_ids) != 1:
+                raise RuntimeError("conditioning_expected_not_single_token")
+            expected_id = int(expected_ids[0])
+            target_logit = float(next_logits[expected_id].item())
+            expected_rank = 1 + int((next_logits > next_logits[expected_id]).sum().item())
+            expected_probability = float(probabilities[expected_id].item())
+            winner_id = int(torch.argmax(next_logits).item())
+            winner_probability = float(probabilities[winner_id].item())
+            winner = tokenizer.decode([winner_id], skip_special=False, errors="replace")
+
             generated = model.generate(
-                torch.tensor([prompt_ids], dtype=torch.long),
+                prompt_tensor,
                 max_new_tokens=6,
                 stop_ids=stops,
                 use_kv_cache=True,
@@ -113,12 +166,29 @@ def _recall(
             )
             decoded = tokenizer.decode(generated[0].tolist(), skip_special=False)
             actual = extract_assistant_response(decoded).strip()
-            rows.append((prompt, expected, actual))
             if actual == expected:
                 correct += 1
+
+            rows.append(ConditioningResponse(
+                prompt=prompt,
+                expected=expected,
+                actual=actual,
+                expected_token_id=expected_id,
+                expected_rank=expected_rank,
+                expected_probability=expected_probability,
+                winner=winner,
+                winner_token_id=winner_id,
+                winner_probability=winner_probability,
+                margin=float(next_logits[winner_id].item()) - target_logit,
+            ))
     finally:
         model.train(was_training)
     return correct, tuple(rows)
+
+
+def _set_lr(optimizer: torch.optim.Optimizer, learning_rate: float) -> None:
+    for group in optimizer.param_groups:
+        group["lr"] = learning_rate
 
 
 def _run_stage(
@@ -129,57 +199,80 @@ def _run_stage(
     max_updates: int,
     check_every: int,
 ) -> ConditioningStageResult:
+    """Train an independent exact-mapping gate with deterministic full batches.
+
+    Mini-batch loss was previously misleading: a sampled batch could have near-zero
+    loss while omitted mappings were wrong. Full-batch optimization and full-dataset
+    evaluation make the gate measure conditioning rather than stochastic interference.
+    """
     seq_len = 64
     cases = _cases()[:size]
     examples = _build_examples(tokenizer, cases, seq_len=seq_len)
     model = _new_model(tokenizer, seq_len=seq_len, seed=seed)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=4e-3, weight_decay=0.0)
-    generator = torch.Generator().manual_seed(seed + 1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-3, weight_decay=0.0)
+    x_all = torch.stack([example[0] for example in examples])
+    y_all = torch.stack([example[1] for example in examples])
 
     updates = 0
-    final_loss = float("inf")
     perfect_checks = 0
     checks: list[ConditioningCheck] = []
-    while updates < max_updates:
-        order = torch.randperm(len(examples), generator=generator).tolist()
-        for start in range(0, len(order), min(8, len(order))):
-            selected = order[start : start + min(8, len(order))]
-            x = torch.stack([examples[index][0] for index in selected])
-            y = torch.stack([examples[index][1] for index in selected])
-            model.train()
-            optimizer.zero_grad(set_to_none=True)
-            _, loss = model(x, targets=y, pad_id=tokenizer.pad_id())
-            if loss is None or not torch.isfinite(loss):
-                raise RuntimeError("conditioning_gate_non_finite_loss")
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            final_loss = float(loss.item())
-            updates += 1
+    best_recall = -1
+    checks_without_recall_gain = 0
+    learning_rate = 3e-3
 
-            if updates % check_every == 0 or updates >= max_updates:
-                recalled, rows = _recall(model, tokenizer, cases)
-                checks.append(ConditioningCheck(updates, recalled, final_loss))
-                print(
-                    f"[ConditioningGate] size={size} recall={recalled}/{size} "
-                    f"updates={updates} loss={final_loss:.4f}"
+    while updates < max_updates:
+        model.train()
+        optimizer.zero_grad(set_to_none=True)
+        _, loss = model(x_all, targets=y_all, pad_id=tokenizer.pad_id())
+        if loss is None or not torch.isfinite(loss):
+            raise RuntimeError("conditioning_gate_non_finite_loss")
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        updates += 1
+
+        if updates % check_every != 0 and updates < max_updates:
+            continue
+
+        recalled, rows = _recall(model, tokenizer, cases)
+        full_loss = _full_dataset_loss(model, tokenizer, examples)
+        checks.append(ConditioningCheck(updates, recalled, full_loss, learning_rate))
+        print(
+            f"[ConditioningGate] size={size} recall={recalled}/{size} "
+            f"updates={updates} full_loss={full_loss:.6f} lr={learning_rate:.6g}"
+        )
+
+        if recalled > best_recall:
+            best_recall = recalled
+            checks_without_recall_gain = 0
+        else:
+            checks_without_recall_gain += 1
+
+        if recalled == size:
+            perfect_checks += 1
+            if perfect_checks >= 2:
+                return ConditioningStageResult(
+                    size, recalled, updates, full_loss, rows, tuple(checks)
                 )
-                if recalled == size:
-                    perfect_checks += 1
-                    if perfect_checks >= 2:
-                        return ConditioningStageResult(
-                            size, recalled, updates, final_loss, rows, tuple(checks)
-                        )
-                else:
-                    perfect_checks = 0
-            if updates >= max_updates:
-                break
+        else:
+            perfect_checks = 0
+
+        # Once exact recall stalls, consolidate instead of continuing high-LR
+        # updates that can overwrite already learned arbitrary mappings.
+        if checks_without_recall_gain >= 4 and learning_rate > 5e-4:
+            learning_rate = max(5e-4, learning_rate * 0.5)
+            _set_lr(optimizer, learning_rate)
+            checks_without_recall_gain = 0
+            print(
+                f"[ConditioningGate] size={size} consolidation_lr={learning_rate:.6g}"
+            )
 
     recalled, rows = _recall(model, tokenizer, cases)
+    full_loss = _full_dataset_loss(model, tokenizer, examples)
     if not checks or checks[-1].optimizer_updates != updates:
-        checks.append(ConditioningCheck(updates, recalled, final_loss))
+        checks.append(ConditioningCheck(updates, recalled, full_loss, learning_rate))
     return ConditioningStageResult(
-        size, recalled, updates, final_loss, rows, tuple(checks)
+        size, recalled, updates, full_loss, rows, tuple(checks)
     )
 
 
@@ -195,34 +288,41 @@ def _render_stage_result(
         f"Status: {status}",
         f"Recall: {result.recall}/{result.size}",
         f"Optimizer updates: {result.optimizer_updates}",
-        f"Final loss: {result.final_loss:.8f}",
+        f"Final full-dataset loss: {result.final_loss:.8f}",
         f"Tokenizer vocab: {tokenizer.vocab_size}",
         f"Tokenizer fingerprint: {tokenizer.fingerprint()}",
         "",
         "CONVERGENCE TRACE",
-        "update\trecall\tloss",
+        "update\trecall\tfull_loss\tlr",
     ]
     for check in result.checks:
         lines.append(
-            f"{check.optimizer_updates}\t{check.recall}/{result.size}\t{check.loss:.8f}"
+            f"{check.optimizer_updates}\t{check.recall}/{result.size}\t"
+            f"{check.full_loss:.8f}\t{check.learning_rate:.8g}"
         )
 
     lines.extend(("", "CASE RESULTS"))
-    for index, (prompt, expected, actual) in enumerate(result.responses, start=1):
-        marker = "OK" if expected == actual else "MISS"
+    for index, row in enumerate(result.responses, start=1):
+        marker = "OK" if row.expected == row.actual else "MISS"
         lines.extend((
             "",
             "-" * 80,
             f"CASE {index:02d} [{marker}]",
-            f"PROMPT: {prompt}",
-            f"EXPECTED: {expected!r}",
-            f"ACTUAL: {actual!r}",
+            f"PROMPT: {row.prompt}",
+            f"EXPECTED: {row.expected!r}",
+            f"ACTUAL: {row.actual!r}",
+            f"EXPECTED TOKEN: id={row.expected_token_id} rank={row.expected_rank}/{tokenizer.vocab_size} "
+            f"p={row.expected_probability:.8%}",
+            f"WINNER: {row.winner!r} id={row.winner_token_id} p={row.winner_probability:.8%}",
+            f"WINNER-TARGET LOGIT MARGIN: {row.margin:.8f}",
         ))
 
     lines.extend((
         "",
         "INTERPRETATION",
         "This gate tests exact prompt-to-answer conditioning, not arithmetic or world knowledge.",
+        "Loss values are full-dataset teacher-forced losses, not last-mini-batch losses.",
+        "Expected-token rank/probability shows whether a wrong answer was narrowly beaten or never learned.",
         "A PASS requires two consecutive perfect-recall checks for this stage size.",
         "A FAIL means the long training run remains blocked at this cardinality.",
     ))
@@ -247,23 +347,15 @@ def _save_stage_result(
 def run_prompt_conditioning_gate(
     tokenizer: BPETokenizer,
     *,
-    diagnostics_dir: str | Path = "conditioning_diagnostics",
+    diagnostics_dir: str | Path,
 ) -> tuple[int, int, int]:
-    """Prove 1/1, 8/8 and 32/32 prompt conditioning before long training.
-
-    Every cardinality starts from a fresh deterministic initialization. This
-    avoids measuring curriculum carry-over/catastrophic forgetting inside the
-    diagnostic itself. Training is convergence-driven rather than tied to one
-    arbitrary epoch count, and exact generation recall remains the acceptance
-    criterion. Every stage is persisted before pass/fail handling so failures
-    remain inspectable instead of disappearing with the raised exception.
-    """
+    """Prove 1/1, 8/8 and 32/32 prompt conditioning before long training."""
     random.seed(1701)
     recalls: list[int] = []
     configs = (
         (1, 1702, 400, 20),
-        (8, 1709, 1600, 40),
-        (32, 1733, 4000, 80),
+        (8, 1709, 1200, 40),
+        (32, 1733, 3000, 80),
     )
     for size, seed, max_updates, check_every in configs:
         result = _run_stage(
@@ -281,15 +373,17 @@ def run_prompt_conditioning_gate(
         print(f"[ConditioningGate] stage_file={stage_path}")
         recalls.append(result.recall)
         if result.recall != size:
-            for prompt, expected, actual in result.responses:
-                marker = "OK" if expected == actual else "MISS"
+            for row in result.responses:
+                marker = "OK" if row.expected == row.actual else "MISS"
                 print(
-                    f"[ConditioningGate:{marker}] prompt={prompt!r} "
-                    f"expected={expected!r} actual={actual!r}"
+                    f"[ConditioningGate:{marker}] prompt={row.prompt!r} "
+                    f"expected={row.expected!r} actual={row.actual!r} "
+                    f"rank={row.expected_rank}/{tokenizer.vocab_size} "
+                    f"p={row.expected_probability:.6%}"
                 )
             raise RuntimeError(
                 f"prompt_conditioning_gate_failed:{result.recall}/{size}:"
-                f"updates={result.optimizer_updates}:loss={result.final_loss:.4f}:"
+                f"updates={result.optimizer_updates}:full_loss={result.final_loss:.6f}:"
                 f"diagnostics={stage_path}"
             )
     return recalls[0], recalls[1], recalls[2]
