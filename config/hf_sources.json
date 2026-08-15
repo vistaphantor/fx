@@ -4,36 +4,26 @@
       "path": "roneneldan/TinyStories",
       "revision": "f54c09fd23315a6f9c86f9dc80f725de7d8f9c64",
       "split": "train",
-      "weight": 0.50,
-      "stages": [
-        "foundation"
-      ],
-      "text_fields": [
-        "text"
-      ],
+      "weight": 0.35,
+      "stages": ["foundation"],
+      "text_fields": ["text"],
       "shuffle_buffer_size": 5000
     },
     {
       "path": "tiiuae/falcon-refinedweb",
       "revision": "c735840575b629292b41da8dde11dcd523d4f91c",
       "split": "train",
-      "weight": 0.40,
-      "stages": [
-        "foundation"
-      ],
-      "text_fields": [
-        "content"
-      ],
+      "weight": 0.35,
+      "stages": ["foundation"],
+      "text_fields": ["content"],
       "shuffle_buffer_size": 1000
     },
     {
       "path": "HuggingFaceTB/everyday-conversations-llama3.1-2k",
       "revision": "14f543216b9ba42b6b951dc5bd199460d193b162",
       "split": "train_sft",
-      "weight": 0.10,
-      "stages": [
-        "foundation"
-      ],
+      "weight": 0.20,
+      "stages": ["foundation"],
       "shuffle_buffer_size": 2260
     },
     {
@@ -42,9 +32,7 @@
       "config_name": "main",
       "split": "train",
       "weight": 1.0,
-      "stages": [
-        "reasoning"
-      ],
+      "stages": ["reasoning"],
       "prompt_field": "question",
       "response_field": "answer",
       "shuffle_buffer_size": 4000
