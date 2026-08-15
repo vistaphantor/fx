@@ -11,7 +11,7 @@
       "text_fields": [
         "text"
       ],
-      "shuffle_buffer_size": 50000
+      "shuffle_buffer_size": 5000
     },
     {
       "path": "tiiuae/falcon-refinedweb",
@@ -24,7 +24,7 @@
       "text_fields": [
         "content"
       ],
-      "shuffle_buffer_size": 10000
+      "shuffle_buffer_size": 1000
     },
     {
       "path": "HuggingFaceTB/everyday-conversations-llama3.1-2k",
@@ -47,7 +47,7 @@
       ],
       "prompt_field": "question",
       "response_field": "answer",
-      "shuffle_buffer_size": 7473
+      "shuffle_buffer_size": 4000
     }
   ]
 }
