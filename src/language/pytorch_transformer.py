@@ -1,10 +1,3 @@
-"""Authoritative PyTorch decoder-only transformer for Vista language reasoning.
-
-The architecture supports a dense FFN mode for smoke/regression models and a
-sparse MoE mode for capacity-efficient reasoning profiles. The sparse path keeps
-a dense attention/residual spine while routing each token through only a small
-subset of FFN experts.
-"""
 from __future__ import annotations
 
 import math
@@ -15,10 +8,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-@dataclass
+@dataclass(slots=True)
 class KVCacheState:
-    """Preallocated compact GQA key/value cache for one transformer layer."""
-
     k: torch.Tensor
     v: torch.Tensor
     length: int
@@ -30,55 +21,54 @@ ModelKVCache = tuple[KVCacheState, ...]
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
+        self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
-        self.eps = float(eps)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         scale = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        return x * scale * self.weight
+        return self.weight * x * scale
 
 
 class RotaryEmbedding(nn.Module):
-    def __init__(self, head_dim: int, theta: float = 10_000.0):
+    def __init__(self, head_dim: int, max_seq_len: int, theta: float = 10_000.0):
         super().__init__()
         if head_dim % 2 != 0:
-            raise ValueError("RoPE head_dim must be even")
+            raise ValueError("RoPE requires an even head dimension")
         inv_freq = 1.0 / (
-            float(theta)
-            ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
+            theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
         )
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        positions = torch.arange(max_seq_len, dtype=torch.float32)
+        frequencies = torch.outer(positions, inv_freq)
+        self.register_buffer("cos", frequencies.cos(), persistent=False)
+        self.register_buffer("sin", frequencies.sin(), persistent=False)
 
-    def cos_sin(
+    def forward(
         self,
-        positions: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
         *,
-        dtype: torch.dtype,
+        position_start: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        freqs = torch.outer(positions.float(), self.inv_freq)
-        return freqs.cos().to(dtype=dtype), freqs.sin().to(dtype=dtype)
-
-    @staticmethod
-    def rotate(
-        x: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-    ) -> torch.Tensor:
-        # Deliberately not named apply(): nn.Module.apply is used recursively
-        # during initialization and must remain intact.
-        even = x[..., 0::2]
-        odd = x[..., 1::2]
+        length = q.shape[-2]
+        end = position_start + length
+        cos = self.cos[position_start:end].to(dtype=q.dtype, device=q.device)
+        sin = self.sin[position_start:end].to(dtype=q.dtype, device=q.device)
         cos = cos.unsqueeze(0).unsqueeze(0)
         sin = sin.unsqueeze(0).unsqueeze(0)
-        out = torch.empty_like(x)
-        out[..., 0::2] = even * cos - odd * sin
-        out[..., 1::2] = even * sin + odd * cos
-        return out
+
+        def rotate(x: torch.Tensor) -> torch.Tensor:
+            x_even = x[..., ::2]
+            x_odd = x[..., 1::2]
+            rotated = torch.stack(
+                (x_even * cos - x_odd * sin, x_even * sin + x_odd * cos),
+                dim=-1,
+            )
+            return rotated.flatten(-2)
+
+        return rotate(q), rotate(k)
 
 
 class SwiGLUExpert(nn.Module):
-    """Bias-free SwiGLU FFN expert."""
-
     def __init__(self, d_model: int, hidden_dim: int):
         super().__init__()
         self.gate_proj = nn.Linear(d_model, hidden_dim, bias=False)
@@ -90,8 +80,6 @@ class SwiGLUExpert(nn.Module):
 
 
 class SparseMoE(nn.Module):
-    """Token-routed SwiGLU experts with optional always-on shared expert."""
-
     def __init__(
         self,
         d_model: int,
@@ -99,19 +87,14 @@ class SparseMoE(nn.Module):
         num_experts: int,
         experts_per_token: int,
         expert_hidden_dim: int,
-        shared_expert_hidden_dim: int = 0,
-        router_jitter: float = 0.01,
+        shared_expert_hidden_dim: int,
+        router_jitter: float,
     ):
         super().__init__()
-        if num_experts < 1:
-            raise ValueError("num_experts must be positive")
+        if num_experts < 2:
+            raise ValueError("MoE requires at least two routed experts")
         if not 1 <= experts_per_token <= num_experts:
-            raise ValueError("experts_per_token must be in [1, num_experts]")
-        if expert_hidden_dim <= 0:
-            raise ValueError("expert_hidden_dim must be positive")
-        if shared_expert_hidden_dim < 0:
-            raise ValueError("shared_expert_hidden_dim must be >= 0")
-
+            raise ValueError("experts_per_token must be between 1 and num_experts")
         self.num_experts = int(num_experts)
         self.experts_per_token = int(experts_per_token)
         self.router_jitter = float(router_jitter)
@@ -125,48 +108,47 @@ class SparseMoE(nn.Module):
             else None
         )
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        shape = x.shape
-        flat = x.reshape(-1, shape[-1])
-        router_logits = self.router(flat)
-        if self.training and self.router_jitter > 0:
-            router_logits = router_logits + torch.randn_like(router_logits) * self.router_jitter
+    def expert_parameter_count(self) -> int:
+        return sum(parameter.numel() for parameter in self.experts[0].parameters())
 
-        probs = F.softmax(router_logits, dim=-1)
-        top_probs, top_indices = torch.topk(
-            probs,
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        original_shape = x.shape
+        flat = x.reshape(-1, x.shape[-1])
+        router_input = flat
+        if self.training and self.router_jitter > 0:
+            noise = torch.empty_like(router_input).uniform_(
+                1.0 - self.router_jitter,
+                1.0 + self.router_jitter,
+            )
+            router_input = router_input * noise
+
+        router_logits = self.router(router_input)
+        router_probs = F.softmax(router_logits.float(), dim=-1).to(flat.dtype)
+        top_weights, top_indices = torch.topk(
+            router_probs,
             k=self.experts_per_token,
             dim=-1,
         )
-        if self.experts_per_token > 1:
-            top_probs = top_probs / top_probs.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+        top_weights = top_weights / top_weights.sum(dim=-1, keepdim=True).clamp_min(1e-9)
 
-        routed = torch.zeros_like(flat)
+        output = torch.zeros_like(flat)
         for expert_index, expert in enumerate(self.experts):
-            token_positions, slots = torch.where(top_indices == expert_index)
-            if token_positions.numel() == 0:
+            token_indices, slot_indices = torch.where(top_indices == expert_index)
+            if token_indices.numel() == 0:
                 continue
-            expert_out = expert(flat[token_positions])
-            weights = top_probs[token_positions, slots].unsqueeze(-1)
-            routed.index_add_(0, token_positions, expert_out * weights)
+            expert_input = flat.index_select(0, token_indices)
+            expert_output = expert(expert_input)
+            weight = top_weights[token_indices, slot_indices].unsqueeze(-1)
+            output.index_add_(0, token_indices, expert_output * weight)
 
         if self.shared_expert is not None:
-            routed = routed + self.shared_expert(flat)
+            output = output + self.shared_expert(flat)
 
-        with torch.no_grad():
-            assignment = F.one_hot(
-                top_indices[:, 0], num_classes=self.num_experts
-            ).float().mean(dim=0)
-        mean_probability = probs.mean(dim=0)
-        load_balance = self.num_experts * torch.sum(mean_probability * assignment)
-        router_z = torch.mean(torch.logsumexp(router_logits, dim=-1).pow(2))
-        aux = load_balance + 0.01 * router_z
-        return routed.reshape(shape), aux
-
-    def expert_parameter_count(self) -> int:
-        if not self.experts:
-            return 0
-        return sum(parameter.numel() for parameter in self.experts[0].parameters())
+        importance = router_probs.mean(dim=0)
+        one_hot = F.one_hot(top_indices, num_classes=self.num_experts).to(router_probs.dtype)
+        load = one_hot.sum(dim=1).mean(dim=0) / float(self.experts_per_token)
+        aux_loss = self.num_experts * torch.sum(importance * load)
+        return output.view(original_shape), aux_loss
 
 
 class GroupedQueryAttention(nn.Module):
@@ -189,17 +171,13 @@ class GroupedQueryAttention(nn.Module):
         self.n_heads = int(n_heads)
         self.n_kv_heads = int(n_kv_heads)
         self.head_dim = d_model // n_heads
-        if self.head_dim % 2 != 0:
-            raise ValueError("attention head_dim must be even for RoPE")
         self.max_seq_len = int(max_seq_len)
-        self.kv_repeat = n_heads // n_kv_heads
-
+        self.dropout = float(dropout)
         self.q_proj = nn.Linear(d_model, n_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(d_model, n_kv_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(d_model, n_kv_heads * self.head_dim, bias=False)
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
-        self.dropout = nn.Dropout(dropout)
-        self.rope = RotaryEmbedding(self.head_dim, theta=rope_theta)
+        self.rope = RotaryEmbedding(self.head_dim, max_seq_len, theta=rope_theta)
 
     def _project(
         self,
@@ -208,30 +186,15 @@ class GroupedQueryAttention(nn.Module):
         position_start: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch, time_steps, _ = x.shape
-        q = self.q_proj(x).view(
-            batch, time_steps, self.n_heads, self.head_dim
-        ).transpose(1, 2)
-        k = self.k_proj(x).view(
-            batch, time_steps, self.n_kv_heads, self.head_dim
-        ).transpose(1, 2)
-        v = self.v_proj(x).view(
-            batch, time_steps, self.n_kv_heads, self.head_dim
-        ).transpose(1, 2)
-        positions = torch.arange(
-            position_start,
-            position_start + time_steps,
-            device=x.device,
-            dtype=torch.long,
-        )
-        cos, sin = self.rope.cos_sin(positions, dtype=q.dtype)
-        q = self.rope.rotate(q, cos, sin)
-        k = self.rope.rotate(k, cos, sin)
+        q = self.q_proj(x).view(batch, time_steps, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(batch, time_steps, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(batch, time_steps, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        q, k = self.rope(q, k, position_start=position_start)
         return q, k, v
 
-    def _expand_kv(self, tensor: torch.Tensor) -> torch.Tensor:
-        if self.kv_repeat == 1:
-            return tensor
-        return tensor.repeat_interleave(self.kv_repeat, dim=1)
+    def _expand_kv(self, x: torch.Tensor) -> torch.Tensor:
+        repeats = self.n_heads // self.n_kv_heads
+        return x.repeat_interleave(repeats, dim=1) if repeats > 1 else x
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch, time_steps, _ = x.shape
@@ -241,12 +204,12 @@ class GroupedQueryAttention(nn.Module):
             self._expand_kv(k),
             self._expand_kv(v),
             is_causal=True,
-            dropout_p=self.dropout.p if self.training else 0.0,
+            dropout_p=self.dropout if self.training else 0.0,
         )
         attention = attention.transpose(1, 2).contiguous().view(
             batch, time_steps, self.d_model
         )
-        return self.dropout(self.out_proj(attention))
+        return self.out_proj(attention)
 
     def forward_cached(
         self,
@@ -571,6 +534,11 @@ class VistaReasoningGPT(nn.Module):
             probs = probs / normalizer
         return torch.multinomial(probs, num_samples=1)
 
+    @staticmethod
+    def _greedy_next_token(logits_last: torch.Tensor) -> torch.Tensor:
+        """Select the unique evaluation token without consuming RNG state."""
+        return torch.argmax(logits_last, dim=-1, keepdim=True)
+
     @torch.no_grad()
     def generate(
         self,
@@ -582,29 +550,35 @@ class VistaReasoningGPT(nn.Module):
         top_p: float = 0.92,
         stop_ids: set[int] | frozenset[int] | None = None,
         use_kv_cache: bool = True,
+        do_sample: bool = True,
     ) -> torch.Tensor:
         if idx.ndim != 2 or idx.shape[0] != 1:
             raise ValueError("generation currently requires a single batch item")
         if max_new_tokens < 0:
             raise ValueError("max_new_tokens must be non-negative")
-        if temperature <= 0:
-            raise ValueError("temperature must be positive")
+        if do_sample and temperature <= 0:
+            raise ValueError("temperature must be positive when sampling")
 
         self.eval()
         stops = set(stop_ids or ())
         if max_new_tokens == 0:
             return idx
 
+        def choose(logits_last: torch.Tensor) -> torch.Tensor:
+            if not do_sample:
+                return self._greedy_next_token(logits_last)
+            return self._sample_next_token(
+                logits_last,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+            )
+
         if not use_kv_cache:
             for _ in range(max_new_tokens):
                 idx_cond = idx[:, -self.max_seq_len :]
                 logits, _ = self(idx_cond)
-                idx_next = self._sample_next_token(
-                    logits[:, -1, :],
-                    temperature=temperature,
-                    top_k=top_k,
-                    top_p=top_p,
-                )
+                idx_next = choose(logits[:, -1, :])
                 idx = torch.cat((idx, idx_next), dim=1)
                 if stops and int(idx_next.item()) in stops:
                     break
@@ -613,12 +587,7 @@ class VistaReasoningGPT(nn.Module):
         context = idx[:, -self.max_seq_len :]
         logits, cache = self._forward_cached(context, None)
         for _ in range(max_new_tokens):
-            idx_next = self._sample_next_token(
-                logits[:, -1, :],
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-            )
+            idx_next = choose(logits[:, -1, :])
             idx = torch.cat((idx, idx_next), dim=1)
             if stops and int(idx_next.item()) in stops:
                 break
