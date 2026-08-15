@@ -5,6 +5,8 @@ import re
 from dataclasses import dataclass
 from typing import Iterable
 
+CANONICAL_CONTRACT_VERSION = 2
+
 STRUCTURAL_TOKENS: tuple[str, ...] = (
     "<bos>", "<eos>", "<sep>",
     "<think>", "</think>",
@@ -35,9 +37,27 @@ class CanonicalMessage:
     content: str
 
 
-def normalize_text(value: object, *, strip_role_prefix: bool = False) -> str:
-    """Normalize ordinary text and structural tokens idempotently.
+def _escape_structural_literals(value: object) -> str:
+    """Make reserved grammar strings inert when they originate in corpus payloads.
 
+    Structural tokens are protocol, not ordinary dataset text. Raw web/chat data
+    must never be able to create role/control state by merely containing a literal
+    string such as ``<assistant>``. HTML-style escaping preserves the visible
+    meaning while ensuring only the serializer itself can emit grammar tokens.
+    """
+    text = "" if value is None else str(value)
+    for token in STRUCTURAL_TOKENS:
+        if token in text:
+            escaped = token.replace("<", "&lt;").replace(">", "&gt;")
+            text = text.replace(token, escaped)
+    return text
+
+
+def normalize_text(value: object, *, strip_role_prefix: bool = False) -> str:
+    """Normalize already-serialized text and structural tokens idempotently.
+
+    This function is for canonical protocol strings. Dataset payloads must pass
+    through :func:`normalize_payload_text` before wrappers are introduced.
     Structural tokens are always emitted on their own lines. Applying this
     function repeatedly produces byte-identical output.
     """
@@ -67,12 +87,20 @@ def normalize_text(value: object, *, strip_role_prefix: bool = False) -> str:
     return normalized
 
 
+def normalize_payload_text(value: object, *, strip_role_prefix: bool = False) -> str:
+    """Normalize untrusted corpus content without allowing grammar injection."""
+    return normalize_text(
+        _escape_structural_literals(value),
+        strip_role_prefix=strip_role_prefix,
+    )
+
+
 def serialize_messages(messages: Iterable[CanonicalMessage]) -> str:
     parts: list[str] = ["<bos>"]
     appended = 0
     for message in messages:
         role = str(message.role or "").strip().casefold()
-        content = normalize_text(message.content, strip_role_prefix=True)
+        content = normalize_payload_text(message.content, strip_role_prefix=True)
         if not content:
             continue
         if role in {"human", "user"}:
@@ -93,7 +121,7 @@ def serialize_messages(messages: Iterable[CanonicalMessage]) -> str:
 
 
 def serialize_document(text: object) -> str:
-    content = normalize_text(text)
+    content = normalize_payload_text(text)
     if not content:
         return ""
     return normalize_text(f"<bos>\n{content}\n<eos>")
