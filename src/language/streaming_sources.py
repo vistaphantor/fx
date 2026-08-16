@@ -24,10 +24,15 @@ from src.language.conceptual_foundations import (
     EconomicsCausalSource,
 )
 from src.language.curriculum import is_math_example, is_reasoning_example, is_trading_example
+from src.language.exam_feedback import ExamFeedbackPolicy
 from src.language.foundation_skill_sources import (
     FOUNDATION_SKILL_SOURCE_VERSION,
     FoundationEconomicsSource,
     PrimitiveArithmeticSource,
+)
+from src.language.language_quality_source import (
+    LANGUAGE_QUALITY_SOURCE_VERSION,
+    LanguageQualityContrastSource,
 )
 
 FOUNDATION_INTERACTION_FRACTION = 0.25
@@ -37,6 +42,7 @@ FOUNDATION_ARITHMETIC_WEIGHT = 0.18
 FOUNDATION_CONCEPTUAL_ARITHMETIC_WEIGHT = 0.10
 FOUNDATION_ECONOMICS_WEIGHT = 0.10
 FOUNDATION_ECONOMICS_CAUSAL_WEIGHT = 0.08
+FOUNDATION_LANGUAGE_QUALITY_WEIGHT = 0.10
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +58,7 @@ class HFSourceSpec:
     response_field: str | None = None
     dialogue_field: str | None = None
     row_filters: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    tags: tuple[str, ...] = ()
     max_examples: int | None = None
     shuffle_buffer_size: int = 10_000
 
@@ -64,10 +71,7 @@ def stream_quality_accepts(text: str) -> bool:
 
 
 def _quality_filter_for_stage(stage: str) -> QualityFilter:
-    normalized = stage.strip().casefold()
-    if normalized == "foundation":
-        return FOUNDATION_ENGLISH_FILTER
-    return LANGUAGE_QUALITY_FILTER
+    return FOUNDATION_ENGLISH_FILTER if stage.strip().casefold() == "foundation" else LANGUAGE_QUALITY_FILTER
 
 
 def _is_chat(text: str) -> bool:
@@ -106,8 +110,7 @@ def _continuation_interaction(text: str) -> str | None:
 
 
 def _use_foundation_interaction(digest: str) -> bool:
-    bucket = int(digest[:8], 16) / 0xFFFFFFFF
-    return bucket < FOUNDATION_INTERACTION_FRACTION
+    return int(digest[:8], 16) / 0xFFFFFFFF < FOUNDATION_INTERACTION_FRACTION
 
 
 class GuardedSource(DatasetSource):
@@ -184,9 +187,7 @@ class GuardedSource(DatasetSource):
             family = prompt_family(text)
             if family and family in self._excluded_families:
                 continue
-            if not self._stage_accepts(text):
-                continue
-            if not near.accept(text):
+            if not self._stage_accepts(text) or not near.accept(text):
                 continue
             seen.add(digest)
             if (
@@ -254,6 +255,15 @@ def _parse_spec(payload: dict) -> HFSourceSpec:
     if mapping_count > 1:
         raise ValueError(f"hf_source_mapping_conflict:{path}")
 
+    raw_tags = payload.get("tags", [])
+    if not isinstance(raw_tags, list):
+        raise ValueError(f"hf_source_tags_must_be_list:{path}")
+    tags = tuple(sorted({str(tag).strip().casefold() for tag in raw_tags if str(tag).strip()}))
+    valid_tags = {"arithmetic", "economics", "language_quality", "conversation", "creativity"}
+    invalid_tags = set(tags).difference(valid_tags)
+    if invalid_tags:
+        raise ValueError(f"hf_source_invalid_tags:{path}:{','.join(sorted(invalid_tags))}")
+
     max_examples = payload.get("max_examples")
     if max_examples is not None:
         max_examples = int(max_examples)
@@ -277,6 +287,7 @@ def _parse_spec(payload: dict) -> HFSourceSpec:
         response_field=response_field,
         dialogue_field=dialogue_field,
         row_filters=_parse_row_filters(payload.get("row_filters"), path=path),
+        tags=tags,
         max_examples=max_examples,
         shuffle_buffer_size=buffer_size,
     )
@@ -301,10 +312,12 @@ def specs_fingerprint(specs: Sequence[HFSourceSpec]) -> str:
         "foundation_continuation_target_words": FOUNDATION_CONTINUATION_TARGET_WORDS,
         "foundation_skill_source_version": FOUNDATION_SKILL_SOURCE_VERSION,
         "conceptual_foundation_version": CONCEPTUAL_FOUNDATION_VERSION,
+        "language_quality_source_version": LANGUAGE_QUALITY_SOURCE_VERSION,
         "foundation_arithmetic_weight": FOUNDATION_ARITHMETIC_WEIGHT,
         "foundation_conceptual_arithmetic_weight": FOUNDATION_CONCEPTUAL_ARITHMETIC_WEIGHT,
         "foundation_economics_weight": FOUNDATION_ECONOMICS_WEIGHT,
         "foundation_economics_causal_weight": FOUNDATION_ECONOMICS_CAUSAL_WEIGHT,
+        "foundation_language_quality_weight": FOUNDATION_LANGUAGE_QUALITY_WEIGHT,
         "sources": [
             {
                 "path": spec.path,
@@ -318,6 +331,7 @@ def specs_fingerprint(specs: Sequence[HFSourceSpec]) -> str:
                 "response_field": spec.response_field,
                 "dialogue_field": spec.dialogue_field,
                 "row_filters": {key: list(values) for key, values in spec.row_filters},
+                "tags": list(spec.tags),
                 "max_examples": spec.max_examples,
                 "shuffle_buffer_size": spec.shuffle_buffer_size,
             }
@@ -357,12 +371,19 @@ def _foundation_skill_sources(
     *,
     excluded_hashes: frozenset[str],
     excluded_families: frozenset[str],
+    feedback: ExamFeedbackPolicy,
 ) -> list[tuple[DatasetSource, float]]:
-    specs: tuple[tuple[DatasetSource, float, int], ...] = (
-        (PrimitiveArithmeticSource(), FOUNDATION_ARITHMETIC_WEIGHT, 250_000),
-        (ConceptualArithmeticSource(), FOUNDATION_CONCEPTUAL_ARITHMETIC_WEIGHT, 250_000),
-        (FoundationEconomicsSource(), FOUNDATION_ECONOMICS_WEIGHT, 50_000),
-        (EconomicsCausalSource(), FOUNDATION_ECONOMICS_CAUSAL_WEIGHT, 100_000),
+    specs: tuple[tuple[DatasetSource, float, int, tuple[str, ...]], ...] = (
+        (PrimitiveArithmeticSource(), FOUNDATION_ARITHMETIC_WEIGHT, 250_000, ("arithmetic",)),
+        (ConceptualArithmeticSource(), FOUNDATION_CONCEPTUAL_ARITHMETIC_WEIGHT, 250_000, ("arithmetic",)),
+        (FoundationEconomicsSource(), FOUNDATION_ECONOMICS_WEIGHT, 50_000, ("economics",)),
+        (EconomicsCausalSource(), FOUNDATION_ECONOMICS_CAUSAL_WEIGHT, 100_000, ("economics",)),
+        (
+            LanguageQualityContrastSource(),
+            FOUNDATION_LANGUAGE_QUALITY_WEIGHT,
+            100_000,
+            ("language_quality", "conversation", "creativity"),
+        ),
     )
     return [
         (
@@ -376,9 +397,9 @@ def _foundation_skill_sources(
                 quality_filter=LANGUAGE_QUALITY_FILTER,
                 transform_foundation_documents=False,
             ),
-            weight,
+            weight * feedback.multiplier_for_tags(tags),
         )
-        for source, weight, near_entries in specs
+        for source, weight, near_entries, tags in specs
     ]
 
 
@@ -391,11 +412,13 @@ def build_training_stream(
     local_weight: float = 0.0,
     excluded_texts: Sequence[str] = (),
     repeat: bool = True,
+    feedback: ExamFeedbackPolicy | None = None,
 ) -> WeightedSourceStream:
     if local_replay or local_weight > 0:
         raise RuntimeError(
             "local_language_training_disabled:configure a pinned streaming source instead"
         )
+    policy = feedback or ExamFeedbackPolicy()
     normalized_stage = stage.strip().casefold()
     selected = stage_specs(specs, stage)
     excluded_hashes = frozenset(canonical_hash(text) for text in excluded_texts if text and text.strip())
@@ -411,12 +434,13 @@ def build_training_stream(
                 excluded_families=excluded_families,
                 near_index=hf_near_index,
             ),
-            spec.weight,
+            spec.weight * policy.multiplier_for_tags(spec.tags),
         ))
     if normalized_stage == "foundation":
         sources.extend(_foundation_skill_sources(
             excluded_hashes=excluded_hashes,
             excluded_families=excluded_families,
+            feedback=policy,
         ))
     return WeightedSourceStream(sources, seed=seed, repeat=repeat)
 
@@ -436,6 +460,7 @@ def sample_training_stream(
         local_replay=(),
         local_weight=0.0,
         repeat=False,
+        feedback=ExamFeedbackPolicy(),
     )
     result: list[str] = []
     for text in stream:
