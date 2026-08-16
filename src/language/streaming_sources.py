@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterator, Sequence
@@ -38,11 +39,15 @@ from src.language.language_quality_source import (
 FOUNDATION_INTERACTION_FRACTION = 0.25
 FOUNDATION_CONTINUATION_PREFIX_WORDS = 32
 FOUNDATION_CONTINUATION_TARGET_WORDS = 48
-FOUNDATION_ARITHMETIC_WEIGHT = 0.18
-FOUNDATION_CONCEPTUAL_ARITHMETIC_WEIGHT = 0.10
-FOUNDATION_ECONOMICS_WEIGHT = 0.10
-FOUNDATION_ECONOMICS_CAUSAL_WEIGHT = 0.08
-FOUNDATION_LANGUAGE_QUALITY_WEIGHT = 0.10
+# These weights now describe supervised-token shares because CorpusStreamer uses
+# weighted fair queuing on actual non-pad loss targets. Arithmetic is deliberately
+# dominant until the foundation model demonstrates basic operand/operation binding.
+FOUNDATION_ARITHMETIC_WEIGHT = 0.45
+FOUNDATION_CONCEPTUAL_ARITHMETIC_WEIGHT = 0.30
+FOUNDATION_ECONOMICS_WEIGHT = 0.18
+FOUNDATION_ECONOMICS_CAUSAL_WEIGHT = 0.15
+FOUNDATION_LANGUAGE_QUALITY_WEIGHT = 0.12
+_IMMUTABLE_HF_REVISION_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -275,6 +280,8 @@ def _parse_spec(payload: dict) -> HFSourceSpec:
     revision = str(payload["revision"]).strip() if payload.get("revision") else None
     if not revision:
         raise ValueError(f"hf_source_revision_required:{path}")
+    if not _IMMUTABLE_HF_REVISION_RE.fullmatch(revision):
+        raise ValueError(f"hf_source_revision_must_be_immutable_commit:{path}:{revision}")
     return HFSourceSpec(
         path=path,
         weight=weight,
@@ -318,6 +325,7 @@ def specs_fingerprint(specs: Sequence[HFSourceSpec]) -> str:
         "foundation_economics_weight": FOUNDATION_ECONOMICS_WEIGHT,
         "foundation_economics_causal_weight": FOUNDATION_ECONOMICS_CAUSAL_WEIGHT,
         "foundation_language_quality_weight": FOUNDATION_LANGUAGE_QUALITY_WEIGHT,
+        "source_weight_unit": "supervised_prediction_tokens",
         "sources": [
             {
                 "path": spec.path,
@@ -376,7 +384,7 @@ def _foundation_skill_sources(
     specs: tuple[tuple[DatasetSource, float, int, tuple[str, ...]], ...] = (
         (PrimitiveArithmeticSource(), FOUNDATION_ARITHMETIC_WEIGHT, 250_000, ("arithmetic",)),
         (ConceptualArithmeticSource(), FOUNDATION_CONCEPTUAL_ARITHMETIC_WEIGHT, 250_000, ("arithmetic",)),
-        (FoundationEconomicsSource(), FOUNDATION_ECONOMICS_WEIGHT, 50_000, ("economics",)),
+        (FoundationEconomicsSource(), FOUNDATION_ECONOMICS_WEIGHT, 100_000, ("economics",)),
         (EconomicsCausalSource(), FOUNDATION_ECONOMICS_CAUSAL_WEIGHT, 100_000, ("economics",)),
         (
             LanguageQualityContrastSource(),
@@ -416,7 +424,7 @@ def build_training_stream(
 ) -> WeightedSourceStream:
     if local_replay or local_weight > 0:
         raise RuntimeError(
-            "local_language_training_disabled:configure a pinned streaming source instead"
+            "local_language_training_disabled:configure_a_pinned_streaming_source_instead"
         )
     policy = feedback or ExamFeedbackPolicy()
     normalized_stage = stage.strip().casefold()
