@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import random
-import re
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,7 +13,24 @@ from src.language.canonical_contract import prompt_family
 from src.language.conditioning_gate import run_prompt_conditioning_gate
 from src.language.loss_objective import build_loss_targets
 from src.language.pytorch_transformer import VistaReasoningGPT
-from src.language.tokenizer import BPETokenizer, TOKENIZER_ALGORITHM_VERSION
+from src.language.tokenizer import (
+    ASSISTANT,
+    BOS,
+    ENDASSISTANT,
+    ENDUSER,
+    EOS,
+    USER,
+    BPETokenizer,
+    SPECIAL_TOKENS,
+    TOKENIZER_ALGORITHM_VERSION,
+)
+
+_BOS_ID = SPECIAL_TOKENS.index(BOS)
+_EOS_ID = SPECIAL_TOKENS.index(EOS)
+_USER_ID = SPECIAL_TOKENS.index(USER)
+_END_USER_ID = SPECIAL_TOKENS.index(ENDUSER)
+_ASSISTANT_ID = SPECIAL_TOKENS.index(ASSISTANT)
+_END_ASSISTANT_ID = SPECIAL_TOKENS.index(ENDASSISTANT)
 
 
 @dataclass(frozen=True)
@@ -69,7 +85,7 @@ def split_by_prompt_family(
 
 
 def _content_windows(token_ids: list[int], seq_len: int) -> list[list[int]]:
-    """Split long content without duplicating prediction targets."""
+    """Split long non-chat content without duplicating prediction targets."""
     if len(token_ids) < 2:
         return []
     window = seq_len + 1
@@ -88,6 +104,103 @@ def _content_windows(token_ids: list[int], seq_len: int) -> list[list[int]]:
     return chunks
 
 
+def _current_user_context(full_ids: list[int], assistant_index: int, *, budget: int) -> list[int]:
+    """Return bounded prompt context for one assistant turn without prior answer targets."""
+    user_index = -1
+    for index in range(assistant_index - 1, -1, -1):
+        if full_ids[index] == _USER_ID:
+            user_index = index
+            break
+        if full_ids[index] == _END_ASSISTANT_ID:
+            break
+    if user_index < 0:
+        context = full_ids[1:assistant_index] if full_ids and full_ids[0] == _BOS_ID else full_ids[:assistant_index]
+    else:
+        context = full_ids[user_index:assistant_index]
+    if len(context) <= budget:
+        return list(context)
+    if budget <= 0:
+        return []
+
+    # Preserve the user opener and, where present, the user closer while retaining
+    # the most recent prompt tokens. This keeps the chunk causally useful without
+    # ever carrying an earlier assistant answer into a new supervision window.
+    tail_budget = max(0, budget - 1)
+    tail = list(context[-tail_budget:]) if tail_budget else []
+    if context and context[0] == _USER_ID:
+        if tail and tail[0] == _USER_ID:
+            return tail[-budget:]
+        return [_USER_ID] + tail
+    return list(context[-budget:])
+
+
+def _chat_long_chunks(full_ids: list[int], *, seq_len: int) -> list[list[int]]:
+    """Chunk long chats by assistant turn while preserving role-aware supervision.
+
+    Arbitrary token windows are unsafe for conversations: a window can begin in
+    user text, lose the <assistant> opener, and then be mistaken for document LM
+    data. Every returned chunk therefore contains an explicit <assistant> marker;
+    prompt context is masked by build_loss_targets and only assistant content is
+    optimized.
+    """
+    max_tokens = seq_len + 1
+    chunks: list[list[int]] = []
+    cursor = 0
+    while cursor < len(full_ids):
+        try:
+            assistant_index = full_ids.index(_ASSISTANT_ID, cursor)
+        except ValueError:
+            break
+        try:
+            end_index = full_ids.index(_END_ASSISTANT_ID, assistant_index + 1)
+        except ValueError:
+            raise RuntimeError("long_chat_missing_endassistant")
+
+        body = full_ids[assistant_index + 1 : end_index]
+        # Reserve BOS + assistant opener + one assistant token + final closer/EOS.
+        context_budget = max(0, max_tokens - 5)
+        context = _current_user_context(full_ids, assistant_index, budget=context_budget)
+        prefix = [_BOS_ID] + context + [_ASSISTANT_ID]
+        if len(prefix) >= max_tokens - 2:
+            context = _current_user_context(
+                full_ids,
+                assistant_index,
+                budget=max(0, max_tokens - 5),
+            )
+            prefix = [_BOS_ID] + context + [_ASSISTANT_ID]
+        if len(prefix) >= max_tokens - 1:
+            raise RuntimeError("long_chat_prompt_context_exhausts_sequence")
+
+        intermediate_capacity = max_tokens - len(prefix)
+        final_capacity = max_tokens - len(prefix) - 2
+        if final_capacity < 1:
+            raise RuntimeError("long_chat_has_no_assistant_capacity")
+
+        body_cursor = 0
+        if not body:
+            chunks.append(prefix + [_END_ASSISTANT_ID, _EOS_ID])
+        while body_cursor < len(body):
+            remaining = len(body) - body_cursor
+            if remaining <= final_capacity:
+                chunk = prefix + body[body_cursor:] + [_END_ASSISTANT_ID, _EOS_ID]
+                body_cursor = len(body)
+            else:
+                take = min(intermediate_capacity, remaining - final_capacity)
+                if take <= 0:
+                    raise RuntimeError("long_chat_chunk_progress_failed")
+                chunk = prefix + body[body_cursor : body_cursor + take]
+                body_cursor += take
+            chunks.append(chunk)
+
+        cursor = end_index + 1
+
+    if not chunks:
+        raise RuntimeError("long_chat_contains_no_assistant_turn")
+    if any(len(chunk) < 2 or len(chunk) > max_tokens for chunk in chunks):
+        raise RuntimeError("contextual_long_chunk_length_invalid")
+    return chunks
+
+
 def _contextual_long_chunks(
     text: str, tokenizer: BPETokenizer, *, seq_len: int,
 ) -> list[list[int]]:
@@ -95,41 +208,9 @@ def _contextual_long_chunks(
     full_ids = tokenizer.encode(text, add_bos=False, add_eos=False)
     if len(full_ids) <= max_tokens:
         return [full_ids]
-    reasoning = re.match(r"(?s)^(.*?<assistant>\s*<think>\s*)(.*?)(\s*</think>.*)$", text)
-    if reasoning:
-        prefix_text, body_text, tail_text = reasoning.groups()
-    else:
-        assistant = re.match(r"(?s)^(.*?<assistant>\s*)(.*?)(\s*</assistant>\s*<eos>\s*)$", text)
-        if not assistant:
-            return _content_windows(full_ids, seq_len)
-        prefix_text, body_text, tail_text = assistant.groups()
-    prefix_ids = tokenizer.encode(prefix_text, add_bos=False, add_eos=False)
-    body_ids = tokenizer.encode(body_text, add_bos=False, add_eos=False)
-    tail_ids = tokenizer.encode(tail_text, add_bos=False, add_eos=False)
-    if len(prefix_ids) >= max_tokens - 2:
-        return _content_windows(full_ids, seq_len)
-    intermediate_capacity = max_tokens - len(prefix_ids)
-    final_capacity = max_tokens - len(prefix_ids) - len(tail_ids)
-    if final_capacity < 1:
-        return _content_windows(full_ids, seq_len)
-    chunks: list[list[int]] = []
-    cursor = 0
-    while cursor < len(body_ids):
-        remaining = len(body_ids) - cursor
-        if remaining <= final_capacity:
-            chunks.append(prefix_ids + body_ids[cursor:] + tail_ids)
-            cursor = len(body_ids)
-            break
-        take = min(intermediate_capacity, remaining - final_capacity)
-        if take <= 0:
-            return _content_windows(full_ids, seq_len)
-        chunks.append(prefix_ids + body_ids[cursor : cursor + take])
-        cursor += take
-    if not chunks:
-        return _content_windows(full_ids, seq_len)
-    if any(len(chunk) < 2 or len(chunk) > max_tokens for chunk in chunks):
-        raise RuntimeError("contextual_long_chunk_length_invalid")
-    return chunks
+    if _ASSISTANT_ID in full_ids:
+        return _chat_long_chunks(full_ids, seq_len=seq_len)
+    return _content_windows(full_ids, seq_len)
 
 
 def _drop_zero_supervision_sequences(
