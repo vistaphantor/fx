@@ -62,4 +62,5 @@ jobs:
             tests/test_language_hf_filtered_dialogue_sources.py \
             tests/test_language_exam_feedback.py \
             tests/test_language_foundation_v11_learning.py \
+            tests/test_language_semantic_checkpointing.py \
             -q
