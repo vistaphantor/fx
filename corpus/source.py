@@ -85,10 +85,35 @@ class LocalSource(DatasetSource):
         )
 
     def stream(self) -> Iterator[str]:
-        from corpus.loader import DataLoader
+        """Stream through the same canonical parsers used by the trainer.
 
-        loader = DataLoader(str(self.path))
-        yield from loader.load()
+        The historical ``corpus.loader`` path duplicated parsing semantics and no
+        longer exists. LocalSource now delegates directly to the authoritative
+        language data pipeline instead of maintaining a compatibility facade.
+        """
+        from src.language.data_pipeline import (
+            _load_json_file,
+            _load_jsonl_file,
+            _load_txt_file,
+            load_all_training_text,
+        )
+
+        if not self.path.exists():
+            raise FileNotFoundError(self.path)
+        if self.path.is_dir():
+            yield from load_all_training_text(self.path, shuffle=False)
+            return
+        suffix = self.path.suffix.casefold()
+        if suffix == ".json":
+            yield from _load_json_file(self.path)
+            return
+        if suffix == ".jsonl":
+            yield from _load_jsonl_file(self.path)
+            return
+        if suffix == ".txt":
+            yield from _load_txt_file(self.path)
+            return
+        raise ValueError(f"unsupported_local_source_format:{self.path.suffix}")
 
 
 class HFSource(DatasetSource):
@@ -141,6 +166,10 @@ class HFSource(DatasetSource):
             raise ValueError("stream_retry_attempts must be >= 0")
         if stream_retry_base_seconds < 0:
             raise ValueError("stream_retry_base_seconds must be >= 0")
+        if bool(prompt_field) != bool(response_field):
+            raise ValueError("prompt_field and response_field must be supplied together")
+        if text_fields and (prompt_field or response_field):
+            raise ValueError("text_fields cannot be combined with prompt/response mappings")
         if dialogue_field and (text_fields or prompt_field or response_field):
             raise ValueError("dialogue_field cannot be combined with text or prompt/response mappings")
 
