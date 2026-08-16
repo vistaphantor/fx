@@ -17,13 +17,29 @@ from src.language.tokenizer import BPETokenizer, ENDASSISTANT
 
 
 class _ScriptedModel:
+    """Small deterministic exam double implementing the model protocol Binoculars uses."""
+
     def __init__(self, tokenizer: BPETokenizer, outputs: dict[str, str]):
         self.tokenizer = tokenizer
         self.outputs = outputs
         self.max_seq_len = 256
+        self.training = False
 
     def eval(self):
+        self.training = False
         return self
+
+    def train(self, mode: bool = True):
+        self.training = bool(mode)
+        return self
+
+    def named_parameters(self):
+        return iter(())
+
+    def __call__(self, idx: torch.Tensor, **_: object):
+        batch, steps = idx.shape
+        logits = torch.zeros(batch, steps, self.tokenizer.vocab_size, dtype=torch.float32)
+        return logits, None
 
     def generate(self, idx: torch.Tensor, **_: object) -> torch.Tensor:
         prompt = self.tokenizer.decode(idx[0].tolist(), skip_special=False)
@@ -41,7 +57,10 @@ def _tokenizer() -> BPETokenizer:
     text = "\n".join(
         build_exam_prompt(question.prompt)
         for question in FOUNDATION_EXAM + TRADING_EXTENSION
-    ) + "\n4 210 3 rising loss Charlie difference bid ask volatility range"
+    ) + "\n" + "\n".join(
+        question.diagnostic_target or ""
+        for question in FOUNDATION_EXAM + TRADING_EXTENSION
+    )
     tokenizer = BPETokenizer()
     tokenizer.train(text, vocab_size=1024, min_frequency=1)
     return tokenizer
@@ -58,14 +77,8 @@ def test_foundation_exam_is_fixed_and_trading_stage_extends_it():
 def test_epoch_exam_scores_known_answers_and_writes_artifacts(tmp_path: Path):
     tokenizer = _tokenizer()
     outputs = {
-        "What is 2 + 2?": "4",
-        "What is 15 multiplied by 14?": "210",
-        "If 2x + 5 = 11, what is x?": "x = 3",
-        "In trading, what does bullish mean?": "Bullish means price is expected to rise.",
-        "What does risk mean in trading?": "Risk is the possibility of loss.",
-        "Alice is older than Bob, and Bob is older than Charlie. Who is youngest?": "Charlie.",
-        "What is the bid-ask spread?": "The difference between bid and ask.",
-        "What does ATR measure in market analysis?": "ATR measures volatility and true range.",
+        question.prompt: question.diagnostic_target or "I do not know."
+        for question in FOUNDATION_EXAM
     }
     model = _ScriptedModel(tokenizer, outputs)
     result = run_epoch_exam(
@@ -75,14 +88,14 @@ def test_epoch_exam_scores_known_answers_and_writes_artifacts(tmp_path: Path):
         training_stage="foundation",
         train_loss=3.0,
         validation_loss=3.2,
-        max_new_tokens=32,
+        max_new_tokens=64,
     )
     assert result.correct_questions == result.total_questions
     assert result.correctness_percent == 100.0
     text_path, json_path = save_epoch_exam(result=result, exams_dir=tmp_path)
     assert text_path.name == "epoch_001_exam.txt"
     assert json_path.name == "epoch_001_exam.json"
-    assert "What is 2 + 2?" in text_path.read_text(encoding="utf-8")
+    assert FOUNDATION_EXAM[0].prompt in text_path.read_text(encoding="utf-8")
     payload = json.loads(json_path.read_text(encoding="utf-8"))
     assert payload["epoch"] == 1
     assert payload["correctness_percent"] == 100.0
