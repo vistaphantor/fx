@@ -50,7 +50,13 @@ def buffered_shuffle(values: Iterable[str], *, buffer_size: int, seed: int) -> I
 
 
 class WeightedSourceStream:
-    """Deterministically mix independent dataset sources without materializing them."""
+    """Deterministically mix independent dataset sources without materializing them.
+
+    ``CorpusStreamer`` treats this object as an authoritative weighted source
+    contract and schedules training sequences by *supervised prediction tokens*,
+    not by document count. ``iter_with_source`` remains useful for lightweight
+    sampling/auditing where tokenization is intentionally unavailable.
+    """
 
     def __init__(
         self,
@@ -100,7 +106,15 @@ class WeightedSourceStream:
 
 
 class CorpusStreamer(IterableDataset):
-    """Boundary-preserving, bounded-memory role-aware training stream."""
+    """Boundary-preserving, bounded-memory role-aware training stream.
+
+    When fed a ``WeightedSourceStream`` the scheduler measures the actual number
+    of non-pad loss targets emitted by every source. The next source is selected
+    by weighted fair queuing on that measured token debt. This prevents a single
+    long web document from receiving many optimizer windows merely because one
+    document draw happened to be selected, which previously overwhelmed short
+    arithmetic and conversation examples despite apparently large source weights.
+    """
 
     def __init__(
         self,
@@ -147,13 +161,13 @@ class CorpusStreamer(IterableDataset):
         if pair is not None:
             yield pair
 
-    def __iter__(self) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+    def _pairs_from_texts(self, texts: Iterable[str]) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+        """Pack one source independently so every emitted token has one owner."""
         from src.language.training_pipeline import build_example_sequences
 
         max_tokens = self.seq_len + 1
         pack: list[int] = []
-
-        for text in self._stream_texts():
+        for text in texts:
             if not text or not text.strip():
                 continue
             raw_ids = self.tokenizer.encode(text, add_bos=False, add_eos=False)
@@ -178,3 +192,54 @@ class CorpusStreamer(IterableDataset):
 
         if len(pack) >= 2:
             yield from self._yield_pair(pack)
+
+    def _weighted_pairs(self, stream: WeightedSourceStream) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+        """Weighted-fair schedule using actual supervised-token consumption."""
+        worker_info = torch.utils.data.get_worker_info()
+        worker_seed = stream.seed if worker_info is None else stream.seed + worker_info.id
+        rng = random.Random(worker_seed)
+        total_weight = sum(weight for _, weight in stream.sources)
+        entries = [
+            {
+                "source": source,
+                "weight": float(weight) / total_weight,
+                "tokens": 0,
+                "iterator": self._pairs_from_texts(source.stream()),
+            }
+            for source, weight in stream.sources
+        ]
+        pad_id = self.tokenizer.pad_id()
+
+        while entries:
+            # Weighted fair queuing: the source with the smallest consumed-token
+            # share relative to its requested share has the largest training debt.
+            scores = [entry["tokens"] / entry["weight"] for entry in entries]
+            minimum = min(scores)
+            tied = [index for index, score in enumerate(scores) if abs(score - minimum) <= 1e-9]
+            chosen = tied[rng.randrange(len(tied))]
+            entry = entries[chosen]
+            try:
+                pair = next(entry["iterator"])
+            except StopIteration:
+                if not stream.repeat:
+                    entries.pop(chosen)
+                    continue
+                entry["iterator"] = self._pairs_from_texts(entry["source"].stream())
+                try:
+                    pair = next(entry["iterator"])
+                except StopIteration:
+                    entries.pop(chosen)
+                    continue
+
+            _, targets = pair
+            supervised_tokens = int((targets != pad_id).sum().item())
+            if supervised_tokens <= 0:
+                continue
+            entry["tokens"] += supervised_tokens
+            yield pair
+
+    def __iter__(self) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+        if isinstance(self.texts, WeightedSourceStream):
+            yield from self._weighted_pairs(self.texts)
+            return
+        yield from self._pairs_from_texts(self._stream_texts())
