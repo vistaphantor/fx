@@ -14,7 +14,7 @@ from src.language.protocol import build_exam_prompt
 from src.language.pytorch_transformer import VistaReasoningGPT
 from src.language.tokenizer import BPETokenizer, ENDASSISTANT, EOS
 
-EXAM_VERSION = 9
+EXAM_VERSION = 10
 EXAM_DECODING_MODE = "greedy_argmax_v1"
 BINOCULARS_TOP_K = 8
 BINOCULARS_RENDER_STEPS = 24
@@ -146,6 +146,30 @@ FOUNDATION_EXAM: tuple[ExamQuestion, ...] = (
         expected_any=("falls", "fall", "decreases", "declines", "lower"),
         diagnostic_target="Purchasing power falls.",
     ),
+    ExamQuestion(
+        "grammar_subject_verb", "grammar",
+        "Which sentence is grammatical? A) The children are playing outside. B) The children is playing outside.",
+        expected_any=("a", "children are"),
+        diagnostic_target="A. The children are playing outside.",
+    ),
+    ExamQuestion(
+        "semantic_plausibility_eat", "semantic_plausibility",
+        "Which sentence makes sense? A) They ate lunch in the park. B) They ate the park.",
+        expected_any=("a", "lunch"),
+        diagnostic_target="A. They ate lunch in the park.",
+    ),
+    ExamQuestion(
+        "repetition_control", "language_control",
+        "Answer once, in one short sentence: What does a key normally open?",
+        expected_any=("lock", "door"),
+        diagnostic_target="A key normally opens a lock or a door.",
+    ),
+    ExamQuestion(
+        "creative_kite", "creativity",
+        "Write one sensible sentence about a red kite in the sky.",
+        expected_all=("kite", "sky"),
+        diagnostic_target="A red kite floats high in the sky.",
+    ),
 )
 
 REASONING_EXTENSION: tuple[ExamQuestion, ...] = (
@@ -180,7 +204,7 @@ def exam_contract_payload(training_stage: str) -> dict:
         "training_stage": stage,
         "questions": [{**asdict(q), "serialized_prompt": build_exam_prompt(q.prompt)} for q in exam_questions(stage)],
         "stop_tokens": [ENDASSISTANT, EOS],
-        "semantic_grading": "expression_bound_numeric_v3",
+        "semantic_grading": "expression_bound_numeric_v3+language_probes_v1",
         "collapse_detection": "exact_and_prefix_v1",
         "binoculars": "logit_trace_target_rank_prompt_js_weight_health_v1",
     }
@@ -350,10 +374,11 @@ def _distribution_snapshot(logits: torch.Tensor, tokenizer: BPETokenizer, *, top
 def _trace_generated_decisions(model: VistaReasoningGPT, tokenizer: BPETokenizer, prompt_ids: list[int], continuation: list[int]) -> tuple[DecisionTrace, ...]:
     if not continuation:
         return ()
-    context = prompt_ids + continuation[:-1]
+    full = prompt_ids + continuation
+    context = full[:-1]
     if len(context) > model.max_seq_len:
         context = context[-model.max_seq_len:]
-        prompt_offset = max(0, len(prompt_ids) - (len(prompt_ids) + len(continuation) - 1 - model.max_seq_len))
+        prompt_offset = max(1, len(prompt_ids) - (len(full) - 1 - len(context)))
     else:
         prompt_offset = len(prompt_ids)
     logits, _ = model(torch.tensor([context], dtype=torch.long))
@@ -477,6 +502,7 @@ def _parameter_health(model: VistaReasoningGPT) -> tuple[ParameterHealth, ...]:
     return tuple(result)
 
 
+@torch.no_grad()
 def run_epoch_exam(*, model: VistaReasoningGPT, tokenizer: BPETokenizer, epoch: int, training_stage: str, train_loss: float | None, validation_loss: float | None, max_new_tokens: int = 64) -> EpochExamResult:
     if epoch < 0 or max_new_tokens <= 0:
         raise ValueError("invalid exam epoch/token budget")
