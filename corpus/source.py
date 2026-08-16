@@ -92,13 +92,7 @@ class LocalSource(DatasetSource):
 
 
 class HFSource(DatasetSource):
-    """Pinned Hugging Face streaming source with local filtering and shuffling.
-
-    Remote shard order stays sequential. Dataset-specific row filtering and
-    dialogue adaptation happen after each row reaches this process, so adding a
-    focused subject slice never delegates expensive random access to the remote
-    iterable.
-    """
+    """Pinned Hugging Face streaming source with local filtering and shuffling."""
 
     COLUMN_SCHEMAS = (
         ("prompt", "response"),
@@ -246,8 +240,6 @@ class HFSource(DatasetSource):
             messages.append(CanonicalMessage(role, str(content)))
         if len(messages) < 2:
             return []
-        # Supervision must end on an assistant turn; dropping a trailing user
-        # turn is preferable to creating a prompt with no target.
         if messages[-1].role == "user":
             messages.pop()
         return messages
@@ -258,7 +250,9 @@ class HFSource(DatasetSource):
 
         if self._dialogue_field:
             messages = self._messages_from_dialogue(row.get(self._dialogue_field))
-            return serialize_messages(messages) or None if messages else None
+            if not messages:
+                return None
+            return serialize_messages(messages) or None
 
         if self._prompt_field and self._response_field:
             schema = self._detect_schema(row)
@@ -299,7 +293,6 @@ class HFSource(DatasetSource):
         return None
 
     def _load_dataset(self, *, shuffle: bool = False, retry_generation: int = 0):
-        """Open the pinned remote iterable without changing remote shard order."""
         if not self._revision:
             raise RuntimeError(
                 f"hf_revision_must_be_pinned:{self._path}:set an immutable commit/tag revision"
@@ -361,9 +354,9 @@ class HFSource(DatasetSource):
             for row in iterator:
                 if scanned >= max_rows:
                     break
-                scanned += 1
-                if not isinstance(row, dict):
+                if not isinstance(row, dict) or not self._row_allowed(row):
                     continue
+                scanned += 1
                 text = self._row_to_text(row)
                 if not text:
                     continue
