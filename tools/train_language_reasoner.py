@@ -28,6 +28,12 @@ from src.language.hard_negative_objective import HARD_NEGATIVE_OBJECTIVE_VERSION
 from src.language.loss_objective import LOSS_OBJECTIVE_VERSION
 from src.language.model_bundle import load_model_bundle, save_model_bundle
 from src.language.pytorch_transformer import VistaReasoningGPT
+from src.language.semantic_checkpointing import (
+    SEMANTIC_CHECKPOINT_POLICY_VERSION,
+    checkpoint_is_better,
+    mastery_report,
+    rank_from_checkpoint_payload,
+)
 from src.language.streaming_sources import (
     HFSourceSpec,
     build_training_stream,
@@ -332,6 +338,16 @@ def _contract_mismatch_allowed(*, key: str, curriculum_upgrade: bool) -> bool:
     return bool(curriculum_upgrade and key in UPGRADABLE_DATA_CONTRACT_KEYS)
 
 
+def _load_best_rank(best_path: Path) -> tuple[float, ...] | None:
+    if not best_path.exists():
+        return None
+    try:
+        payload = torch.load(best_path, map_location="cpu", weights_only=False)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return rank_from_checkpoint_payload(payload if isinstance(payload, dict) else None)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--profile", choices=sorted(PROFILES), default="2m")
@@ -550,12 +566,14 @@ def main() -> None:
         "exam_steps": measured_exam_steps,
         "exam_feedback_version": EXAM_FEEDBACK_VERSION,
         "hard_negative_objective_version": HARD_NEGATIVE_OBJECTIVE_VERSION,
+        "semantic_checkpoint_policy_version": SEMANTIC_CHECKPOINT_POLICY_VERSION,
     }
     _atomic_json_save(preflight, preflight_path)
     print(
         f"[Preflight] PASS roundtrips={report.roundtrip_cases} "
         f"overfit={report.overfit_initial_loss:.4f}->{report.overfit_final_loss:.4f} "
-        f"objective=v{LOSS_OBJECTIVE_VERSION} hard_negative=v{HARD_NEGATIVE_OBJECTIVE_VERSION}"
+        f"objective=v{LOSS_OBJECTIVE_VERSION} hard_negative=v{HARD_NEGATIVE_OBJECTIVE_VERSION} "
+        f"semantic_checkpoint=v{SEMANTIC_CHECKPOINT_POLICY_VERSION}"
     )
     print(
         f"[Architecture] ffn={cfg['ffn_type']} total_params={total_params:,} "
@@ -607,6 +625,7 @@ def main() -> None:
     best_val = float("inf")
     stale = 0
     feedback = ExamFeedbackPolicy()
+    best_semantic_rank = _load_best_rank(best_path)
     if args.resume:
         if not state_path.exists():
             raise RuntimeError("resume_training_state_missing")
@@ -638,9 +657,11 @@ def main() -> None:
             resume_step = 0
             best_val = float("inf")
             stale = 0
+            best_semantic_rank = None
+            best_path.unlink(missing_ok=True)
             print(
                 f"[CurriculumUpgrade] state data contract changed: "
-                f"{','.join(changed_state_data_keys)}; validation baseline reset"
+                f"{','.join(changed_state_data_keys)}; validation and semantic checkpoint baselines reset"
             )
             if abandoned_steps > 0:
                 print(
@@ -820,7 +841,7 @@ def main() -> None:
                 optimizer=optimizer,
                 feedback=feedback,
             )
-            _run_exam(
+            session_exam = _run_exam(
                 model,
                 tokenizer,
                 epoch=epoch,
@@ -832,6 +853,21 @@ def main() -> None:
                 max_new_tokens=int(cfg["exam_max_new_tokens"]),
                 prefix="session_end_exam",
             )
+            feedback = derive_exam_feedback(session_exam)
+            _save_state(
+                state_path,
+                contract=state_contract,
+                epoch=epoch,
+                step=completed,
+                cumulative_tokens=cumulative_tokens,
+                optimizer_steps=optimizer_steps,
+                best_val=best_val,
+                stale=stale,
+                model=model,
+                optimizer=optimizer,
+                feedback=feedback,
+            )
+            print(f"[ExamFeedback] resume_with {feedback_summary(feedback)}")
             print(
                 f"[SessionStop] step={completed}/{exam_steps} "
                 f"tokens={cumulative_tokens:,}/{target_tokens:,}. Resume with --resume."
@@ -843,22 +879,6 @@ def main() -> None:
             val_loader,
             pad_id=tokenizer.pad_id(),
         )
-        if val_loss < best_val - float(cfg["early_stop_min_delta"]):
-            best_val = val_loss
-            stale = 0
-            _atomic_torch_save(
-                {
-                    "model_state_dict": model.state_dict(),
-                    "model_config": model_config,
-                    "validation_loss": best_val,
-                    "epoch": epoch + 1,
-                    "cumulative_prediction_tokens": cumulative_tokens,
-                },
-                best_path,
-            )
-        else:
-            stale += 1
-
         previous_exam = _run_exam(
             model,
             tokenizer,
@@ -870,6 +890,44 @@ def main() -> None:
             previous=previous_exam,
             max_new_tokens=int(cfg["exam_max_new_tokens"]),
         )
+
+        promoted, candidate_rank = checkpoint_is_better(
+            candidate_result=previous_exam,
+            candidate_validation_loss=val_loss,
+            incumbent_rank=best_semantic_rank,
+        )
+        if promoted:
+            best_semantic_rank = candidate_rank
+            best_val = val_loss
+            stale = 0
+            mastery = mastery_report(previous_exam, stage)
+            _atomic_torch_save(
+                {
+                    "model_state_dict": model.state_dict(),
+                    "model_config": model_config,
+                    "validation_loss": best_val,
+                    "epoch": epoch + 1,
+                    "cumulative_prediction_tokens": cumulative_tokens,
+                    "semantic_checkpoint_policy_version": SEMANTIC_CHECKPOINT_POLICY_VERSION,
+                    "semantic_checkpoint_rank": list(candidate_rank),
+                    "exam_correct_questions": previous_exam.correct_questions,
+                    "exam_total_questions": previous_exam.total_questions,
+                    "exam_correctness_percent": previous_exam.correctness_percent,
+                    "exam_quality_percent": previous_exam.mean_quality_percent,
+                    "exam_gibberish_answers": previous_exam.gibberish_answers,
+                    "exam_answer_diversity_percent": previous_exam.answer_diversity_percent,
+                    "exam_mode_collapse": previous_exam.mode_collapse,
+                    "mastery": mastery.to_dict(),
+                },
+                best_path,
+            )
+            print(
+                f"[BestCheckpoint] promoted semantic={previous_exam.correct_questions}/"
+                f"{previous_exam.total_questions} val={val_loss:.4f} mastery={mastery.mastered}"
+            )
+        else:
+            stale += 1
+
         feedback = derive_exam_feedback(previous_exam)
         print(f"[ExamFeedback] next_epoch {feedback_summary(feedback)}")
         epoch += 1
@@ -892,21 +950,31 @@ def main() -> None:
             feedback=feedback,
         )
         current_tpp = cumulative_tokens / max(total_params, 1)
+        mastery = mastery_report(previous_exam, stage)
         print(
             f"epoch={epoch} train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
             f"best_val={best_val:.4f} supervised_tokens={epoch_tokens:,} "
             f"cumulative={cumulative_tokens:,}/{target_tokens:,} "
-            f"tokens/total_param={current_tpp:.3f} val_tokens={val_tokens:,}"
+            f"tokens/total_param={current_tpp:.3f} val_tokens={val_tokens:,} "
+            f"mastery={mastery.mastered}"
         )
         if (
             current_tpp >= float(cfg["early_stop_min_tokens_per_parameter"])
             and stale >= int(cfg["early_stop_patience"])
         ):
+            if mastery.mastered:
+                print(
+                    f"[EarlyStop] semantic/validation checkpoint stalled for {stale} exam epochs "
+                    f"after {current_tpp:.2f} tokens/total-param with mastery satisfied"
+                )
+                break
             print(
-                f"[EarlyStop] validation stalled for {stale} exam epochs "
-                f"after {current_tpp:.2f} tokens/total-param"
+                f"[EarlyStopBlocked] checkpoint stalled for {stale} intervals but foundation "
+                f"mastery is not satisfied: arithmetic={mastery.arithmetic_accuracy:.1%} "
+                f"economics={mastery.economics_accuracy:.1%} "
+                f"language={mastery.language_control_accuracy:.1%} "
+                f"overall={mastery.overall_accuracy:.1%}"
             )
-            break
 
         stream_generation += 1
         train_loader = _stream_loader(
@@ -921,6 +989,7 @@ def main() -> None:
         iterator = iter(train_loader)
 
     if not best_path.exists():
+        fallback_mastery = mastery_report(previous_exam, stage).to_dict() if previous_exam is not None else None
         _atomic_torch_save(
             {
                 "model_state_dict": model.state_dict(),
@@ -928,6 +997,9 @@ def main() -> None:
                 "validation_loss": best_val,
                 "epoch": epoch,
                 "cumulative_prediction_tokens": cumulative_tokens,
+                "semantic_checkpoint_policy_version": SEMANTIC_CHECKPOINT_POLICY_VERSION,
+                "semantic_checkpoint_rank": list(best_semantic_rank) if best_semantic_rank is not None else None,
+                "mastery": fallback_mastery,
             },
             best_path,
         )
@@ -947,11 +1019,13 @@ def main() -> None:
         max_new_tokens=int(cfg["exam_max_new_tokens"]),
         prefix="best_model_exam",
     )
+    final_mastery = mastery_report(final_exam, stage)
     metrics = {
         "trainer_version": TRAINER_VERSION,
         "loss_objective_version": LOSS_OBJECTIVE_VERSION,
         "hard_negative_objective_version": HARD_NEGATIVE_OBJECTIVE_VERSION,
         "exam_feedback_version": EXAM_FEEDBACK_VERSION,
+        "semantic_checkpoint_policy_version": SEMANTIC_CHECKPOINT_POLICY_VERSION,
         "profile": args.profile,
         "training_stage": stage,
         "parameter_count": total_params,
@@ -965,6 +1039,8 @@ def main() -> None:
         "stream_only": True,
         "persistent_stream_per_session": True,
         "exam_driven_next_epoch": True,
+        "semantic_checkpoint_selection": True,
+        "mastery_aware_early_stop": True,
         "last_exam_feedback": feedback.to_dict(),
         "sparse_moe": str(cfg["ffn_type"]) == "moe",
         "gqa": {
@@ -980,6 +1056,7 @@ def main() -> None:
             "mean_quality_percent": final_exam.mean_quality_percent,
             "gibberish_answers": final_exam.gibberish_answers,
             "training_signal": final_exam.training_signal,
+            "mastery": final_mastery.to_dict(),
         },
     }
     save_model_bundle(
