@@ -29,11 +29,26 @@ def test_generation_decode_replaces_invalid_utf8() -> None:
 class _MalformedByteModel:
     max_seq_len = 256
 
-    def __init__(self, invalid_id: int):
+    def __init__(self, invalid_id: int, vocab_size: int):
         self.invalid_id = invalid_id
+        self.vocab_size = vocab_size
+        self.training = False
 
     def eval(self):
+        self.training = False
         return self
+
+    def train(self, mode: bool = True):
+        self.training = bool(mode)
+        return self
+
+    def named_parameters(self):
+        return iter(())
+
+    def __call__(self, idx: torch.Tensor, **_: object):
+        batch, steps = idx.shape
+        logits = torch.zeros(batch, steps, self.vocab_size, dtype=torch.float32)
+        return logits, None
 
     def generate(self, idx: torch.Tensor, **_: object) -> torch.Tensor:
         continuation = torch.tensor([[self.invalid_id]], dtype=torch.long)
@@ -42,7 +57,7 @@ class _MalformedByteModel:
 
 def test_epoch_zero_exam_observes_malformed_bytes_without_crashing() -> None:
     tok = _tokenizer()
-    model = _MalformedByteModel(tok.vocab["<byte:ff>"])
+    model = _MalformedByteModel(tok.vocab["<byte:ff>"], tok.vocab_size)
     result = run_epoch_exam(
         model=model,  # type: ignore[arg-type]
         tokenizer=tok,
