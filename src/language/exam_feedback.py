@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 
-EXAM_FEEDBACK_VERSION = 2
+EXAM_FEEDBACK_VERSION = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,7 +24,7 @@ class ExamFeedbackPolicy:
         if not payload:
             return cls()
         version = int(payload.get("version", EXAM_FEEDBACK_VERSION))
-        if version not in {1, EXAM_FEEDBACK_VERSION}:
+        if version not in {1, 2, EXAM_FEEDBACK_VERSION}:
             raise RuntimeError(f"unsupported_exam_feedback_version:{version}")
         values = {field: payload[field] for field in cls.__dataclass_fields__ if field in payload}
         values["version"] = EXAM_FEEDBACK_VERSION
@@ -42,7 +42,7 @@ class ExamFeedbackPolicy:
         return sum(values) / len(values) if values else 1.0
 
 
-def _bounded(value: float, low: float = 0.65, high: float = 2.50) -> float:
+def _bounded(value: float, low: float = 0.65, high: float = 3.75) -> float:
     return max(low, min(high, float(value)))
 
 
@@ -70,12 +70,13 @@ def _attempt_rate(result) -> float:
 
 
 def derive_exam_feedback(result) -> ExamFeedbackPolicy:
-    """Convert holdout exam signals into bounded next-epoch pressure.
+    """Convert holdout failures into next-interval remediation pressure.
 
-    The exam prompts and targets never become training examples. Only aggregate
-    signals alter sampling and loss pressure. A coherent attempt receives credit:
-    it still gets corrected when wrong, but the punitive scale is moderated so
-    the model is encouraged to engage rather than retreat into generic boilerplate.
+    Exams remain holdouts: their prompts/targets are never replayed as training
+    examples. Failure instead reallocates *supervised-token quota* toward the
+    weak skill and strengthens answer-anchor/repetition penalties. Coherent
+    attempts retain a small reward so the model is not trained to retreat into
+    silence or generic boilerplate.
     """
     arithmetic_accuracy = _category_accuracy(result, {"primitive_arithmetic", "number_sense"})
     economics_accuracy = _category_accuracy(result, {"foundation_economics"})
@@ -88,41 +89,47 @@ def derive_exam_feedback(result) -> ExamFeedbackPolicy:
     attempt = _attempt_rate(result)
     gibberish_rate = result.gibberish_answers / max(result.total_questions, 1)
 
-    arithmetic = _bounded(1.0 + 1.30 * (1.0 - arithmetic_accuracy))
-    economics = _bounded(1.0 + 1.20 * (1.0 - economics_accuracy))
+    # Arithmetic is a mastery prerequisite for later reasoning. A zero-score exam
+    # now receives 3.5x arithmetic token quota instead of the former 2.3x ceiling.
+    arithmetic = _bounded(1.0 + 2.50 * (1.0 - arithmetic_accuracy), high=3.50)
+    economics = _bounded(1.0 + 2.00 * (1.0 - economics_accuracy), high=3.00)
     language_quality = _bounded(
         1.0
-        + 1.05 * (1.0 - quality)
-        + 0.90 * gibberish_rate
-        + 0.90 * (1.0 - grammar_accuracy)
-        + 0.45 * (1.0 - language_control_accuracy)
+        + 1.25 * (1.0 - quality)
+        + 1.10 * gibberish_rate
+        + 1.10 * (1.0 - grammar_accuracy)
+        + 0.60 * (1.0 - language_control_accuracy),
+        high=3.25,
     )
     conversation = _bounded(
-        1.0 + 0.60 * (1.0 - quality) + 0.45 * (1.0 - attempt)
+        1.0 + 0.65 * (1.0 - quality) + 0.45 * (1.0 - attempt),
+        high=2.25,
     )
     creativity_weight = _bounded(
         1.0
-        + 0.85 * (1.0 - diversity)
+        + 0.90 * (1.0 - diversity)
         + 0.65 * (1.0 - creativity_accuracy)
-        + (0.50 if result.mode_collapse else 0.0)
+        + (0.50 if result.mode_collapse else 0.0),
+        high=2.75,
     )
 
-    raw_hard_negative = 1.0 + 1.20 * (1.0 - result.correctness_percent / 100.0)
-    # Reward genuine attempts by reducing the extra punitive multiplier by up to
-    # 18%, while never removing the base cross-entropy correction.
+    raw_hard_negative = 1.0 + 1.55 * (1.0 - result.correctness_percent / 100.0)
+    # Attempts reduce only 10% of the extra pressure. The answer-anchor objective
+    # is now narrow enough that strong correction does not indiscriminately punish
+    # every ordinary language token in an otherwise useful answer.
     hard_negative = _bounded(
-        raw_hard_negative * (1.0 - 0.18 * attempt),
-        low=0.80,
+        raw_hard_negative * (1.0 - 0.10 * attempt),
+        low=0.90,
         high=2.75,
     )
     repetition = _bounded(
         1.0
-        + 1.45 * (1.0 - diversity)
-        + 0.60 * (1.0 - language_control_accuracy)
-        + (0.75 if result.mode_collapse else 0.0)
-        + 0.75 * gibberish_rate,
-        low=0.80,
-        high=3.00,
+        + 1.75 * (1.0 - diversity)
+        + 0.80 * (1.0 - language_control_accuracy)
+        + (0.90 if result.mode_collapse else 0.0)
+        + 0.90 * gibberish_rate,
+        low=0.90,
+        high=3.50,
     )
     return ExamFeedbackPolicy(
         arithmetic_weight=arithmetic,
