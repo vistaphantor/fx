@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from src.language.canonical_contract import canonicalize_serialized
 from src.language.tokenizer import BPETokenizer
 from src.language.training_pipeline import (
     PackedSequenceDataset,
@@ -86,7 +87,6 @@ def test_packed_dataset_masks_prompt_and_seeded_assistant_opener():
     ]
     assert assistant_target_positions
     assert all(y[position].item() == tok.pad_id() for position in assistant_target_positions)
-    # The first assistant-content token immediately after the role marker is supervised.
     assistant_index = sequences[0].index(assistant_id)
     assert y[assistant_index].item() != tok.pad_id()
 
@@ -94,10 +94,10 @@ def test_packed_dataset_masks_prompt_and_seeded_assistant_opener():
 def test_preflight_proves_roundtrip_alignment_and_learning():
     tok = _tokenizer()
     texts = [
-        "<bos><user>What is RSI?</user><assistant>RSI is momentum.</assistant><eos>",
-        "<bos><user>What is ATR?</user><assistant>ATR is volatility.</assistant><eos>",
-        "<bos><user>What is risk?</user><assistant>Risk is potential loss.</assistant><eos>",
-        "<bos><user>What is spread?</user><assistant>Spread is bid minus ask.</assistant><eos>",
+        canonicalize_serialized("<bos><user>What is RSI?</user><assistant>RSI is momentum.</assistant><eos>"),
+        canonicalize_serialized("<bos><user>What is ATR?</user><assistant>ATR is volatility.</assistant><eos>"),
+        canonicalize_serialized("<bos><user>What is risk?</user><assistant>Risk is potential loss.</assistant><eos>"),
+        canonicalize_serialized("<bos><user>What is spread?</user><assistant>Spread is bid minus ask.</assistant><eos>"),
     ]
     train, val = split_by_prompt_family(texts, val_fraction=0.25, seed=42)
     train_sequences = build_example_sequences(train, tok, seq_len=64)
