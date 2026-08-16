@@ -9,8 +9,9 @@ from src.language.hard_negative_objective import (
 
 
 def _penalty(values: list[float], target: int = 1) -> float:
-    logits = torch.tensor([[values]], dtype=torch.float32)
-    targets = torch.tensor([[target]], dtype=torch.long)
+    # Answer-specific punishment requires evidence of masked prompt context.
+    logits = torch.tensor([[[0.0] * len(values), values]], dtype=torch.float32)
+    targets = torch.tensor([[0, target]], dtype=torch.long)
     return float(hard_negative_answer_penalty(logits, targets, pad_id=0).item())
 
 
@@ -28,14 +29,24 @@ def test_correct_answer_with_clear_margin_has_small_penalty() -> None:
 
 
 def test_gradient_pushes_correct_up_and_hard_wrong_down() -> None:
-    logits = torch.tensor([[[0.0, -1.0, 4.0, 0.5]]], requires_grad=True)
-    targets = torch.tensor([[1]], dtype=torch.long)
+    logits = torch.tensor(
+        [[[0.0, 0.0, 0.0, 0.0], [0.0, -1.0, 4.0, 0.5]]],
+        requires_grad=True,
+    )
+    targets = torch.tensor([[0, 1]], dtype=torch.long)
     loss = hard_negative_answer_penalty(logits, targets, pad_id=0)
     loss.backward()
 
-    gradient = logits.grad[0, 0]
+    gradient = logits.grad[0, 1]
     assert gradient[1].item() < 0
     assert gradient[2].item() > 0
+
+
+def test_document_start_receives_no_answer_specific_penalty() -> None:
+    logits = torch.tensor([[[0.0, -1.0, 5.0, -2.0]]], dtype=torch.float32)
+    targets = torch.tensor([[1]], dtype=torch.long)
+    penalty = hard_negative_answer_penalty(logits, targets, pad_id=0)
+    assert penalty.item() == 0.0
 
 
 def test_padding_positions_receive_no_penalty() -> None:
