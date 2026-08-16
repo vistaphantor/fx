@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from typing import Iterable
 
-CANONICAL_CONTRACT_VERSION = 3
+CANONICAL_CONTRACT_VERSION = 4
 
 STRUCTURAL_TOKENS: tuple[str, ...] = (
     "<bos>", "<eos>", "<sep>",
@@ -29,10 +29,8 @@ _STRUCTURAL_RE = re.compile(
     "(" + "|".join(re.escape(token) for token in sorted(STRUCTURAL_TOKENS, key=len, reverse=True)) + ")"
 )
 _ROLE_PREFIX_RE = re.compile(r"^\s*(?:Human|User|Assistant|AI|System)\s*:\s*", re.IGNORECASE)
+_ASSISTANT_REASONING_TOKENS = frozenset({"<think>", "</think>"})
 
-# Strong signals that UTF-8 bytes were decoded as Latin-1/Windows-1252. These
-# characters are not blanket-banned: they only trigger a conservative repair
-# attempt whose result must strictly reduce the corruption score.
 _MOJIBAKE_MARKERS: tuple[str, ...] = (
     "Ã", "Â", "â€", "â€™", "â€œ", "â€�", "â€“", "â€”", "â€¦",
     "ðŸ", "ï»¿", "ï¿½", "�",
@@ -46,26 +44,17 @@ class CanonicalMessage:
 
 
 def mojibake_score(value: object) -> int:
-    """Return a bounded corruption score for common UTF-8 mojibake patterns."""
     text = "" if value is None else str(value)
     score = text.count("�") * 8
     for marker in _MOJIBAKE_MARKERS:
         if marker == "�":
             continue
         score += text.count(marker) * 2
-    # C1 controls often appear after a bad single-byte decode and should never
-    # survive in natural-language training text.
     score += sum(1 for char in text if 0x80 <= ord(char) <= 0x9F) * 3
     return score
 
 
 def repair_mojibake(value: object) -> str:
-    """Conservatively repair common UTF-8-as-single-byte decoding corruption.
-
-    We never modify clean text. A candidate repair is accepted only when the
-    corruption score strictly decreases. At most two passes are attempted so
-    doubly-encoded text can be repaired without creating an unbounded heuristic.
-    """
     text = "" if value is None else str(value)
     if mojibake_score(text) <= 0:
         return text
@@ -92,10 +81,16 @@ def repair_mojibake(value: object) -> str:
     return current
 
 
-def _escape_structural_literals(value: object) -> str:
-    """Make reserved grammar strings inert when they originate in corpus payloads."""
+def _escape_structural_literals(
+    value: object,
+    *,
+    allowed_tokens: frozenset[str] = frozenset(),
+) -> str:
+    """Make reserved grammar strings inert unless the role explicitly owns them."""
     text = "" if value is None else str(value)
     for token in STRUCTURAL_TOKENS:
+        if token in allowed_tokens:
+            continue
         if token in text:
             escaped = token.replace("<", "&lt;").replace(">", "&gt;")
             text = text.replace(token, escaped)
@@ -103,7 +98,6 @@ def _escape_structural_literals(value: object) -> str:
 
 
 def normalize_text(value: object, *, strip_role_prefix: bool = False) -> str:
-    """Normalize already-serialized text and structural tokens idempotently."""
     if value is None:
         return ""
     text = str(value).replace("\x00", "").replace("\r\n", "\n").replace("\r", "\n").strip()
@@ -131,10 +125,25 @@ def normalize_text(value: object, *, strip_role_prefix: bool = False) -> str:
 
 
 def normalize_payload_text(value: object, *, strip_role_prefix: bool = False) -> str:
-    """Normalize untrusted corpus content without grammar injection or mojibake."""
     repaired = repair_mojibake(value)
     return normalize_text(
         _escape_structural_literals(repaired),
+        strip_role_prefix=strip_role_prefix,
+    )
+
+
+def normalize_assistant_payload_text(value: object, *, strip_role_prefix: bool = False) -> str:
+    """Normalize assistant text while preserving only owned reasoning boundaries.
+
+    Corpus payloads are untrusted with respect to role/control grammar, so user,
+    tool, account and other structural literals remain escaped. Assistant content
+    is the one role allowed to carry <think>...</think> reasoning boundaries;
+    preserving them restores the tokenizer/loss contract without reopening role
+    injection through arbitrary dataset text.
+    """
+    repaired = repair_mojibake(value)
+    return normalize_text(
+        _escape_structural_literals(repaired, allowed_tokens=_ASSISTANT_REASONING_TOKENS),
         strip_role_prefix=strip_role_prefix,
     )
 
@@ -144,7 +153,10 @@ def serialize_messages(messages: Iterable[CanonicalMessage]) -> str:
     appended = 0
     for message in messages:
         role = str(message.role or "").strip().casefold()
-        content = normalize_payload_text(message.content, strip_role_prefix=True)
+        if role in {"assistant", "ai", "gpt", "model"}:
+            content = normalize_assistant_payload_text(message.content, strip_role_prefix=True)
+        else:
+            content = normalize_payload_text(message.content, strip_role_prefix=True)
         if not content:
             continue
         if role in {"human", "user"}:
@@ -188,3 +200,10 @@ def prompt_family(text: str) -> str:
     prompt = re.sub(r"\s+", " ", prompt)
     prompt = re.sub(r"[\s\.,;:!?]+$", "", prompt)
     return prompt.strip()
+
+
+def prompt_family_key(prompt: str) -> str:
+    text = normalize_payload_text(prompt).casefold()
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"[\s\.,;:!?]+$", "", text)
+    return text.strip()
