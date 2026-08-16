@@ -70,17 +70,28 @@ def test_weighted_stream_balances_supervised_tokens_not_document_count():
     long_examples = len(pairs) - short_examples
     assert short_examples > long_examples * 2
 
+    assert dataset.source_requested_shares == {"test:short": 0.5, "test:long": 0.5}
+    assert sum(dataset.source_token_accounting.values()) == total
+    assert dataset.source_token_accounting["test:short"] == consumed[11]
+    assert dataset.source_token_accounting["test:long"] == consumed[22]
 
-def test_hard_negative_objective_targets_answer_anchors_only():
+
+def test_hard_negative_objective_targets_only_runs_with_masked_prompt_context():
     pad = 0
     targets = torch.tensor([
+        # Two assistant answer runs, each preceded by masked prompt context.
         [0, 0, 4, 5, 6, 0, 0, 7, 8, 9],
+        # One assistant answer run after one masked prompt token.
         [0, 3, 4, 5, 6, 7, 0, 0, 0, 0],
+        # Ordinary document LM row: supervised from position zero. It must not be
+        # treated as an answer merely because it has tail padding.
+        [3, 4, 5, 6, 7, 8, 0, 0, 0, 0],
     ])
     mask = _answer_anchor_mask(targets, pad_id=pad)
     expected = torch.tensor([
         [False, False, True, True, False, False, False, True, True, False],
         [False, True, True, False, False, False, False, False, False, False],
+        [False, False, False, False, False, False, False, False, False, False],
     ])
     assert torch.equal(mask, expected)
 
