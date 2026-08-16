@@ -4,7 +4,7 @@
       "path": "roneneldan/TinyStories",
       "revision": "f54c09fd23315a6f9c86f9dc80f725de7d8f9c64",
       "split": "train",
-      "weight": 0.35,
+      "weight": 0.30,
       "stages": ["foundation"],
       "text_fields": ["text"],
       "shuffle_buffer_size": 5000
@@ -13,7 +13,7 @@
       "path": "tiiuae/falcon-refinedweb",
       "revision": "c735840575b629292b41da8dde11dcd523d4f91c",
       "split": "train",
-      "weight": 0.35,
+      "weight": 0.20,
       "stages": ["foundation"],
       "text_fields": ["content"],
       "shuffle_buffer_size": 1000
@@ -22,9 +22,44 @@
       "path": "HuggingFaceTB/everyday-conversations-llama3.1-2k",
       "revision": "14f543216b9ba42b6b951dc5bd199460d193b162",
       "split": "train_sft",
-      "weight": 0.20,
+      "weight": 0.18,
       "stages": ["foundation"],
       "shuffle_buffer_size": 2260
+    },
+    {
+      "path": "allenai/soda",
+      "revision": "fdc848ab0183208ea7808206c91c724414d0a071",
+      "split": "train",
+      "weight": 0.12,
+      "stages": ["foundation"],
+      "dialogue_field": "dialogue",
+      "max_examples": 200000,
+      "shuffle_buffer_size": 3000
+    },
+    {
+      "path": "EleutherAI/arithmetic",
+      "revision": "cf5ec4512aaa47cdebf02ca032b7af870528c272",
+      "config_name": "arithmetic_1dc",
+      "split": "validation",
+      "weight": 0.12,
+      "stages": ["foundation"],
+      "prompt_field": "context",
+      "response_field": "completion",
+      "shuffle_buffer_size": 2000
+    },
+    {
+      "path": "TIGER-Lab/WebInstruct-verified",
+      "revision": "2767452521af40d87201231507672a6f0ea88c4a",
+      "split": "train",
+      "weight": 0.10,
+      "stages": ["foundation"],
+      "prompt_field": "question",
+      "response_field": "answer",
+      "row_filters": {
+        "category": ["Economics"],
+        "difficulty": ["Middle School", "High School", "Senior High School"]
+      },
+      "shuffle_buffer_size": 2500
     },
     {
       "path": "openai/gsm8k",
