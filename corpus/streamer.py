@@ -11,6 +11,8 @@ if TYPE_CHECKING:
     from corpus.source import DatasetSource
     from src.language.tokenizer import BPETokenizer
 
+SOURCE_ACCOUNTING_INTERVAL_TOKENS = 50_000
+
 
 class ShardDataset(Dataset):
     def __init__(self, shard_paths: list[Path]):
@@ -53,9 +55,9 @@ class WeightedSourceStream:
     """Deterministically mix independent dataset sources without materializing them.
 
     ``CorpusStreamer`` treats this object as an authoritative weighted source
-    contract and schedules training sequences by *supervised prediction tokens*,
-    not by document count. ``iter_with_source`` remains useful for lightweight
-    sampling/auditing where tokenization is intentionally unavailable.
+    contract and schedules training sequences by supervised prediction tokens,
+    not by document count. Requested weights are therefore interpretable as token
+    shares and are audited against the realized shares during iteration.
     """
 
     def __init__(
@@ -108,12 +110,11 @@ class WeightedSourceStream:
 class CorpusStreamer(IterableDataset):
     """Boundary-preserving, bounded-memory role-aware training stream.
 
-    When fed a ``WeightedSourceStream`` the scheduler measures the actual number
-    of non-pad loss targets emitted by every source. The next source is selected
-    by weighted fair queuing on that measured token debt. This prevents a single
-    long web document from receiving many optimizer windows merely because one
-    document draw happened to be selected, which previously overwhelmed short
-    arithmetic and conversation examples despite apparently large source weights.
+    Weighted sources are scheduled by realized non-pad target tokens. The
+    scheduler prefetches one candidate sequence per source and chooses using the
+    projected post-emission debt. This bounds short-interval overshoot better than
+    choosing only from historical debt, which matters when five-minute exam
+    remediation changes weights frequently.
     """
 
     def __init__(
@@ -134,6 +135,8 @@ class CorpusStreamer(IterableDataset):
         self.seq_len = int(seq_len)
         self.seed = int(seed)
         self.shuffle_buffer_size = int(shuffle_buffer_size)
+        self.source_token_accounting: dict[str, int] = {}
+        self.source_requested_shares: dict[str, float] = {}
 
     def _stream_texts(self) -> Iterator[str]:
         worker_info = torch.utils.data.get_worker_info()
@@ -193,49 +196,101 @@ class CorpusStreamer(IterableDataset):
         if len(pack) >= 2:
             yield from self._yield_pair(pack)
 
+    @staticmethod
+    def _pair_supervised_tokens(pair: tuple[torch.Tensor, torch.Tensor], pad_id: int) -> int:
+        return int((pair[1] != pad_id).sum().item())
+
+    def _print_source_accounting(self, *, total_tokens: int) -> None:
+        if total_tokens <= 0 or not self.source_token_accounting:
+            return
+        fragments: list[str] = []
+        for source_id in sorted(self.source_token_accounting):
+            actual = self.source_token_accounting[source_id] / total_tokens
+            requested = self.source_requested_shares.get(source_id, 0.0)
+            fragments.append(
+                f"{source_id} requested={requested:.1%} actual={actual:.1%} "
+                f"tokens={self.source_token_accounting[source_id]:,}"
+            )
+        print("[SourceTokens] " + " | ".join(fragments))
+
     def _weighted_pairs(self, stream: WeightedSourceStream) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
-        """Weighted-fair schedule using actual supervised-token consumption."""
+        """Projected weighted-fair scheduling with realized-token accounting."""
         worker_info = torch.utils.data.get_worker_info()
         worker_seed = stream.seed if worker_info is None else stream.seed + worker_info.id
         rng = random.Random(worker_seed)
         total_weight = sum(weight for _, weight in stream.sources)
+        pad_id = self.tokenizer.pad_id()
         entries = [
             {
                 "source": source,
+                "source_id": source.source_id,
                 "weight": float(weight) / total_weight,
                 "tokens": 0,
                 "iterator": self._pairs_from_texts(source.stream()),
+                "pending": None,
+                "pending_tokens": 0,
             }
             for source, weight in stream.sources
         ]
-        pad_id = self.tokenizer.pad_id()
+        self.source_requested_shares = {
+            entry["source_id"]: entry["weight"] for entry in entries
+        }
+        self.source_token_accounting = {entry["source_id"]: 0 for entry in entries}
+        total_tokens = 0
+        next_report = SOURCE_ACCOUNTING_INTERVAL_TOKENS
+
+        def refill(entry: dict) -> bool:
+            while entry["pending"] is None:
+                try:
+                    pair = next(entry["iterator"])
+                except StopIteration:
+                    if not stream.repeat:
+                        return False
+                    entry["iterator"] = self._pairs_from_texts(entry["source"].stream())
+                    try:
+                        pair = next(entry["iterator"])
+                    except StopIteration:
+                        return False
+                count = self._pair_supervised_tokens(pair, pad_id)
+                if count <= 0:
+                    continue
+                entry["pending"] = pair
+                entry["pending_tokens"] = count
+            return True
 
         while entries:
-            # Weighted fair queuing: the source with the smallest consumed-token
-            # share relative to its requested share has the largest training debt.
-            scores = [entry["tokens"] / entry["weight"] for entry in entries]
+            exhausted: list[int] = []
+            for index, entry in enumerate(entries):
+                if not refill(entry):
+                    exhausted.append(index)
+            for index in reversed(exhausted):
+                entries.pop(index)
+            if not entries:
+                break
+
+            # Compare where each source would land after its next indivisible
+            # sequence. This sharply reduces oscillation from 512-token web chunks
+            # competing with tiny arithmetic answers.
+            scores = [
+                (entry["tokens"] + entry["pending_tokens"]) / entry["weight"]
+                for entry in entries
+            ]
             minimum = min(scores)
             tied = [index for index, score in enumerate(scores) if abs(score - minimum) <= 1e-9]
             chosen = tied[rng.randrange(len(tied))]
             entry = entries[chosen]
-            try:
-                pair = next(entry["iterator"])
-            except StopIteration:
-                if not stream.repeat:
-                    entries.pop(chosen)
-                    continue
-                entry["iterator"] = self._pairs_from_texts(entry["source"].stream())
-                try:
-                    pair = next(entry["iterator"])
-                except StopIteration:
-                    entries.pop(chosen)
-                    continue
-
-            _, targets = pair
-            supervised_tokens = int((targets != pad_id).sum().item())
-            if supervised_tokens <= 0:
-                continue
+            pair = entry["pending"]
+            supervised_tokens = int(entry["pending_tokens"])
+            entry["pending"] = None
+            entry["pending_tokens"] = 0
             entry["tokens"] += supervised_tokens
+            source_id = entry["source_id"]
+            self.source_token_accounting[source_id] = self.source_token_accounting.get(source_id, 0) + supervised_tokens
+            total_tokens += supervised_tokens
+            if total_tokens >= next_report:
+                self._print_source_accounting(total_tokens=total_tokens)
+                while next_report <= total_tokens:
+                    next_report += SOURCE_ACCOUNTING_INTERVAL_TOKENS
             yield pair
 
     def __iter__(self) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
