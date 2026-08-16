@@ -41,15 +41,14 @@
       "shuffle_buffer_size": 3000
     },
     {
-      "path": "EleutherAI/arithmetic",
-      "revision": "cf5ec4512aaa47cdebf02ca032b7af870528c272",
-      "config_name": "arithmetic_1dc",
-      "split": "validation",
+      "path": "mkurman/basic-math-operations",
+      "split": "train",
       "weight": 0.12,
       "stages": ["foundation"],
-      "tags": ["arithmetic"],
-      "prompt_field": "context",
+      "tags": ["arithmetic", "language_quality"],
+      "prompt_field": "prompt",
       "response_field": "completion",
+      "max_examples": 45000,
       "shuffle_buffer_size": 2000
     },
     {
