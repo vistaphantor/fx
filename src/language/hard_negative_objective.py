@@ -20,21 +20,22 @@ def hard_negative_answer_penalty(
 
     Cross-entropy rewards the correct token but does not directly express that a
     confidently preferred wrong token is worse than a diffuse uncertain error.
-    This objective adds two terms on every supervised assistant target:
+    This objective adds a target-vs-hard-negative margin and unlikelihood on the
+    strongest wrong token. The penalty scales with detached wrong-token
+    confidence, so confidently wrong predictions receive materially stronger
+    correction without amplifying gradient through the scale itself.
 
-    * a logit margin requiring the correct target to beat the strongest wrong
-      candidate by ``HARD_NEGATIVE_MARGIN``;
-    * unlikelihood on that strongest wrong candidate.
-
-    Both terms are scaled by the model's detached probability for the hard wrong
-    candidate, so confidently wrong predictions receive materially larger
-    gradients while uncertain early-training distributions are not destabilized.
-    Prompt and padding positions remain excluded by the authoritative target mask.
+    The top-two selection avoids cloning a full supervised [tokens, vocab]
+    tensor merely to mask the correct target. If top-1 is the target, top-2 is
+    necessarily the strongest wrong candidate; otherwise top-1 is the hard
+    negative. Prompt and padding positions remain excluded by the target mask.
     """
     if logits.ndim != 3:
         raise ValueError("logits must have shape [batch, time, vocab]")
     if targets.shape != logits.shape[:2]:
         raise ValueError("targets must match logits batch/time dimensions")
+    if logits.shape[-1] < 2:
+        return logits.new_zeros(())
 
     flat_logits = logits.reshape(-1, logits.shape[-1])
     flat_targets = targets.reshape(-1)
@@ -46,9 +47,9 @@ def hard_negative_answer_penalty(
     supervised_targets = flat_targets[valid]
     correct_logits = supervised_logits.gather(1, supervised_targets[:, None]).squeeze(1)
 
-    wrong_logits = supervised_logits.clone()
-    wrong_logits.scatter_(1, supervised_targets[:, None], -torch.inf)
-    hard_wrong_logits, _ = wrong_logits.max(dim=1)
+    top_values, top_indices = torch.topk(supervised_logits, k=2, dim=1)
+    target_is_top = top_indices[:, 0] == supervised_targets
+    hard_wrong_logits = torch.where(target_is_top, top_values[:, 1], top_values[:, 0])
 
     log_normalizer = torch.logsumexp(supervised_logits, dim=1)
     hard_wrong_probability = torch.exp(hard_wrong_logits - log_normalizer).clamp(
