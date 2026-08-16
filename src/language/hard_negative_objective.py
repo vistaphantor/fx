@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-HARD_NEGATIVE_OBJECTIVE_VERSION = 4
+HARD_NEGATIVE_OBJECTIVE_VERSION = 5
 HARD_NEGATIVE_MARGIN = 1.5
 HARD_NEGATIVE_MARGIN_WEIGHT = 0.30
 HARD_NEGATIVE_UNLIKELIHOOD_WEIGHT = 0.10
@@ -15,23 +15,39 @@ REPETITION_UNLIKELIHOOD_WEIGHT = 0.08
 
 
 def _answer_anchor_mask(targets: torch.Tensor, *, pad_id: int) -> torch.Tensor:
-    """Select only the first few supervised tokens of each target run.
+    """Select the first supervised tokens of genuine assistant-answer runs.
 
-    Chat loss masks the user prompt, so every assistant answer begins immediately
-    after one or more pad targets. These answer anchors carry the high-value
-    response decision. Applying margin pressure to every word previously spent
-    most of the hard-negative gradient on syntax such as spaces, punctuation and
-    boilerplate instead of the answer choice itself.
+    The authoritative chat loss masks user/system prompt targets before the first
+    assistant-content target. Ordinary document LM rows begin supervised at time
+    zero and may only contain padding at the tail. Requiring a pad->valid
+    transition therefore prevents the answer-specific hard-negative objective
+    from accidentally treating the first words of normal documents as answers.
+
+    Packed chat sequences may contain more than one assistant run; each transition
+    is independently anchored. A run beginning at position zero is deliberately
+    excluded because it has no evidence of masked prompt context.
     """
+    if targets.ndim != 2:
+        raise ValueError("targets must have shape [batch, time]")
     valid = targets != int(pad_id)
     if not torch.any(valid):
         return valid
+
+    previous_is_pad = torch.zeros_like(valid)
+    if valid.shape[1] > 1:
+        previous_is_pad[:, 1:] = ~valid[:, :-1]
+    run_start = valid & previous_is_pad
+    if not torch.any(run_start):
+        return torch.zeros_like(valid)
+
     anchors = torch.zeros_like(valid)
-    run_start = valid & ~F.pad(valid[:, :-1], (1, 0), value=False)
     frontier = run_start
     for _ in range(HARD_NEGATIVE_ANCHOR_TOKENS):
         anchors |= frontier & valid
-        frontier = F.pad(frontier[:, :-1], (1, 0), value=False)
+        shifted = torch.zeros_like(frontier)
+        if frontier.shape[1] > 1:
+            shifted[:, 1:] = frontier[:, :-1]
+        frontier = shifted
     return anchors & valid
 
 
@@ -91,8 +107,8 @@ def repetition_unlikelihood_penalty(
     For each supervised position, collect a bounded causal history. A token is a
     repetition negative only when it appears at least twice in that history and
     differs from the current target. The strongest such candidate receives an
-    unlikelihood penalty. The implementation is vectorized across batch/time so
-    this signal can run every optimizer step without a Python loop per token.
+    unlikelihood penalty. This applies to both documents and conversations because
+    pathological repetition is a language failure in either objective.
     """
     if logits.shape[:2] != input_ids.shape or targets.shape != input_ids.shape:
         raise ValueError("logits, input_ids and targets must share batch/time dimensions")
