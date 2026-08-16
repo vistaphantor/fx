@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import torch
 
-from src.language.hard_negative_objective import hard_negative_answer_penalty
+from src.language.hard_negative_objective import (
+    hard_negative_answer_penalty,
+    repetition_unlikelihood_penalty,
+)
 
 
 def _penalty(values: list[float], target: int = 1) -> float:
@@ -31,8 +34,6 @@ def test_gradient_pushes_correct_up_and_hard_wrong_down() -> None:
     loss.backward()
 
     gradient = logits.grad[0, 0]
-    # Gradient descent subtracts the gradient: negative raises the correct logit,
-    # positive lowers the confidently preferred wrong logit.
     assert gradient[1].item() < 0
     assert gradient[2].item() > 0
 
@@ -41,4 +42,37 @@ def test_padding_positions_receive_no_penalty() -> None:
     logits = torch.randn(1, 2, 5)
     targets = torch.zeros(1, 2, dtype=torch.long)
     penalty = hard_negative_answer_penalty(logits, targets, pad_id=0)
+    assert penalty.item() == 0.0
+
+
+def test_repetition_loop_candidate_is_directly_penalized() -> None:
+    # Token 3 has already appeared repeatedly in context. At the final position
+    # the teacher wants token 4, while the model is trying to emit token 3 again.
+    input_ids = torch.tensor([[1, 3, 2, 3, 3]], dtype=torch.long)
+    targets = torch.tensor([[0, 0, 0, 0, 4]], dtype=torch.long)
+    logits = torch.zeros(1, 5, 6, requires_grad=True)
+    with torch.no_grad():
+        logits[0, 4, 3] = 5.0
+        logits[0, 4, 4] = 0.5
+    penalty = repetition_unlikelihood_penalty(
+        logits,
+        input_ids,
+        targets,
+        pad_id=0,
+    )
+    assert penalty.item() > 0
+    penalty.backward()
+    assert logits.grad[0, 4, 3].item() > 0
+
+
+def test_teacher_requested_repetition_is_not_punished() -> None:
+    input_ids = torch.tensor([[1, 3, 2, 3, 3]], dtype=torch.long)
+    targets = torch.tensor([[0, 0, 0, 0, 3]], dtype=torch.long)
+    logits = torch.zeros(1, 5, 6)
+    penalty = repetition_unlikelihood_penalty(
+        logits,
+        input_ids,
+        targets,
+        pad_id=0,
+    )
     assert penalty.item() == 0.0
