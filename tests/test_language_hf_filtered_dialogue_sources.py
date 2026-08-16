@@ -82,8 +82,9 @@ def test_dialogue_field_becomes_alternating_user_assistant_chat() -> None:
 def test_training_config_contains_external_math_economics_and_dialogue_sources() -> None:
     specs = load_hf_source_config("config/hf_sources.json")
     by_path = {spec.path: spec for spec in specs}
-    assert "EleutherAI/arithmetic" in by_path
+    assert "mkurman/basic-math-operations" in by_path
     assert "TIGER-Lab/WebInstruct-verified" in by_path
     assert "allenai/soda" in by_path
+    assert len(by_path["mkurman/basic-math-operations"].revision or "") == 40
     assert by_path["TIGER-Lab/WebInstruct-verified"].row_filter_dict()["category"] == ("Economics",)
     assert by_path["allenai/soda"].dialogue_field == "dialogue"
