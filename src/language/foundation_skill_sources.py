@@ -6,7 +6,7 @@ from typing import Iterator
 from corpus.source import DatasetSource, SourceMetadata
 from src.language.canonical_contract import CanonicalMessage, serialize_document, serialize_messages
 
-FOUNDATION_SKILL_SOURCE_VERSION = 2
+FOUNDATION_SKILL_SOURCE_VERSION = 3
 
 _NUMBER_WORDS = (
     "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
@@ -23,16 +23,18 @@ def _chat(question: str, answer: str) -> str:
 
 
 def _answer_forms(value: int, expression: str) -> tuple[str, ...]:
-    """Teach both direct answers and explicit equations.
+    """Make the mathematical result the dominant first-token decision.
 
-    Tiny models otherwise learn a single equation-shaped attractor and can emit
-    the same memorized pattern for unrelated questions. Direct answers force the
-    prompt to carry the discriminating information while equation forms preserve
-    useful mathematical language.
+    A tiny foundation model must first bind the operands and operation to the
+    result. Equation rendering remains in the curriculum, but it is deliberately
+    the minority form so copying an expression cannot become a shortcut for
+    answering the question.
     """
     return (
         f"{value}.",
         f"The answer is {value}.",
+        f"{value} is the result.",
+        f"{value}.",
         f"{expression} = {value}.",
     )
 
@@ -48,8 +50,8 @@ class PrimitiveArithmeticSource(DatasetSource):
         return SourceMetadata(
             source_type="generated",
             path=self.source_id,
-            estimated_docs=180_000,
-            description="Primitive integer arithmetic, number language and concise answers",
+            estimated_docs=190_000,
+            description="Primitive integer arithmetic, number language and result-first answers",
         )
 
     def metadata(self) -> dict:
@@ -60,17 +62,19 @@ class PrimitiveArithmeticSource(DatasetSource):
             "curriculum": "primitive_arithmetic",
             "max_operand": 20,
             "multiplication_table_max": 12,
-            "answer_contract": "direct_and_equation",
+            "answer_contract": "result_first_with_minor_equation_rendering",
         }
 
     def stream(self) -> Iterator[str]:
         add_templates = (
+            "What is {a} + {b}?",
             "Calculate {a} + {b}.",
             "What is {a} plus {b}?",
             "Add {a} and {b}.",
             "Find the sum of {a} and {b}.",
         )
         sub_templates = (
+            "What is {a} - {b}?",
             "Calculate {a} - {b}.",
             "What is {a} minus {b}?",
             "Subtract {b} from {a}.",
@@ -86,30 +90,35 @@ class PrimitiveArithmeticSource(DatasetSource):
                 forms = _answer_forms(a - b, f"{a} - {b}")
                 yield _chat(q, forms[index % len(forms)])
 
-        # Short chains: still primitive arithmetic, but they require retaining an
-        # intermediate value. Keep operands small enough for a 2M foundation LM.
+        # Chains require operand retention. Both common prompt surfaces answer with
+        # the result first; equation production is trained under an explicit
+        # equation-rendering instruction rather than leaking into every answer.
         for a, b, c in product(range(11), repeat=3):
             expression = f"{a} + {b} + {c}"
             value = a + b + c
             yield _chat(f"Calculate {expression}.", f"{value}.")
-            yield _chat(f"What is {expression}?", f"{expression} = {value}.")
+            yield _chat(f"What is {expression}?", f"{value}.")
+            yield _chat(f"Write the completed equation for {expression}.", f"{expression} = {value}.")
 
             expression = f"{a} + {b} - {c}"
             value = a + b - c
             yield _chat(f"Calculate {expression}.", f"{value}.")
-            yield _chat(f"What is {expression}?", f"The answer is {value}.")
+            yield _chat(f"What is {expression}?", f"{value}.")
+            yield _chat(f"Write the completed equation for {expression}.", f"{expression} = {value}.")
 
         for a, b in product(range(13), repeat=2):
             value = a * b
             yield _chat(f"What is {a} times {b}?", f"{value}.")
-            yield _chat(f"Calculate {a} multiplied by {b}.", f"{a} times {b} is {value}.")
+            yield _chat(f"Calculate {a} multiplied by {b}.", f"{value}.")
+            yield _chat(f"Write the multiplication equation for {a} and {b}.", f"{a} times {b} is {value}.")
 
         for divisor in range(1, 13):
             for quotient in range(13):
                 dividend = divisor * quotient
                 yield _chat(f"What is {dividend} divided by {divisor}?", f"{quotient}.")
+                yield _chat(f"Calculate {dividend} divided by {divisor}.", f"{quotient}.")
                 yield _chat(
-                    f"Calculate {dividend} divided by {divisor}.",
+                    f"Write the division equation for {dividend} divided by {divisor}.",
                     f"{dividend} divided by {divisor} is {quotient}.",
                 )
 
@@ -118,6 +127,8 @@ class PrimitiveArithmeticSource(DatasetSource):
         for n in range(1, 21):
             yield _chat(f"What number comes after {n - 1}?", f"{n}.")
             yield _chat(f"What number comes before {n}?", f"{n - 1}.")
+            yield _chat(f"Give the successor of {n - 1}.", f"{n}.")
+            yield _chat(f"Give the predecessor of {n}.", f"{n - 1}.")
 
         for a, b in product(range(11), repeat=2):
             total = a + b
@@ -178,7 +189,7 @@ class FoundationEconomicsSource(DatasetSource):
         return SourceMetadata(
             source_type="generated",
             path=self.source_id,
-            estimated_docs=30_000,
+            estimated_docs=45_000,
             description="Introductory economics language, concise definitions and causal examples",
         )
 
@@ -196,12 +207,16 @@ class FoundationEconomicsSource(DatasetSource):
             yield serialize_document(definition)
             yield _chat(f"What does {name} mean in basic economics?", definition)
             yield _chat(f"Explain {name} in simple words.", definition)
+            yield _chat(f"In simple economics, define {name}.", definition)
             # Short discriminative answer prevents every definition prompt from
             # collapsing into one generic long sentence.
             yield _chat(f"Name this concept: {definition}", f"{name}.")
 
-        for revenue in range(20, 201, 10):
-            for cost in range(10, revenue + 1, 10):
+        # Use dense integer costs rather than only multiples of ten. This teaches
+        # the revenue-minus-cost relationship itself instead of a decimal-grid
+        # shortcut while exact exam prompts remain excluded by prompt family.
+        for revenue in range(10, 61):
+            for cost in range(0, revenue + 1):
                 profit = revenue - cost
                 yield _chat(
                     f"A business receives {revenue} shillings and has costs of {cost} shillings. What is its profit?",
@@ -209,7 +224,11 @@ class FoundationEconomicsSource(DatasetSource):
                 )
                 yield _chat(
                     f"Revenue is {revenue} and cost is {cost}. Calculate profit.",
-                    f"{revenue} - {cost} = {profit}.",
+                    f"{profit}.",
+                )
+                yield _chat(
+                    f"What remains after a business earns {revenue} shillings and pays {cost} shillings in costs?",
+                    f"{profit} shillings remain as profit because profit is revenue minus cost.",
                 )
 
         for income in range(20, 201, 10):
@@ -224,6 +243,7 @@ class FoundationEconomicsSource(DatasetSource):
             ("If many buyers want the same limited item, what can happen to its price?", "The price can rise."),
             ("If sellers bring much more of a product to market while demand stays the same, what can happen to price?", "The price can fall."),
             ("If general prices rise while income stays unchanged, what happens to purchasing power?", "Purchasing power falls."),
+            ("When prices rise but a person's income does not, can the same income buy as much?", "No. Purchasing power falls because the same income buys less."),
             ("Why does a person make a budget?", "A budget helps plan income, spending and saving."),
             ("Why can saving be useful?", "Saving keeps income available for future needs or goals."),
             ("Why does a lender charge interest?", "Interest compensates the lender for providing money and taking repayment risk."),
