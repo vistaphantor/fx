@@ -3,14 +3,36 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-HARD_NEGATIVE_OBJECTIVE_VERSION = 3
+HARD_NEGATIVE_OBJECTIVE_VERSION = 4
 HARD_NEGATIVE_MARGIN = 1.5
 HARD_NEGATIVE_MARGIN_WEIGHT = 0.30
 HARD_NEGATIVE_UNLIKELIHOOD_WEIGHT = 0.10
 HARD_NEGATIVE_CONFIDENCE_MULTIPLIER = 4.0
+HARD_NEGATIVE_ANCHOR_TOKENS = 2
 REPETITION_WINDOW = 16
 REPETITION_MIN_PRIOR_OCCURRENCES = 2
 REPETITION_UNLIKELIHOOD_WEIGHT = 0.08
+
+
+def _answer_anchor_mask(targets: torch.Tensor, *, pad_id: int) -> torch.Tensor:
+    """Select only the first few supervised tokens of each target run.
+
+    Chat loss masks the user prompt, so every assistant answer begins immediately
+    after one or more pad targets. These answer anchors carry the high-value
+    response decision. Applying margin pressure to every word previously spent
+    most of the hard-negative gradient on syntax such as spaces, punctuation and
+    boilerplate instead of the answer choice itself.
+    """
+    valid = targets != int(pad_id)
+    if not torch.any(valid):
+        return valid
+    anchors = torch.zeros_like(valid)
+    run_start = valid & ~F.pad(valid[:, :-1], (1, 0), value=False)
+    frontier = run_start
+    for _ in range(HARD_NEGATIVE_ANCHOR_TOKENS):
+        anchors |= frontier & valid
+        frontier = F.pad(frontier[:, :-1], (1, 0), value=False)
+    return anchors & valid
 
 
 def hard_negative_answer_penalty(
@@ -19,7 +41,7 @@ def hard_negative_answer_penalty(
     *,
     pad_id: int,
 ) -> torch.Tensor:
-    """Push the strongest wrong token below the supervised target."""
+    """Push the strongest wrong token below answer-critical target anchors."""
     if logits.ndim != 3:
         raise ValueError("logits must have shape [batch, time, vocab]")
     if targets.shape != logits.shape[:2]:
@@ -27,14 +49,12 @@ def hard_negative_answer_penalty(
     if logits.shape[-1] < 2:
         return logits.new_zeros(())
 
-    flat_logits = logits.reshape(-1, logits.shape[-1])
-    flat_targets = targets.reshape(-1)
-    valid = flat_targets != int(pad_id)
-    if not torch.any(valid):
+    anchor = _answer_anchor_mask(targets, pad_id=pad_id)
+    if not torch.any(anchor):
         return logits.new_zeros(())
 
-    supervised_logits = flat_logits[valid]
-    supervised_targets = flat_targets[valid]
+    supervised_logits = logits[anchor]
+    supervised_targets = targets[anchor]
     correct_logits = supervised_logits.gather(1, supervised_targets[:, None]).squeeze(1)
     top_values, top_indices = torch.topk(supervised_logits, k=2, dim=1)
     target_is_top = top_indices[:, 0] == supervised_targets
@@ -79,13 +99,11 @@ def repetition_unlikelihood_penalty(
     if input_ids.ndim != 2:
         raise ValueError("input_ids must have shape [batch, time]")
 
-    batch, steps = input_ids.shape
+    _, steps = input_ids.shape
     width = min(max(2, int(window)), steps)
     if steps < 2:
         return logits.new_zeros(())
 
-    # history[b, t, k] is the token k+1 causal positions before/current at t.
-    # Out-of-range positions are filled with pad and therefore ignored.
     histories: list[torch.Tensor] = []
     for lag in range(width):
         shifted = torch.full_like(input_ids, int(pad_id))
@@ -94,7 +112,7 @@ def repetition_unlikelihood_penalty(
         else:
             shifted[:, lag:] = input_ids[:, :-lag]
         histories.append(shifted)
-    history = torch.stack(histories, dim=-1)  # [B, T, W]
+    history = torch.stack(histories, dim=-1)
 
     equality = history.unsqueeze(-1) == history.unsqueeze(-2)
     occurrence_count = equality.sum(dim=-1)
