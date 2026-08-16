@@ -42,6 +42,7 @@
     },
     {
       "path": "mkurman/basic-math-operations",
+      "revision": "main",
       "split": "train",
       "weight": 0.12,
       "stages": ["foundation"],
