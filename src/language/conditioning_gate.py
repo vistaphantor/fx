@@ -77,6 +77,27 @@ def _new_model(tokenizer: BPETokenizer, *, seq_len: int, seed: int) -> VistaReas
     )
 
 
+def _required_seq_len(tokenizer: BPETokenizer, cases: list[tuple[str, str]]) -> int:
+    """Size the tiny conditioning model from the actual tokenizer, never a guess.
+
+    Byte-level tokenization is intentionally lossless, so a tokenizer trained on a
+    tiny unrelated sample may encode the gate prompt with many byte tokens. A fixed
+    64-token context made the preflight fail before it could test conditioning.
+    The gate now derives the smallest safe context that can hold every supervised
+    example and six deterministic generation tokens.
+    """
+    required = 64
+    for prompt, answer in cases:
+        training_text = serialize_messages((
+            CanonicalMessage("user", prompt),
+            CanonicalMessage("assistant", answer),
+        ))
+        training_ids = tokenizer.encode(training_text, add_bos=False, add_eos=False)
+        prompt_ids = tokenizer.encode(build_exam_prompt(prompt), add_bos=False, add_eos=False)
+        required = max(required, len(training_ids) - 1, len(prompt_ids) + 6)
+    return required
+
+
 def _build_examples(
     tokenizer: BPETokenizer,
     cases: list[tuple[str, str]],
@@ -199,14 +220,9 @@ def _run_stage(
     max_updates: int,
     check_every: int,
 ) -> ConditioningStageResult:
-    """Train an independent exact-mapping gate with deterministic full batches.
-
-    Mini-batch loss was previously misleading: a sampled batch could have near-zero
-    loss while omitted mappings were wrong. Full-batch optimization and full-dataset
-    evaluation make the gate measure conditioning rather than stochastic interference.
-    """
-    seq_len = 64
+    """Train an independent exact-mapping gate with deterministic full batches."""
     cases = _cases()[:size]
+    seq_len = _required_seq_len(tokenizer, cases)
     examples = _build_examples(tokenizer, cases, seq_len=seq_len)
     model = _new_model(tokenizer, seq_len=seq_len, seed=seed)
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-3, weight_decay=0.0)
@@ -238,7 +254,7 @@ def _run_stage(
         full_loss = _full_dataset_loss(model, tokenizer, examples)
         checks.append(ConditioningCheck(updates, recalled, full_loss, learning_rate))
         print(
-            f"[ConditioningGate] size={size} recall={recalled}/{size} "
+            f"[ConditioningGate] size={size} context={seq_len} recall={recalled}/{size} "
             f"updates={updates} full_loss={full_loss:.6f} lr={learning_rate:.6g}"
         )
 
@@ -257,8 +273,6 @@ def _run_stage(
         else:
             perfect_checks = 0
 
-        # Once exact recall stalls, consolidate instead of continuing high-LR
-        # updates that can overwrite already learned arbitrary mappings.
         if checks_without_recall_gain >= 4 and learning_rate > 5e-4:
             learning_rate = max(5e-4, learning_rate * 0.5)
             _set_lr(optimizer, learning_rate)

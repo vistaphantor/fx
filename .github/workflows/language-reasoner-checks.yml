@@ -5,6 +5,7 @@ on:
     paths:
       - "src/language/**"
       - "corpus/**"
+      - "config/hf_sources*.json"
       - "tools/train_language_reasoner.py"
       - "tools/vista_chat.py"
       - "tests/test_language_*.py"
@@ -14,6 +15,7 @@ on:
     paths:
       - "src/language/**"
       - "corpus/**"
+      - "config/hf_sources*.json"
       - "tools/train_language_reasoner.py"
       - "tools/vista_chat.py"
       - "tests/test_language_*.py"
@@ -52,6 +54,7 @@ jobs:
             tests/test_language_protocol.py \
             tests/test_language_generation.py \
             tests/test_language_epoch_exam.py \
+            tests/test_language_exam_determinism.py \
             tests/test_language_generated_bytes.py \
             tests/test_language_streaming_sources.py \
             tests/test_language_dedup.py \
@@ -61,6 +64,7 @@ jobs:
             tests/test_language_conceptual_foundations.py \
             tests/test_language_hf_filtered_dialogue_sources.py \
             tests/test_language_exam_feedback.py \
+            tests/test_language_foundation_skills.py \
             tests/test_language_foundation_v11_learning.py \
             tests/test_language_semantic_checkpointing.py \
             -q

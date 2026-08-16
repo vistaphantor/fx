@@ -17,8 +17,10 @@ from src.language.tokenizer import (
     ASSISTANT,
     BOS,
     ENDASSISTANT,
+    ENDTHINK,
     ENDUSER,
     EOS,
+    THINK,
     USER,
     BPETokenizer,
     SPECIAL_TOKENS,
@@ -31,6 +33,8 @@ _USER_ID = SPECIAL_TOKENS.index(USER)
 _END_USER_ID = SPECIAL_TOKENS.index(ENDUSER)
 _ASSISTANT_ID = SPECIAL_TOKENS.index(ASSISTANT)
 _END_ASSISTANT_ID = SPECIAL_TOKENS.index(ENDASSISTANT)
+_THINK_ID = SPECIAL_TOKENS.index(THINK)
+_END_THINK_ID = SPECIAL_TOKENS.index(ENDTHINK)
 
 
 @dataclass(frozen=True)
@@ -122,9 +126,6 @@ def _current_user_context(full_ids: list[int], assistant_index: int, *, budget: 
     if budget <= 0:
         return []
 
-    # Preserve the user opener and, where present, the user closer while retaining
-    # the most recent prompt tokens. This keeps the chunk causally useful without
-    # ever carrying an earlier assistant answer into a new supervision window.
     tail_budget = max(0, budget - 1)
     tail = list(context[-tail_budget:]) if tail_budget else []
     if context and context[0] == _USER_ID:
@@ -134,15 +135,50 @@ def _current_user_context(full_ids: list[int], assistant_index: int, *, budget: 
     return list(context[-budget:])
 
 
-def _chat_long_chunks(full_ids: list[int], *, seq_len: int) -> list[list[int]]:
-    """Chunk long chats by assistant turn while preserving role-aware supervision.
+def _reasoning_body_chunks(
+    *,
+    body: list[int],
+    prefix_without_think: list[int],
+    max_tokens: int,
+) -> list[list[int]] | None:
+    """Chunk a <think> assistant body without dropping reasoning boundaries.
 
-    Arbitrary token windows are unsafe for conversations: a window can begin in
-    user text, lose the <assistant> opener, and then be mistaken for document LM
-    data. Every returned chunk therefore contains an explicit <assistant> marker;
-    prompt context is masked by build_loss_targets and only assistant content is
-    optimized.
+    Every reasoning chunk reopens <think>. Intermediate chunks intentionally do
+    not close it; the final reasoning chunk carries the single </think>, final
+    answer tokens, </assistant> and <eos>. Prediction targets are partitioned, not
+    overlapped, so long reasoning remains causally labelled without duplication.
     """
+    if not body or body[0] != _THINK_ID:
+        return None
+    try:
+        end_think = body.index(_END_THINK_ID, 1)
+    except ValueError:
+        return None
+
+    reasoning = body[1:end_think]
+    answer_tail = body[end_think + 1 :]
+    prefix = prefix_without_think + [_THINK_ID]
+    final_suffix = [_END_THINK_ID] + answer_tail + [_END_ASSISTANT_ID, _EOS_ID]
+    intermediate_capacity = max_tokens - len(prefix)
+    final_reasoning_capacity = max_tokens - len(prefix) - len(final_suffix)
+    if intermediate_capacity < 1 or final_reasoning_capacity < 0:
+        return None
+
+    chunks: list[list[int]] = []
+    cursor = 0
+    while len(reasoning) - cursor > final_reasoning_capacity:
+        remaining = len(reasoning) - cursor
+        take = min(intermediate_capacity, remaining - final_reasoning_capacity)
+        if take <= 0:
+            raise RuntimeError("long_reasoning_chunk_progress_failed")
+        chunks.append(prefix + reasoning[cursor : cursor + take])
+        cursor += take
+    chunks.append(prefix + reasoning[cursor:] + final_suffix)
+    return chunks
+
+
+def _chat_long_chunks(full_ids: list[int], *, seq_len: int) -> list[list[int]]:
+    """Chunk long chats by assistant turn while preserving role-aware supervision."""
     max_tokens = seq_len + 1
     chunks: list[list[int]] = []
     cursor = 0
@@ -157,19 +193,21 @@ def _chat_long_chunks(full_ids: list[int], *, seq_len: int) -> list[list[int]]:
             raise RuntimeError("long_chat_missing_endassistant")
 
         body = full_ids[assistant_index + 1 : end_index]
-        # Reserve BOS + assistant opener + one assistant token + final closer/EOS.
-        context_budget = max(0, max_tokens - 5)
+        context_budget = max(0, max_tokens - 7)
         context = _current_user_context(full_ids, assistant_index, budget=context_budget)
         prefix = [_BOS_ID] + context + [_ASSISTANT_ID]
-        if len(prefix) >= max_tokens - 2:
-            context = _current_user_context(
-                full_ids,
-                assistant_index,
-                budget=max(0, max_tokens - 5),
-            )
-            prefix = [_BOS_ID] + context + [_ASSISTANT_ID]
         if len(prefix) >= max_tokens - 1:
             raise RuntimeError("long_chat_prompt_context_exhausts_sequence")
+
+        reasoning_chunks = _reasoning_body_chunks(
+            body=body,
+            prefix_without_think=prefix,
+            max_tokens=max_tokens,
+        )
+        if reasoning_chunks is not None:
+            chunks.extend(reasoning_chunks)
+            cursor = end_index + 1
+            continue
 
         intermediate_capacity = max_tokens - len(prefix)
         final_capacity = max_tokens - len(prefix) - 2

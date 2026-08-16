@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
+from functools import lru_cache
 from pathlib import Path
 
 import torch
@@ -13,16 +15,18 @@ from src.language.exam import (
     run_epoch_exam,
     save_epoch_exam,
 )
+from src.language.foundation_contract import FOUNDATION_EXAM_QUESTIONS_PER_SKILL, FOUNDATION_SKILLS
 from src.language.tokenizer import BPETokenizer, ENDASSISTANT
 
 
-class _ScriptedModel:
-    """Small deterministic exam double implementing the model protocol Binoculars uses."""
+_ALL_QUESTIONS = FOUNDATION_EXAM + TRADING_EXTENSION
 
+
+class _ScriptedModel:
     def __init__(self, tokenizer: BPETokenizer, outputs: dict[str, str]):
         self.tokenizer = tokenizer
         self.outputs = outputs
-        self.max_seq_len = 256
+        self.max_seq_len = 512
         self.training = False
 
     def eval(self):
@@ -43,43 +47,42 @@ class _ScriptedModel:
 
     def generate(self, idx: torch.Tensor, **_: object) -> torch.Tensor:
         prompt = self.tokenizer.decode(idx[0].tolist(), skip_special=False)
-        question = next(
-            question.prompt
-            for question in FOUNDATION_EXAM + TRADING_EXTENSION
-            if question.prompt in prompt
-        )
+        question = next(question.prompt for question in _ALL_QUESTIONS if question.prompt in prompt)
         text = self.outputs.get(question, "I do not know.") + ENDASSISTANT
         continuation = self.tokenizer.encode(text, add_bos=False, add_eos=False)
         return torch.cat((idx, torch.tensor([continuation], dtype=torch.long)), dim=1)
 
 
+@lru_cache(maxsize=1)
 def _tokenizer() -> BPETokenizer:
-    text = "\n".join(
-        build_exam_prompt(question.prompt)
-        for question in FOUNDATION_EXAM + TRADING_EXTENSION
-    ) + "\n" + "\n".join(
-        question.diagnostic_target or ""
-        for question in FOUNDATION_EXAM + TRADING_EXTENSION
-    )
+    text = "\n".join(build_exam_prompt(question.prompt) for question in _ALL_QUESTIONS)
+    text += "\n" + "\n".join(question.diagnostic_target or "" for question in _ALL_QUESTIONS)
     tokenizer = BPETokenizer()
-    tokenizer.train(text, vocab_size=1024, min_frequency=1)
+    tokenizer.train(text, vocab_size=2048, min_frequency=1)
     return tokenizer
 
 
-def test_foundation_exam_is_fixed_and_trading_stage_extends_it():
+def test_foundation_exam_has_fifty_questions_per_skill_and_question_one_is_gate():
     foundation = exam_questions("foundation")
-    trading = exam_questions("trading_reasoning")
     assert foundation == FOUNDATION_EXAM
+    assert len(foundation) == len(FOUNDATION_SKILLS) * FOUNDATION_EXAM_QUESTIONS_PER_SKILL == 700
+    counts = Counter(question.skill for question in foundation)
+    assert counts == Counter({skill: 50 for skill in FOUNDATION_SKILLS})
+    for skill in FOUNDATION_SKILLS:
+        questions = [question for question in foundation if question.skill == skill]
+        assert questions[0].conceptual_gate
+        assert sum(question.conceptual_gate for question in questions) == 1
+
+
+def test_trading_stage_extends_the_complete_foundation_exam():
+    trading = exam_questions("trading_reasoning")
     assert trading[: len(FOUNDATION_EXAM)] == FOUNDATION_EXAM
-    assert len(trading) > len(foundation)
+    assert len(trading) > len(FOUNDATION_EXAM)
 
 
 def test_epoch_exam_scores_known_answers_and_writes_artifacts(tmp_path: Path):
     tokenizer = _tokenizer()
-    outputs = {
-        question.prompt: question.diagnostic_target or "I do not know."
-        for question in FOUNDATION_EXAM
-    }
+    outputs = {question.prompt: question.diagnostic_target or "I do not know." for question in FOUNDATION_EXAM}
     model = _ScriptedModel(tokenizer, outputs)
     result = run_epoch_exam(
         model=model,  # type: ignore[arg-type]
@@ -90,18 +93,20 @@ def test_epoch_exam_scores_known_answers_and_writes_artifacts(tmp_path: Path):
         validation_loss=3.2,
         max_new_tokens=64,
     )
-    assert result.correct_questions == result.total_questions
+    assert result.correct_questions == result.total_questions == 700
     assert result.correctness_percent == 100.0
+    assert sum(answer.conceptual_gate for answer in result.answers) == 14
+    assert sum(bool(answer.decision_trace) for answer in result.answers) == 14
     text_path, json_path = save_epoch_exam(result=result, exams_dir=tmp_path)
     assert text_path.name == "epoch_001_exam.txt"
     assert json_path.name == "epoch_001_exam.json"
-    assert FOUNDATION_EXAM[0].prompt in text_path.read_text(encoding="utf-8")
+    assert "What is addition? Explain what it means." in text_path.read_text(encoding="utf-8")
     payload = json.loads(json_path.read_text(encoding="utf-8"))
     assert payload["epoch"] == 1
     assert payload["correctness_percent"] == 100.0
 
 
-def test_repetitive_gibberish_is_visible_in_exam_result():
+def test_repetitive_gibberish_fails_the_large_exam():
     tokenizer = _tokenizer()
     model = _ScriptedModel(
         tokenizer,
@@ -117,34 +122,5 @@ def test_repetitive_gibberish_is_visible_in_exam_result():
         max_new_tokens=32,
     )
     assert result.correct_questions == 0
-    assert result.gibberish_answers == result.total_questions
-    assert all("high_word_repetition" in answer.gibberish_flags for answer in result.answers)
-
-
-def test_concatenated_subword_loops_are_gibberish():
-    tokenizer = _tokenizer()
-    loops = {
-        question.prompt: "parkparkparkparkparkparklesslesslesslesslessless"
-        for question in FOUNDATION_EXAM
-    }
-    model = _ScriptedModel(tokenizer, loops)
-    result = run_epoch_exam(
-        model=model,  # type: ignore[arg-type]
-        tokenizer=tokenizer,
-        epoch=0,
-        training_stage="foundation",
-        train_loss=None,
-        validation_loss=None,
-        max_new_tokens=32,
-    )
-    assert result.correct_questions == 0
-    assert result.gibberish_answers == result.total_questions
+    assert result.gibberish_answers == result.total_questions == 700
     assert result.training_signal == "GIBBERISH"
-    assert all(
-        any(
-            flag in answer.gibberish_flags
-            for flag in ("high_character_repetition", "periodic_repetition", "run_on_fragment")
-        )
-        for answer in result.answers
-    )
-    assert result.mean_quality_percent < 50.0

@@ -1,10 +1,6 @@
 from __future__ import annotations
 
-import hashlib
-import json
-import re
-from dataclasses import dataclass, replace
-from pathlib import Path
+from dataclasses import replace
 from typing import Iterator, Sequence
 
 from corpus.dedup import NearDuplicateIndex
@@ -19,64 +15,38 @@ from src.language.canonical_contract import (
     prompt_family,
     serialize_messages,
 )
-from src.language.conceptual_foundations import (
-    CONCEPTUAL_FOUNDATION_VERSION,
-    ConceptualArithmeticSource,
-    EconomicsCausalSource,
-)
+from src.language.conceptual_foundations import ConceptualArithmeticSource, EconomicsCausalSource
 from src.language.curriculum import is_math_example, is_reasoning_example, is_trading_example
 from src.language.exam_feedback import ExamFeedbackPolicy
-from src.language.foundation_skill_sources import (
-    FOUNDATION_SKILL_SOURCE_VERSION,
-    FoundationEconomicsSource,
-    PrimitiveArithmeticSource,
-)
-from src.language.language_quality_source import (
-    LANGUAGE_QUALITY_SOURCE_VERSION,
-    LanguageQualityContrastSource,
+from src.language.foundation_exam_source import FoundationExamCurriculumSource
+from src.language.foundation_skill_sources import FoundationEconomicsSource, PrimitiveArithmeticSource
+from src.language.language_quality_source import LanguageQualityContrastSource
+from src.language.source_contract import (
+    CurriculumCapacity,
+    HFSourceSpec,
+    _parse_spec,
+    curriculum_capacity,
+    load_hf_source_config,
+    require_curriculum_capacity,
+    specs_fingerprint,
+    stage_specs,
 )
 
 FOUNDATION_INTERACTION_FRACTION = 0.25
 FOUNDATION_CONTINUATION_PREFIX_WORDS = 32
 FOUNDATION_CONTINUATION_TARGET_WORDS = 48
-# These weights now describe supervised-token shares because CorpusStreamer uses
-# weighted fair queuing on actual non-pad loss targets. Arithmetic is deliberately
-# dominant until the foundation model demonstrates basic operand/operation binding.
-FOUNDATION_ARITHMETIC_WEIGHT = 0.45
-FOUNDATION_CONCEPTUAL_ARITHMETIC_WEIGHT = 0.30
-FOUNDATION_ECONOMICS_WEIGHT = 0.18
-FOUNDATION_ECONOMICS_CAUSAL_WEIGHT = 0.15
-FOUNDATION_LANGUAGE_QUALITY_WEIGHT = 0.12
-_IMMUTABLE_HF_REVISION_RE = re.compile(r"^[0-9a-fA-F]{40}$")
-
-
-@dataclass(frozen=True, slots=True)
-class HFSourceSpec:
-    path: str
-    weight: float
-    stages: tuple[str, ...]
-    split: str = "train"
-    config_name: str | None = None
-    revision: str | None = None
-    text_fields: tuple[str, ...] | None = None
-    prompt_field: str | None = None
-    response_field: str | None = None
-    dialogue_field: str | None = None
-    row_filters: tuple[tuple[str, tuple[str, ...]], ...] = ()
-    tags: tuple[str, ...] = ()
-    max_examples: int | None = None
-    shuffle_buffer_size: int = 10_000
-
-    def row_filter_dict(self) -> dict[str, tuple[str, ...]]:
-        return {key: values for key, values in self.row_filters}
+# The 8B run is broad-source first. Generated curricula reinforce elementary
+# invariants but are deliberately a minority of supervised prediction tokens.
+FOUNDATION_ARITHMETIC_WEIGHT = 0.05
+FOUNDATION_CONCEPTUAL_ARITHMETIC_WEIGHT = 0.08
+FOUNDATION_ECONOMICS_WEIGHT = 0.03
+FOUNDATION_ECONOMICS_CAUSAL_WEIGHT = 0.06
+FOUNDATION_LANGUAGE_QUALITY_WEIGHT = 0.02
+FOUNDATION_EXAM_CURRICULUM_WEIGHT = 0.05
 
 
 def stream_quality_accepts(text: str) -> bool:
     return LANGUAGE_QUALITY_FILTER.accepts(text)
-
-
-def _quality_filter_for_stage(stage: str) -> QualityFilter:
-    return FOUNDATION_ENGLISH_FILTER if stage.strip().casefold() == "foundation" else LANGUAGE_QUALITY_FILTER
 
 
 def _is_chat(text: str) -> bool:
@@ -85,8 +55,6 @@ def _is_chat(text: str) -> bool:
 
 def _document_payload(text: str) -> str:
     value = canonicalize_serialized(text)
-    if not value:
-        return ""
     if value.startswith("<bos>"):
         value = value[len("<bos>"):].lstrip()
     if value.endswith("<eos>"):
@@ -97,10 +65,8 @@ def _document_payload(text: str) -> str:
 def _continuation_interaction(text: str) -> str | None:
     if _is_chat(text):
         return None
-    payload = _document_payload(text)
-    words = payload.split()
-    minimum = FOUNDATION_CONTINUATION_PREFIX_WORDS + 12
-    if len(words) < minimum:
+    words = _document_payload(text).split()
+    if len(words) < FOUNDATION_CONTINUATION_PREFIX_WORDS + 12:
         return None
     prefix_end = min(FOUNDATION_CONTINUATION_PREFIX_WORDS, len(words) - 12)
     target_end = min(len(words), prefix_end + FOUNDATION_CONTINUATION_TARGET_WORDS)
@@ -119,17 +85,7 @@ def _use_foundation_interaction(digest: str) -> bool:
 
 
 class GuardedSource(DatasetSource):
-    """Canonicalize, quality-gate, deduplicate and enforce stage holdouts.
-
-    Foundation has two legitimate surfaces with different length contracts. Raw
-    documents need the stricter English filter because web text is noisy and long.
-    Canonical chat examples, however, often contain intentionally tiny answers
-    such as ``4.`` or ``13 shillings.``. Applying the document minimum-word gate to
-    those chats silently removed exactly the supervised mappings the foundation
-    model must learn. Unless a caller supplies an explicit authoritative override,
-    foundation chats therefore use the general language quality gate while
-    foundation documents retain the strict English/document gate.
-    """
+    """Canonical quality gate, deduplicator and exam/validation holdout boundary."""
 
     def __init__(
         self,
@@ -162,27 +118,16 @@ class GuardedSource(DatasetSource):
         return self._source.scan()
 
     def metadata(self) -> dict:
-        if self._quality_filter_override is not None:
-            quality_policy = type(self._quality_filter_override).__name__
-        elif self._stage == "foundation":
-            quality_policy = (
-                f"chat:{type(LANGUAGE_QUALITY_FILTER).__name__};"
-                f"document:{type(FOUNDATION_ENGLISH_FILTER).__name__}"
-            )
-        else:
-            quality_policy = type(LANGUAGE_QUALITY_FILTER).__name__
         return {
             **self._source.metadata(),
             "guarded_stage": self._stage,
-            "quality_filter": quality_policy,
             "near_dedup_entries": self._near_dedup_entries,
             "near_dedup_hamming": self._near_dedup_hamming,
             "shared_near_dedup": self._near_index is not None,
             "canonical_contract_version": CANONICAL_CONTRACT_VERSION,
             "foundation_interaction_fraction": (
                 FOUNDATION_INTERACTION_FRACTION
-                if self._stage == "foundation" and self._transform_foundation_documents
-                else 0.0
+                if self._stage == "foundation" and self._transform_foundation_documents else 0.0
             ),
         }
 
@@ -191,7 +136,9 @@ class GuardedSource(DatasetSource):
             return self._quality_filter_override.accepts(text)
         if self._stage == "foundation" and _is_chat(text):
             return LANGUAGE_QUALITY_FILTER.accepts(text)
-        return _quality_filter_for_stage(self._stage).accepts(text)
+        if self._stage == "foundation":
+            return FOUNDATION_ENGLISH_FILTER.accepts(text)
+        return LANGUAGE_QUALITY_FILTER.accepts(text)
 
     def _stage_accepts(self, text: str) -> bool:
         if self._stage == "foundation":
@@ -234,149 +181,6 @@ class GuardedSource(DatasetSource):
             yield text
 
 
-def _parse_row_filters(payload: object, *, path: str) -> tuple[tuple[str, tuple[str, ...]], ...]:
-    if payload is None:
-        return ()
-    if not isinstance(payload, dict):
-        raise ValueError(f"hf_source_row_filters_must_be_object:{path}")
-    parsed: list[tuple[str, tuple[str, ...]]] = []
-    for raw_key, raw_values in payload.items():
-        key = str(raw_key).strip()
-        if not key:
-            raise ValueError(f"hf_source_row_filter_field_invalid:{path}")
-        values = [raw_values] if isinstance(raw_values, str) else raw_values
-        if not isinstance(values, list) or not values:
-            raise ValueError(f"hf_source_row_filter_values_invalid:{path}:{key}")
-        cleaned = tuple(str(value).strip() for value in values if str(value).strip())
-        if not cleaned:
-            raise ValueError(f"hf_source_row_filter_values_invalid:{path}:{key}")
-        parsed.append((key, cleaned))
-    return tuple(sorted(parsed))
-
-
-def _parse_spec(payload: dict) -> HFSourceSpec:
-    path = str(payload.get("path", "")).strip()
-    if not path:
-        raise ValueError("hf_source_missing_path")
-    weight = float(payload.get("weight", 1.0))
-    if weight <= 0:
-        raise ValueError(f"hf_source_weight_must_be_positive:{path}")
-    raw_stages = payload.get("stages", ["foundation", "reasoning", "trading_reasoning"])
-    if not isinstance(raw_stages, list) or not raw_stages:
-        raise ValueError(f"hf_source_stages_must_be_nonempty_list:{path}")
-    stages = tuple(str(value).strip().casefold() for value in raw_stages if str(value).strip())
-    allowed = {"foundation", "reasoning", "trading_reasoning"}
-    invalid = set(stages).difference(allowed)
-    if invalid:
-        raise ValueError(f"hf_source_invalid_stages:{path}:{','.join(sorted(invalid))}")
-
-    text_fields_payload = payload.get("text_fields")
-    text_fields = None
-    if text_fields_payload is not None:
-        if not isinstance(text_fields_payload, list) or not text_fields_payload:
-            raise ValueError(f"hf_source_text_fields_invalid:{path}")
-        text_fields = tuple(str(value) for value in text_fields_payload)
-
-    prompt_field = str(payload["prompt_field"]).strip() if payload.get("prompt_field") else None
-    response_field = str(payload["response_field"]).strip() if payload.get("response_field") else None
-    dialogue_field = str(payload["dialogue_field"]).strip() if payload.get("dialogue_field") else None
-    if bool(prompt_field) != bool(response_field):
-        raise ValueError(f"hf_source_prompt_response_fields_must_be_paired:{path}")
-    mapping_count = int(bool(text_fields)) + int(bool(prompt_field)) + int(bool(dialogue_field))
-    if mapping_count > 1:
-        raise ValueError(f"hf_source_mapping_conflict:{path}")
-
-    raw_tags = payload.get("tags", [])
-    if not isinstance(raw_tags, list):
-        raise ValueError(f"hf_source_tags_must_be_list:{path}")
-    tags = tuple(sorted({str(tag).strip().casefold() for tag in raw_tags if str(tag).strip()}))
-    valid_tags = {"arithmetic", "economics", "language_quality", "conversation", "creativity"}
-    invalid_tags = set(tags).difference(valid_tags)
-    if invalid_tags:
-        raise ValueError(f"hf_source_invalid_tags:{path}:{','.join(sorted(invalid_tags))}")
-
-    max_examples = payload.get("max_examples")
-    if max_examples is not None:
-        max_examples = int(max_examples)
-        if max_examples <= 0:
-            raise ValueError(f"hf_source_max_examples_invalid:{path}")
-    buffer_size = int(payload.get("shuffle_buffer_size", 10_000))
-    if buffer_size < 0:
-        raise ValueError(f"hf_source_shuffle_buffer_invalid:{path}")
-    revision = str(payload["revision"]).strip() if payload.get("revision") else None
-    if not revision:
-        raise ValueError(f"hf_source_revision_required:{path}")
-    if not _IMMUTABLE_HF_REVISION_RE.fullmatch(revision):
-        raise ValueError(f"hf_source_revision_must_be_immutable_commit:{path}:{revision}")
-    return HFSourceSpec(
-        path=path,
-        weight=weight,
-        stages=stages,
-        split=str(payload.get("split", "train")),
-        config_name=(str(payload["config_name"]) if payload.get("config_name") else None),
-        revision=revision,
-        text_fields=text_fields,
-        prompt_field=prompt_field,
-        response_field=response_field,
-        dialogue_field=dialogue_field,
-        row_filters=_parse_row_filters(payload.get("row_filters"), path=path),
-        tags=tags,
-        max_examples=max_examples,
-        shuffle_buffer_size=buffer_size,
-    )
-
-
-def load_hf_source_config(path: str | Path) -> tuple[HFSourceSpec, ...]:
-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    raw_sources = payload.get("sources", []) if isinstance(payload, dict) else payload if isinstance(payload, list) else None
-    if not isinstance(raw_sources, list) or not raw_sources:
-        raise ValueError("hf_config_contains_no_sources")
-    specs = tuple(_parse_spec(item) for item in raw_sources if isinstance(item, dict))
-    if not specs:
-        raise ValueError("hf_config_contains_no_valid_sources")
-    return specs
-
-
-def specs_fingerprint(specs: Sequence[HFSourceSpec]) -> str:
-    payload = {
-        "canonical_contract_version": CANONICAL_CONTRACT_VERSION,
-        "foundation_interaction_fraction": FOUNDATION_INTERACTION_FRACTION,
-        "foundation_continuation_prefix_words": FOUNDATION_CONTINUATION_PREFIX_WORDS,
-        "foundation_continuation_target_words": FOUNDATION_CONTINUATION_TARGET_WORDS,
-        "foundation_skill_source_version": FOUNDATION_SKILL_SOURCE_VERSION,
-        "conceptual_foundation_version": CONCEPTUAL_FOUNDATION_VERSION,
-        "language_quality_source_version": LANGUAGE_QUALITY_SOURCE_VERSION,
-        "foundation_arithmetic_weight": FOUNDATION_ARITHMETIC_WEIGHT,
-        "foundation_conceptual_arithmetic_weight": FOUNDATION_CONCEPTUAL_ARITHMETIC_WEIGHT,
-        "foundation_economics_weight": FOUNDATION_ECONOMICS_WEIGHT,
-        "foundation_economics_causal_weight": FOUNDATION_ECONOMICS_CAUSAL_WEIGHT,
-        "foundation_language_quality_weight": FOUNDATION_LANGUAGE_QUALITY_WEIGHT,
-        "foundation_quality_policy": "chat_general_document_strict_v1",
-        "source_weight_unit": "supervised_prediction_tokens",
-        "sources": [
-            {
-                "path": spec.path,
-                "weight": spec.weight,
-                "stages": list(spec.stages),
-                "split": spec.split,
-                "config_name": spec.config_name,
-                "revision": spec.revision,
-                "text_fields": list(spec.text_fields) if spec.text_fields else None,
-                "prompt_field": spec.prompt_field,
-                "response_field": spec.response_field,
-                "dialogue_field": spec.dialogue_field,
-                "row_filters": {key: list(values) for key, values in spec.row_filters},
-                "tags": list(spec.tags),
-                "max_examples": spec.max_examples,
-                "shuffle_buffer_size": spec.shuffle_buffer_size,
-            }
-            for spec in specs
-        ],
-    }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
 def hf_source_from_spec(spec: HFSourceSpec, *, seed: int) -> HFSource:
     return HFSource(
         path=spec.path,
@@ -394,31 +198,18 @@ def hf_source_from_spec(spec: HFSourceSpec, *, seed: int) -> HFSource:
     )
 
 
-def stage_specs(specs: Sequence[HFSourceSpec], stage: str) -> tuple[HFSourceSpec, ...]:
-    normalized = stage.strip().casefold()
-    selected = tuple(spec for spec in specs if normalized in spec.stages)
-    if not selected:
-        raise RuntimeError(f"no_hf_sources_for_training_stage:{normalized}")
-    return selected
-
-
 def _foundation_skill_sources(
-    *,
-    excluded_hashes: frozenset[str],
-    excluded_families: frozenset[str],
-    feedback: ExamFeedbackPolicy,
+    *, excluded_hashes: frozenset[str], excluded_families: frozenset[str], feedback: ExamFeedbackPolicy,
 ) -> list[tuple[DatasetSource, float]]:
     specs: tuple[tuple[DatasetSource, float, int, tuple[str, ...]], ...] = (
         (PrimitiveArithmeticSource(), FOUNDATION_ARITHMETIC_WEIGHT, 250_000, ("arithmetic",)),
         (ConceptualArithmeticSource(), FOUNDATION_CONCEPTUAL_ARITHMETIC_WEIGHT, 250_000, ("arithmetic",)),
         (FoundationEconomicsSource(), FOUNDATION_ECONOMICS_WEIGHT, 100_000, ("economics",)),
         (EconomicsCausalSource(), FOUNDATION_ECONOMICS_CAUSAL_WEIGHT, 100_000, ("economics",)),
-        (
-            LanguageQualityContrastSource(),
-            FOUNDATION_LANGUAGE_QUALITY_WEIGHT,
-            100_000,
-            ("language_quality", "conversation", "creativity"),
-        ),
+        (LanguageQualityContrastSource(), FOUNDATION_LANGUAGE_QUALITY_WEIGHT, 100_000,
+         ("language_quality", "conversation", "creativity")),
+        (FoundationExamCurriculumSource(), FOUNDATION_EXAM_CURRICULUM_WEIGHT, 100_000,
+         ("language_quality", "conversation")),
     )
     return [
         (
@@ -450,9 +241,7 @@ def build_training_stream(
     feedback: ExamFeedbackPolicy | None = None,
 ) -> WeightedSourceStream:
     if local_replay or local_weight > 0:
-        raise RuntimeError(
-            "local_language_training_disabled:configure_a_pinned_streaming_source_instead"
-        )
+        raise RuntimeError("local_language_training_disabled:configure_a_pinned_streaming_source_instead")
     policy = feedback or ExamFeedbackPolicy()
     normalized_stage = stage.strip().casefold()
     selected = stage_specs(specs, stage)
@@ -461,6 +250,7 @@ def build_training_stream(
     sources: list[tuple[DatasetSource, float]] = []
     hf_near_index = NearDuplicateIndex(max_entries=50_000, max_hamming_distance=4)
     for index, spec in enumerate(selected):
+        unicode_foundation = normalized_stage == "foundation" and {"swahili", "shairi", "poetry", "financial_news_comprehension"}.intersection(spec.skills)
         sources.append((
             GuardedSource(
                 hf_source_from_spec(spec, seed=seed + index * 997),
@@ -468,6 +258,7 @@ def build_training_stream(
                 excluded_hashes=excluded_hashes,
                 excluded_families=excluded_families,
                 near_index=hf_near_index,
+                quality_filter=LANGUAGE_QUALITY_FILTER if unicode_foundation else None,
             ),
             spec.weight * policy.multiplier_for_tags(spec.tags),
         ))
@@ -483,7 +274,6 @@ def build_training_stream(
 def sample_training_stream(
     *, specs: Sequence[HFSourceSpec], stage: str, limit: int, seed: int,
 ) -> list[str]:
-    """Build a deterministic, network-light preflight sample."""
     if limit <= 0:
         raise ValueError("stream sample limit must be positive")
     selected = stage_specs(specs, stage)
@@ -492,8 +282,6 @@ def sample_training_stream(
         specs=preflight_specs,
         stage=stage,
         seed=seed,
-        local_replay=(),
-        local_weight=0.0,
         repeat=False,
         feedback=ExamFeedbackPolicy(),
     )

@@ -2,38 +2,46 @@
   "sources": [
     {
       "path": "ORG_OR_USER/FOUNDATION_DOCUMENT_DATASET",
-      "revision": "PIN_IMMUTABLE_DATASET_COMMIT_SHA",
+      "revision": "PIN_IMMUTABLE_40_HEX_DATASET_COMMIT_SHA",
       "split": "train",
       "weight": 1.0,
-      "stages": [
-        "foundation"
-      ],
-      "text_fields": [
-        "text"
-      ],
-      "shuffle_buffer_size": 10000
+      "available_tokens": 8000000000,
+      "stages": ["foundation"],
+      "text_fields": ["text"],
+      "shuffle_buffer_size": 10000,
+      "skills": [
+        "addition",
+        "subtraction",
+        "multiplication",
+        "english",
+        "swahili",
+        "economics",
+        "business",
+        "finance",
+        "commerce",
+        "government",
+        "central_banking",
+        "financial_news_comprehension",
+        "poetry",
+        "shairi"
+      ]
     },
     {
       "path": "ORG_OR_USER/REASONING_QA_DATASET",
-      "revision": "PIN_IMMUTABLE_DATASET_COMMIT_SHA",
+      "revision": "PIN_IMMUTABLE_40_HEX_DATASET_COMMIT_SHA",
       "split": "train",
       "weight": 1.0,
-      "stages": [
-        "reasoning",
-        "trading_reasoning"
-      ],
+      "stages": ["reasoning", "trading_reasoning"],
       "prompt_field": "question",
       "response_field": "answer",
       "shuffle_buffer_size": 10000
     },
     {
       "path": "ORG_OR_USER/TRADING_QA_DATASET",
-      "revision": "PIN_IMMUTABLE_DATASET_COMMIT_SHA",
+      "revision": "PIN_IMMUTABLE_40_HEX_DATASET_COMMIT_SHA",
       "split": "train",
       "weight": 2.0,
-      "stages": [
-        "trading_reasoning"
-      ],
+      "stages": ["trading_reasoning"],
       "prompt_field": "instruction",
       "response_field": "output",
       "shuffle_buffer_size": 10000

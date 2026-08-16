@@ -6,18 +6,19 @@ from types import SimpleNamespace
 
 import pytest
 
-from corpus.source import HFSource
+from corpus.source import DatasetSource, HFSource, SourceMetadata
 from corpus.streamer import CorpusStreamer
 from src.language.canonical_contract import prompt_family
+from src.language.foundation_contract import FOUNDATION_MIN_AVAILABLE_CURRICULUM_TOKENS, FOUNDATION_SKILLS
 from src.language.streaming_sources import (
     GuardedSource,
     HFSourceSpec,
     build_training_stream,
     load_hf_source_config,
+    require_curriculum_capacity,
     stream_quality_accepts,
 )
 from src.language.tokenizer import BPETokenizer
-from corpus.source import DatasetSource, SourceMetadata
 
 
 class _MemorySource(DatasetSource):
@@ -157,3 +158,32 @@ def test_hf_config_rejects_unpinned_revision(tmp_path):
     )
     with pytest.raises(ValueError, match="revision_required"):
         load_hf_source_config(path)
+
+
+def test_foundation_capacity_is_declared_and_enforced(tmp_path):
+    path = tmp_path / "hf.json"
+    path.write_text(json.dumps({"sources": [{
+        "path": "example/test",
+        "revision": "a" * 40,
+        "weight": 1.0,
+        "stages": ["foundation"],
+        "text_fields": ["text"],
+        "available_tokens": FOUNDATION_MIN_AVAILABLE_CURRICULUM_TOKENS - 1,
+        "skills": list(FOUNDATION_SKILLS),
+    }]}), encoding="utf-8")
+    specs = load_hf_source_config(path)
+    with pytest.raises(RuntimeError, match="foundation_curriculum_capacity_insufficient"):
+        require_curriculum_capacity(specs, "foundation")
+
+    path.write_text(json.dumps({"sources": [{
+        "path": "example/test",
+        "revision": "a" * 40,
+        "weight": 1.0,
+        "stages": ["foundation"],
+        "text_fields": ["text"],
+        "available_tokens": FOUNDATION_MIN_AVAILABLE_CURRICULUM_TOKENS,
+        "skills": list(FOUNDATION_SKILLS),
+    }]}), encoding="utf-8")
+    inventory = require_curriculum_capacity(load_hf_source_config(path), "foundation")
+    assert inventory.available_tokens == FOUNDATION_MIN_AVAILABLE_CURRICULUM_TOKENS
+    assert inventory.skills == tuple(sorted(FOUNDATION_SKILLS))
