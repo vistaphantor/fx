@@ -634,16 +634,20 @@ def main() -> None:
         else:
             feedback = load_latest_exam_feedback(exams_dir)
         if changed_state_data_keys:
-            if resume_step != 0:
-                raise RuntimeError(
-                    "curriculum_upgrade_requires_exam_boundary:finish_or_discard_partial_interval_first"
-                )
+            abandoned_steps = resume_step
+            resume_step = 0
             best_val = float("inf")
             stale = 0
             print(
                 f"[CurriculumUpgrade] state data contract changed: "
                 f"{','.join(changed_state_data_keys)}; validation baseline reset"
             )
+            if abandoned_steps > 0:
+                print(
+                    f"[CurriculumUpgrade] interrupted old-curriculum interval had "
+                    f"{abandoned_steps} completed batches. Model/optimizer/tokens are preserved, "
+                    f"but interval scheduling restarts at step 0 under the new curriculum."
+                )
         saved_exam_steps = int(state.get("exam_steps", measured_exam_steps))
         if resume_step > 0:
             if saved_exam_steps <= 0 or resume_step >= saved_exam_steps:
@@ -904,8 +908,6 @@ def main() -> None:
             )
             break
 
-        # Exam output controls the *next* interval: rebuild the weighted source
-        # mixer only after the completed exam, never mid-interval.
         stream_generation += 1
         train_loader = _stream_loader(
             specs=hf_specs,
