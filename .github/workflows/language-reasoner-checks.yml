@@ -57,4 +57,8 @@ jobs:
             tests/test_language_dedup.py \
             tests/test_language_compute_budget.py \
             tests/test_language_source_contract.py \
+            tests/test_language_hard_negative_objective.py \
+            tests/test_language_conceptual_foundations.py \
+            tests/test_language_hf_filtered_dialogue_sources.py \
+            tests/test_language_exam_feedback.py \
             -q

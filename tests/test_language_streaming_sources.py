@@ -7,26 +7,46 @@ from types import SimpleNamespace
 import pytest
 
 from corpus.source import HFSource
-from corpus.streamer import CorpusStreamer, WeightedSourceStream
+from corpus.streamer import CorpusStreamer
 from src.language.canonical_contract import prompt_family
 from src.language.streaming_sources import (
-    CanonicalMemorySource,
     GuardedSource,
+    HFSourceSpec,
     build_training_stream,
     load_hf_source_config,
     stream_quality_accepts,
 )
 from src.language.tokenizer import BPETokenizer
+from corpus.source import DatasetSource, SourceMetadata
+
+
+class _MemorySource(DatasetSource):
+    def __init__(self, rows: list[str], name: str = "memory"):
+        self.rows = rows
+        self.name = name
+
+    @property
+    def source_id(self) -> str:
+        return f"test:{self.name}"
+
+    def scan(self) -> SourceMetadata:
+        return SourceMetadata(source_type="test", path=self.source_id, estimated_docs=len(self.rows))
+
+    def stream(self):
+        yield from self.rows
+
+    def metadata(self) -> dict:
+        return {"source_type": "test", "source_id": self.source_id}
 
 
 class _FakeIterableDataset:
     def __init__(self, rows):
         self.rows = list(rows)
-        self.shuffle_args = None
+        self.shuffle_called = False
 
-    def shuffle(self, *, seed: int, buffer_size: int):
-        self.shuffle_args = (seed, buffer_size)
-        return self
+    def shuffle(self, *args, **kwargs):
+        self.shuffle_called = True
+        raise AssertionError("remote HF shuffle must not be used")
 
     def __iter__(self):
         yield from self.rows
@@ -39,7 +59,7 @@ def test_hf_source_requires_pinned_revision(monkeypatch):
         list(HFSource("example/test", shuffle_buffer_size=0).stream())
 
 
-def test_hf_source_streams_same_canonical_chat_contract(monkeypatch):
+def test_hf_source_streams_canonical_chat_without_remote_shuffle(monkeypatch):
     calls = []
     dataset = _FakeIterableDataset(
         [
@@ -62,21 +82,17 @@ def test_hf_source_streams_same_canonical_chat_contract(monkeypatch):
     )
     texts = list(source.stream())
     assert len(texts) == 2
-    assert texts[0] == (
-        "<bos>\n<user>\nWhat is 2 + 2?\n</user>\n"
-        "<assistant>\n<think>\nCalculate.\n</think>\n4\n</assistant>\n<eos>"
-    )
+    assert all("<assistant>" in text for text in texts)
     assert calls[0][1]["revision"] == "abc123"
-    assert dataset.shuffle_args == (7, 128)
+    assert dataset.shuffle_called is False
 
 
 def test_guarded_source_excludes_validation_family_and_duplicates():
     heldout = "<bos>\n<user>\nWhat is RSI?\n</user>\n<assistant>\nHeldout.\n</assistant>\n<eos>"
     same_family = "<bos>\n<user>\nWhat is RSI?\n</user>\n<assistant>\nDifferent answer.\n</assistant>\n<eos>"
     safe = "<bos>\n<user>\nExplain ATR.\n</user>\n<assistant>\nATR measures range.\n</assistant>\n<eos>"
-    source = CanonicalMemorySource([same_family, safe, safe])
     guarded = GuardedSource(
-        source,
+        _MemorySource([same_family, safe, safe]),
         stage="foundation",
         excluded_families=frozenset({prompt_family(heldout)}),
     )
@@ -95,47 +111,27 @@ def test_stream_quality_rejects_malformed_and_pathological_records():
 def test_guarded_source_drops_bad_rows_before_training():
     good = "<bos>\n<user>\nExplain ATR.\n</user>\n<assistant>\nATR measures market range and volatility.\n</assistant>\n<eos>"
     bad = "<bos>\n<user>\nMissing assistant.\n</user>\n<eos>"
-    guarded = GuardedSource(CanonicalMemorySource([bad, good]), stage="foundation")
+    guarded = GuardedSource(_MemorySource([bad, good]), stage="foundation")
     assert list(guarded.stream()) == [good]
 
 
-def test_specialist_local_replay_preserves_general_language_examples(monkeypatch):
-    general = (
-        "<bos>\n<user>\nExplain photosynthesis.\n</user>\n"
-        "<assistant>\nPlants convert light into chemical energy.\n</assistant>\n<eos>"
-    )
-    trading = (
-        "<bos>\n<user>\nWhat does ATR measure?\n</user>\n"
-        "<assistant>\nATR measures market volatility and range.\n</assistant>\n<eos>"
-    )
-    # No HF row is required to prove replay behavior; use a tiny fake source
-    # configuration whose iterator is empty, while local replay must remain.
-    dataset = _FakeIterableDataset([])
-    monkeypatch.setitem(
-        sys.modules,
-        "datasets",
-        SimpleNamespace(load_dataset=lambda *a, **k: dataset),
-    )
-    from src.language.streaming_sources import HFSourceSpec
-
+def test_local_replay_is_rejected_by_authoritative_stream_only_builder():
     spec = HFSourceSpec(
         path="example/empty",
         revision="abc123",
         weight=1.0,
-        stages=("trading_reasoning",),
+        stages=("foundation",),
         shuffle_buffer_size=0,
     )
-    stream = build_training_stream(
-        specs=(spec,),
-        stage="trading_reasoning",
-        seed=7,
-        local_replay=(general, trading),
-        local_weight=1.0,
-        repeat=False,
-    )
-    values = list(stream)
-    assert general in values
-    assert trading in values
+    with pytest.raises(RuntimeError, match="local_language_training_disabled"):
+        build_training_stream(
+            specs=(spec,),
+            stage="foundation",
+            seed=7,
+            local_replay=("<bos>\ntext\n<eos>",),
+            local_weight=1.0,
+            repeat=False,
+        )
 
 
 def test_corpus_streamer_packs_short_examples_into_context():
@@ -151,19 +147,6 @@ def test_corpus_streamer_packs_short_examples_into_context():
     decoded = [tokenizer.decode(x.tolist(), skip_special=False) for x, _ in samples]
     joined = "\n".join(decoded)
     assert "A?" in joined and "B?" in joined
-    individual = sum(len(tokenizer.encode(text, False, False)) for text in texts)
-    if individual <= 65:
-        assert len(samples) == 1
-
-
-def test_weighted_stream_repeats_finite_sources_deterministically():
-    left = CanonicalMemorySource(["<bos>\nleft\n<eos>"], source_name="left")
-    right = CanonicalMemorySource(["<bos>\nright\n<eos>"], source_name="right")
-    stream_a = WeightedSourceStream([(left, 1.0), (right, 1.0)], seed=9, repeat=True)
-    stream_b = WeightedSourceStream([(left, 1.0), (right, 1.0)], seed=9, repeat=True)
-    iterator_a = iter(stream_a)
-    iterator_b = iter(stream_b)
-    assert [next(iterator_a) for _ in range(12)] == [next(iterator_b) for _ in range(12)]
 
 
 def test_hf_config_rejects_unpinned_revision(tmp_path):

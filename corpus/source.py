@@ -92,15 +92,7 @@ class LocalSource(DatasetSource):
 
 
 class HFSource(DatasetSource):
-    """Pinned Hugging Face streaming source with network-local sequential reads.
-
-    Hugging Face ``IterableDataset.shuffle`` can shuffle both rows and remote
-    shard order. On corpora with thousands of large parquet shards that turns a
-    modest row shuffle into repeated TLS/range requests against unrelated remote
-    files. This source deliberately keeps the remote iterable sequential and
-    performs bounded reservoir shuffling only after rows have been serialized in
-    process memory.
-    """
+    """Pinned Hugging Face streaming source with local filtering and shuffling."""
 
     COLUMN_SCHEMAS = (
         ("prompt", "response"),
@@ -128,6 +120,8 @@ class HFSource(DatasetSource):
         text_fields: list[str] | tuple[str, ...] | None = None,
         prompt_field: str | None = None,
         response_field: str | None = None,
+        dialogue_field: str | None = None,
+        row_filters: dict[str, tuple[str, ...] | list[str] | str] | None = None,
         max_examples: int | None = None,
         config_name: str | None = None,
         revision: str | None = None,
@@ -147,11 +141,27 @@ class HFSource(DatasetSource):
             raise ValueError("stream_retry_attempts must be >= 0")
         if stream_retry_base_seconds < 0:
             raise ValueError("stream_retry_base_seconds must be >= 0")
+        if dialogue_field and (text_fields or prompt_field or response_field):
+            raise ValueError("dialogue_field cannot be combined with text or prompt/response mappings")
+
+        normalized_filters: dict[str, tuple[str, ...]] = {}
+        for key, raw_values in (row_filters or {}).items():
+            field_name = str(key).strip()
+            if not field_name:
+                raise ValueError("row_filter_field_must_be_nonempty")
+            values = (raw_values,) if isinstance(raw_values, str) else tuple(raw_values)
+            cleaned = tuple(str(value).strip() for value in values if str(value).strip())
+            if not cleaned:
+                raise ValueError(f"row_filter_values_must_be_nonempty:{field_name}")
+            normalized_filters[field_name] = cleaned
+
         self._path = path.strip()
         self._split = split
         self._text_fields = list(text_fields) if text_fields else None
         self._prompt_field = str(prompt_field) if prompt_field else None
         self._response_field = str(response_field) if response_field else None
+        self._dialogue_field = str(dialogue_field) if dialogue_field else None
+        self._row_filters = normalized_filters
         self._max_examples = max_examples
         self._config_name = config_name
         self._revision = revision
@@ -182,9 +192,18 @@ class HFSource(DatasetSource):
                 "text_fields": self._text_fields,
                 "prompt_field": self._prompt_field,
                 "response_field": self._response_field,
+                "dialogue_field": self._dialogue_field,
+                "row_filters": self._row_filters,
                 "stream_retry_attempts": self._stream_retry_attempts,
             },
         )
+
+    def _row_allowed(self, row: dict) -> bool:
+        for field_name, allowed in self._row_filters.items():
+            value = row.get(field_name)
+            if value is None or str(value).strip() not in allowed:
+                return False
+        return True
 
     def _detect_schema(self, row: dict) -> Optional[tuple[str, str]]:
         if self._prompt_field and self._response_field:
@@ -209,7 +228,32 @@ class HFSource(DatasetSource):
                 messages.append(CanonicalMessage(str(role), str(content)))
         return messages
 
+    @staticmethod
+    def _messages_from_dialogue(dialogue: object) -> list[CanonicalMessage]:
+        if not isinstance(dialogue, (list, tuple)):
+            return []
+        messages: list[CanonicalMessage] = []
+        for index, content in enumerate(dialogue):
+            if content is None or not str(content).strip():
+                continue
+            role = "user" if index % 2 == 0 else "assistant"
+            messages.append(CanonicalMessage(role, str(content)))
+        if len(messages) < 2:
+            return []
+        if messages[-1].role == "user":
+            messages.pop()
+        return messages
+
     def _row_to_text(self, row: dict) -> Optional[str]:
+        if not self._row_allowed(row):
+            return None
+
+        if self._dialogue_field:
+            messages = self._messages_from_dialogue(row.get(self._dialogue_field))
+            if not messages:
+                return None
+            return serialize_messages(messages) or None
+
         if self._prompt_field and self._response_field:
             schema = self._detect_schema(row)
             if schema is None:
@@ -249,12 +293,6 @@ class HFSource(DatasetSource):
         return None
 
     def _load_dataset(self, *, shuffle: bool = False, retry_generation: int = 0):
-        """Open the pinned remote iterable without changing remote shard order.
-
-        ``shuffle`` and ``retry_generation`` remain accepted for compatibility
-        with callers/tests, but network-side shuffling is intentionally disabled.
-        Randomization happens in :meth:`stream` after rows reach local memory.
-        """
         if not self._revision:
             raise RuntimeError(
                 f"hf_revision_must_be_pinned:{self._path}:set an immutable commit/tag revision"
@@ -296,8 +334,6 @@ class HFSource(DatasetSource):
                     close()
                 except Exception:
                     pass
-        # HF iterable datasets generally expose no public close method, but some
-        # wrappers do. Close it when available and release both references.
         if dataset is not None:
             close = getattr(dataset, "close", None)
             if callable(close):
@@ -318,9 +354,9 @@ class HFSource(DatasetSource):
             for row in iterator:
                 if scanned >= max_rows:
                     break
-                scanned += 1
-                if not isinstance(row, dict):
+                if not isinstance(row, dict) or not self._row_allowed(row):
                     continue
+                scanned += 1
                 text = self._row_to_text(row)
                 if not text:
                     continue
@@ -353,10 +389,6 @@ class HFSource(DatasetSource):
             try:
                 dataset = self._load_dataset(shuffle=False)
                 iterator = iter(dataset)
-
-                # Remote cursors are not serializable. On a transient reconnect,
-                # replay the deterministic sequential stream only up to the raw
-                # row boundary already consumed. We never change shard order.
                 skipped = 0
                 while skipped < raw_rows_consumed:
                     next(iterator)
@@ -376,18 +408,15 @@ class HFSource(DatasetSource):
                         yield text
                         emitted += 1
                         continue
-
                     if len(reservoir) < self._shuffle_buffer_size:
                         reservoir.append(text)
                         continue
-
                     index = rng.randrange(len(reservoir))
                     selected = reservoir[index]
                     reservoir[index] = text
                     yield selected
                     emitted += 1
 
-                # Normal EOF: randomize and drain only the in-memory reservoir.
                 rng.shuffle(reservoir)
                 while reservoir and (
                     self._max_examples is None or emitted < self._max_examples
@@ -396,8 +425,6 @@ class HFSource(DatasetSource):
                     emitted += 1
                 return
             except StopIteration:
-                # A reconnect can discover that the saved raw-row boundary was
-                # exactly EOF. Drain any buffered local examples and finish.
                 rng.shuffle(reservoir)
                 while reservoir and (
                     self._max_examples is None or emitted < self._max_examples
@@ -444,5 +471,7 @@ class HFSource(DatasetSource):
             "text_fields": self._text_fields,
             "prompt_field": self._prompt_field,
             "response_field": self._response_field,
+            "dialogue_field": self._dialogue_field,
+            "row_filters": self._row_filters,
             "stream_retry_attempts": self._stream_retry_attempts,
         }

@@ -7,6 +7,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.language.hard_negative_objective import hard_negative_answer_penalty
+
 
 @dataclass(slots=True)
 class KVCacheState:
@@ -470,6 +472,12 @@ class VistaReasoningGPT(nn.Module):
                 targets.reshape(-1),
                 ignore_index=pad_id,
             )
+            if self.training:
+                loss = loss + hard_negative_answer_penalty(
+                    logits,
+                    targets,
+                    pad_id=pad_id,
+                )
             if self.training and self.ffn_type == "moe" and aux_losses:
                 router_aux = torch.stack(aux_losses).mean()
                 loss = loss + self.router_aux_loss_coef * router_aux

@@ -23,6 +23,8 @@ from src.language.compute_budget import benchmark_training_throughput, reference
 from src.language.curriculum import CURRICULUM_STAGES, select_curriculum
 from src.language.data_pipeline import build_tokenizer_training_sample
 from src.language.exam import EpochExamResult, build_exam_prompt, exam_questions, run_epoch_exam, save_epoch_exam
+from src.language.exam_feedback import EXAM_FEEDBACK_VERSION, ExamFeedbackPolicy, derive_exam_feedback
+from src.language.hard_negative_objective import HARD_NEGATIVE_OBJECTIVE_VERSION
 from src.language.loss_objective import LOSS_OBJECTIVE_VERSION
 from src.language.model_bundle import load_model_bundle, save_model_bundle
 from src.language.pytorch_transformer import VistaReasoningGPT
@@ -36,6 +38,11 @@ from src.language.streaming_sources import (
     stage_specs,
 )
 from src.language.tokenizer import BPETokenizer, TOKENIZER_ALGORITHM_VERSION
+from src.language.training_feedback_controller import (
+    adaptive_training_loss,
+    feedback_summary,
+    load_latest_exam_feedback,
+)
 from src.language.training_pipeline import (
     PackedSequenceDataset,
     build_example_sequences,
@@ -54,6 +61,12 @@ TRAINER_VERSION = 8
 TRAINING_STATE_VERSION = 8
 PREFLIGHT_MANIFEST_VERSION = 8
 SEED = 42
+UPGRADABLE_DATA_CONTRACT_KEYS = frozenset({
+    "source_corpus_fingerprint",
+    "curriculum_fingerprint",
+    "split_fingerprint",
+    "hf_sources_fingerprint",
+})
 
 
 def _atomic_torch_save(payload: dict, path: Path) -> None:
@@ -206,17 +219,20 @@ def _audit_hf_sources(specs: tuple[HFSourceSpec, ...], *, stage: str, rows: int,
 
 def _load_hf_sample(
     *, specs: tuple[HFSourceSpec, ...], stage: str, limit: int,
-    sample_path: Path, metadata_path: Path,
+    sample_path: Path, metadata_path: Path, refresh: bool = False,
 ) -> tuple[list[str], str]:
     fingerprint = specs_fingerprint(specs)
     expected = {"config_fingerprint": fingerprint, "stage": stage, "limit": int(limit)}
     if sample_path.exists() or metadata_path.exists():
         if not sample_path.exists() or not metadata_path.exists():
             raise RuntimeError("incomplete_hf_preflight_sample_cache")
-        if json.loads(metadata_path.read_text(encoding="utf-8")) != expected:
-            raise RuntimeError("hf_preflight_sample_contract_mismatch:use_clean_bundle")
-        sample = json.loads(sample_path.read_text(encoding="utf-8"))
-        return [canonicalize_serialized(value) for value in sample], fingerprint
+        saved_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if saved_metadata == expected:
+            sample = json.loads(sample_path.read_text(encoding="utf-8"))
+            return [canonicalize_serialized(value) for value in sample], fingerprint
+        if not refresh:
+            raise RuntimeError("hf_preflight_sample_contract_mismatch:use_--curriculum-upgrade_or_clean_bundle")
+        print("[CurriculumUpgrade] refreshing HF preflight sample for new source contract")
     sample = sample_training_stream(specs=specs, stage=stage, limit=limit, seed=SEED)
     _atomic_json_save(sample, sample_path)
     _atomic_json_save(expected, metadata_path)
@@ -263,6 +279,7 @@ def _run_exam(
 def _stream_loader(
     *, specs: tuple[HFSourceSpec, ...], stage: str, stream_generation: int,
     excluded: list[str], tokenizer: BPETokenizer, cfg: dict,
+    feedback: ExamFeedbackPolicy,
 ) -> DataLoader:
     stream = build_training_stream(
         specs=specs,
@@ -272,6 +289,7 @@ def _stream_loader(
         local_weight=0.0,
         excluded_texts=excluded,
         repeat=True,
+        feedback=feedback,
     )
     return DataLoader(
         CorpusStreamer(
@@ -289,7 +307,7 @@ def _stream_loader(
 def _save_state(
     path: Path, *, contract: dict, epoch: int, step: int, cumulative_tokens: int,
     optimizer_steps: int, best_val: float, stale: int, model: VistaReasoningGPT,
-    optimizer: torch.optim.Optimizer,
+    optimizer: torch.optim.Optimizer, feedback: ExamFeedbackPolicy,
 ) -> None:
     _atomic_torch_save(
         {
@@ -300,6 +318,7 @@ def _save_state(
             "optimizer_steps": optimizer_steps,
             "best_validation_loss": best_val,
             "epochs_without_improvement": stale,
+            "exam_feedback": feedback.to_dict(),
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "torch_rng_state": torch.get_rng_state(),
@@ -307,6 +326,10 @@ def _save_state(
         },
         path,
     )
+
+
+def _contract_mismatch_allowed(*, key: str, curriculum_upgrade: bool) -> bool:
+    return bool(curriculum_upgrade and key in UPGRADABLE_DATA_CONTRACT_KEYS)
 
 
 def main() -> None:
@@ -320,6 +343,7 @@ def main() -> None:
     parser.add_argument("--threads", type=int, default=max(1, min(4, os.cpu_count() or 2)))
     parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--curriculum-upgrade", action="store_true")
     parser.add_argument("--session-hours", type=float, default=4.0)
     parser.add_argument("--exam-interval-minutes", type=float, default=5.0)
     parser.add_argument("--target-tokens-per-parameter", type=float, default=None)
@@ -328,6 +352,9 @@ def main() -> None:
     parser.add_argument("--min-source-serialization-rate", type=float, default=0.80)
     parser.add_argument("--warmup-fraction", type=float, default=0.02)
     args = parser.parse_args()
+
+    if args.curriculum_upgrade and not args.resume:
+        raise ValueError("--curriculum-upgrade requires --resume")
 
     stage = _normalize_stage(args.training_stage)
     cfg = load_profile(args.profile)
@@ -371,6 +398,7 @@ def main() -> None:
         limit=args.hf_sample_examples or int(cfg["hf_preflight_sample_examples"]),
         sample_path=hf_sample_path,
         metadata_path=hf_sample_meta,
+        refresh=bool(args.resume and args.curriculum_upgrade),
     )
     print(
         f"[HF] sources={len(stage_specs(hf_specs, stage))} "
@@ -429,9 +457,16 @@ def main() -> None:
         if not preflight_path.exists():
             raise RuntimeError("unverified_preflight_tokenizer_exists")
         saved = json.loads(preflight_path.read_text(encoding="utf-8"))
+        changed_data_keys: list[str] = []
         for key, value in contract.items():
-            if saved.get(key) != value:
-                raise RuntimeError(f"preflight_contract_mismatch:{key}:use_clean_bundle")
+            if saved.get(key) == value:
+                continue
+            if _contract_mismatch_allowed(key=key, curriculum_upgrade=args.curriculum_upgrade):
+                changed_data_keys.append(key)
+                continue
+            raise RuntimeError(f"preflight_contract_mismatch:{key}:use_clean_bundle")
+        if changed_data_keys:
+            print(f"[CurriculumUpgrade] preflight data contract changed: {','.join(changed_data_keys)}")
         tokenizer = BPETokenizer.load(tokenizer_path)
         reused = True
     elif lineage_tokenizer is not None:
@@ -513,12 +548,14 @@ def main() -> None:
         "source_audit": source_audit,
         "compute_probe": probe.to_dict(),
         "exam_steps": measured_exam_steps,
+        "exam_feedback_version": EXAM_FEEDBACK_VERSION,
+        "hard_negative_objective_version": HARD_NEGATIVE_OBJECTIVE_VERSION,
     }
     _atomic_json_save(preflight, preflight_path)
     print(
         f"[Preflight] PASS roundtrips={report.roundtrip_cases} "
         f"overfit={report.overfit_initial_loss:.4f}->{report.overfit_final_loss:.4f} "
-        f"objective=v{LOSS_OBJECTIVE_VERSION}"
+        f"objective=v{LOSS_OBJECTIVE_VERSION} hard_negative=v{HARD_NEGATIVE_OBJECTIVE_VERSION}"
     )
     print(
         f"[Architecture] ffn={cfg['ffn_type']} total_params={total_params:,} "
@@ -569,15 +606,21 @@ def main() -> None:
     optimizer_steps = 0
     best_val = float("inf")
     stale = 0
+    feedback = ExamFeedbackPolicy()
     if args.resume:
         if not state_path.exists():
             raise RuntimeError("resume_training_state_missing")
         state = torch.load(state_path, map_location="cpu", weights_only=False)
+        changed_state_data_keys: list[str] = []
         for key, value in state_contract.items():
             if key == "exam_steps":
                 continue
-            if state.get(key) != value:
-                raise RuntimeError(f"resume_contract_mismatch:{key}")
+            if state.get(key) == value:
+                continue
+            if _contract_mismatch_allowed(key=key, curriculum_upgrade=args.curriculum_upgrade):
+                changed_state_data_keys.append(key)
+                continue
+            raise RuntimeError(f"resume_contract_mismatch:{key}")
         model.load_state_dict(state["model_state_dict"])
         optimizer.load_state_dict(state["optimizer_state_dict"])
         epoch = int(state["epoch"])
@@ -586,6 +629,25 @@ def main() -> None:
         optimizer_steps = int(state["optimizer_steps"])
         best_val = float(state["best_validation_loss"])
         stale = int(state["epochs_without_improvement"])
+        if state.get("exam_feedback"):
+            feedback = ExamFeedbackPolicy.from_dict(state.get("exam_feedback"))
+        else:
+            feedback = load_latest_exam_feedback(exams_dir)
+        if changed_state_data_keys:
+            abandoned_steps = resume_step
+            resume_step = 0
+            best_val = float("inf")
+            stale = 0
+            print(
+                f"[CurriculumUpgrade] state data contract changed: "
+                f"{','.join(changed_state_data_keys)}; validation baseline reset"
+            )
+            if abandoned_steps > 0:
+                print(
+                    f"[CurriculumUpgrade] interrupted old-curriculum interval had "
+                    f"{abandoned_steps} completed batches. Model/optimizer/tokens are preserved, "
+                    f"but interval scheduling restarts at step 0 under the new curriculum."
+                )
         saved_exam_steps = int(state.get("exam_steps", measured_exam_steps))
         if resume_step > 0:
             if saved_exam_steps <= 0 or resume_step >= saved_exam_steps:
@@ -606,6 +668,7 @@ def main() -> None:
             f"[Resume] epoch={epoch} step={resume_step}/{exam_steps} "
             f"tokens={cumulative_tokens:,}/{target_tokens:,}"
         )
+        print(f"[ExamFeedback] restored {feedback_summary(feedback)}")
     elif state_path.exists():
         raise RuntimeError("training_state_already_exists:use_--resume_or_clean_bundle")
 
@@ -622,6 +685,8 @@ def main() -> None:
             previous=None,
             max_new_tokens=int(cfg["exam_max_new_tokens"]),
         )
+        feedback = derive_exam_feedback(previous_exam)
+        print(f"[ExamFeedback] next_epoch {feedback_summary(feedback)}")
 
     excluded_stream_texts = list(val_texts) + _exam_holdout_texts(stage)
     stream_generation = epoch if args.resume else 0
@@ -632,12 +697,10 @@ def main() -> None:
         excluded=excluded_stream_texts,
         tokenizer=tokenizer,
         cfg=cfg,
+        feedback=feedback,
     )
     iterator = iter(train_loader)
 
-    # Resume cannot persist a remote HTTP cursor across processes. Replaying only
-    # the in-interval batch count keeps recovery bounded; GuardedSource removes
-    # exact/near duplicates during the reconstructed stream.
     if resume_step > 0:
         for _ in range(resume_step):
             try:
@@ -651,6 +714,7 @@ def main() -> None:
                     excluded=excluded_stream_texts,
                     tokenizer=tokenizer,
                     cfg=cfg,
+                    feedback=feedback,
                 )
                 iterator = iter(train_loader)
                 next(iterator)
@@ -678,6 +742,7 @@ def main() -> None:
                     excluded=excluded_stream_texts,
                     tokenizer=tokenizer,
                     cfg=cfg,
+                    feedback=feedback,
                 )
                 iterator = iter(train_loader)
                 x, y = next(iterator)
@@ -696,9 +761,19 @@ def main() -> None:
                 warmup_fraction=args.warmup_fraction,
             )
             optimizer.zero_grad(set_to_none=True)
-            _, loss = model(x, targets=y, pad_id=tokenizer.pad_id())
+            logits, loss = model(x, targets=y, pad_id=tokenizer.pad_id())
             if loss is None or not torch.isfinite(loss):
                 raise RuntimeError("non_finite_training_loss")
+            loss = adaptive_training_loss(
+                base_loss=loss,
+                logits=logits,
+                input_ids=x,
+                targets=y,
+                pad_id=tokenizer.pad_id(),
+                feedback=feedback,
+            )
+            if not torch.isfinite(loss):
+                raise RuntimeError("non_finite_adaptive_training_loss")
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg["grad_clip"]))
             optimizer.step()
@@ -720,6 +795,7 @@ def main() -> None:
                     stale=stale,
                     model=model,
                     optimizer=optimizer,
+                    feedback=feedback,
                 )
                 print(
                     f"[Checkpoint] exam_epoch={epoch+1} step={completed}/{exam_steps} "
@@ -742,6 +818,7 @@ def main() -> None:
                 stale=stale,
                 model=model,
                 optimizer=optimizer,
+                feedback=feedback,
             )
             _run_exam(
                 model,
@@ -793,11 +870,10 @@ def main() -> None:
             previous=previous_exam,
             max_new_tokens=int(cfg["exam_max_new_tokens"]),
         )
+        feedback = derive_exam_feedback(previous_exam)
+        print(f"[ExamFeedback] next_epoch {feedback_summary(feedback)}")
         epoch += 1
         resume_step = 0
-        # Once an interrupted interval has completed, future intervals may adopt
-        # the cadence measured by this process. Cadence is runtime scheduling,
-        # never checkpoint identity.
         if exam_steps != measured_exam_steps:
             exam_steps = measured_exam_steps
             state_contract["exam_steps"] = exam_steps
@@ -813,6 +889,7 @@ def main() -> None:
             stale=stale,
             model=model,
             optimizer=optimizer,
+            feedback=feedback,
         )
         current_tpp = cumulative_tokens / max(total_params, 1)
         print(
@@ -830,6 +907,18 @@ def main() -> None:
                 f"after {current_tpp:.2f} tokens/total-param"
             )
             break
+
+        stream_generation += 1
+        train_loader = _stream_loader(
+            specs=hf_specs,
+            stage=stage,
+            stream_generation=stream_generation,
+            excluded=excluded_stream_texts,
+            tokenizer=tokenizer,
+            cfg=cfg,
+            feedback=feedback,
+        )
+        iterator = iter(train_loader)
 
     if not best_path.exists():
         _atomic_torch_save(
@@ -861,6 +950,8 @@ def main() -> None:
     metrics = {
         "trainer_version": TRAINER_VERSION,
         "loss_objective_version": LOSS_OBJECTIVE_VERSION,
+        "hard_negative_objective_version": HARD_NEGATIVE_OBJECTIVE_VERSION,
+        "exam_feedback_version": EXAM_FEEDBACK_VERSION,
         "profile": args.profile,
         "training_stage": stage,
         "parameter_count": total_params,
@@ -873,6 +964,8 @@ def main() -> None:
         "tokenizer_efficiency": tokenizer_stats,
         "stream_only": True,
         "persistent_stream_per_session": True,
+        "exam_driven_next_epoch": True,
+        "last_exam_feedback": feedback.to_dict(),
         "sparse_moe": str(cfg["ffn_type"]) == "moe",
         "gqa": {
             "query_heads": int(cfg["n_heads"]),
