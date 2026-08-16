@@ -90,7 +90,7 @@ def _document_payload(text: str) -> str:
     if value.startswith("<bos>"):
         value = value[len("<bos>"):].lstrip()
     if value.endswith("<eos>"):
-        value = value[:-len("<eos>")].rstrip()
+        value = value[:-len("<eos>"):].rstrip()
     return value.strip()
 
 
@@ -119,7 +119,17 @@ def _use_foundation_interaction(digest: str) -> bool:
 
 
 class GuardedSource(DatasetSource):
-    """Canonicalize, stage-filter, near-deduplicate and enforce holdouts."""
+    """Canonicalize, quality-gate, deduplicate and enforce stage holdouts.
+
+    Foundation has two legitimate surfaces with different length contracts. Raw
+    documents need the stricter English filter because web text is noisy and long.
+    Canonical chat examples, however, often contain intentionally tiny answers
+    such as ``4.`` or ``13 shillings.``. Applying the document minimum-word gate to
+    those chats silently removed exactly the supervised mappings the foundation
+    model must learn. Unless a caller supplies an explicit authoritative override,
+    foundation chats therefore use the general language quality gate while
+    foundation documents retain the strict English/document gate.
+    """
 
     def __init__(
         self,
@@ -141,7 +151,7 @@ class GuardedSource(DatasetSource):
         self._near_dedup_entries = int(near_dedup_entries)
         self._near_dedup_hamming = int(near_dedup_hamming)
         self._near_index = near_index
-        self._quality_filter = quality_filter or _quality_filter_for_stage(self._stage)
+        self._quality_filter_override = quality_filter
         self._transform_foundation_documents = bool(transform_foundation_documents)
 
     @property
@@ -152,10 +162,19 @@ class GuardedSource(DatasetSource):
         return self._source.scan()
 
     def metadata(self) -> dict:
+        if self._quality_filter_override is not None:
+            quality_policy = type(self._quality_filter_override).__name__
+        elif self._stage == "foundation":
+            quality_policy = (
+                f"chat:{type(LANGUAGE_QUALITY_FILTER).__name__};"
+                f"document:{type(FOUNDATION_ENGLISH_FILTER).__name__}"
+            )
+        else:
+            quality_policy = type(LANGUAGE_QUALITY_FILTER).__name__
         return {
             **self._source.metadata(),
             "guarded_stage": self._stage,
-            "quality_filter": type(self._quality_filter).__name__,
+            "quality_filter": quality_policy,
             "near_dedup_entries": self._near_dedup_entries,
             "near_dedup_hamming": self._near_dedup_hamming,
             "shared_near_dedup": self._near_index is not None,
@@ -166,6 +185,13 @@ class GuardedSource(DatasetSource):
                 else 0.0
             ),
         }
+
+    def _quality_accepts(self, text: str) -> bool:
+        if self._quality_filter_override is not None:
+            return self._quality_filter_override.accepts(text)
+        if self._stage == "foundation" and _is_chat(text):
+            return LANGUAGE_QUALITY_FILTER.accepts(text)
+        return _quality_filter_for_stage(self._stage).accepts(text)
 
     def _stage_accepts(self, text: str) -> bool:
         if self._stage == "foundation":
@@ -184,7 +210,7 @@ class GuardedSource(DatasetSource):
         )
         for raw in self._source.stream():
             text = canonicalize_serialized(raw)
-            if not text or not self._quality_filter.accepts(text):
+            if not text or not self._quality_accepts(text):
                 continue
             digest = canonical_hash(text)
             if digest in seen or digest in self._excluded_hashes:
@@ -325,6 +351,7 @@ def specs_fingerprint(specs: Sequence[HFSourceSpec]) -> str:
         "foundation_economics_weight": FOUNDATION_ECONOMICS_WEIGHT,
         "foundation_economics_causal_weight": FOUNDATION_ECONOMICS_CAUSAL_WEIGHT,
         "foundation_language_quality_weight": FOUNDATION_LANGUAGE_QUALITY_WEIGHT,
+        "foundation_quality_policy": "chat_general_document_strict_v1",
         "source_weight_unit": "supervised_prediction_tokens",
         "sources": [
             {
