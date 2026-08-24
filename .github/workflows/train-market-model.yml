@@ -1,0 +1,77 @@
+name: Train market model
+
+on:
+  push:
+    paths:
+      - ".github/workflows/train-market-model.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: market-model-training
+  cancel-in-progress: false
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      PYTHONUNBUFFERED: "1"
+      PYTHONHASHSEED: "0"
+    steps:
+      - name: Checkout exact repository state
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install market-training dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy lightgbm torch yfinance pandas pytest
+
+      - name: Run focused training-contract tests
+        run: |
+          python -m pytest \
+            tests/strategy/test_ml_trainer.py \
+            tests/test_decision_fusion.py \
+            tests/strategy/test_features.py \
+            tests/strategy/test_execution_cost.py \
+            -q
+
+      - name: Train authoritative 365-day multi-timeframe market model
+        run: |
+          mkdir -p data/models
+          python tools/fetch_365d_all_timeframes_train.py
+
+      - name: Record immutable training provenance
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p data/models
+          cat > data/models/training_provenance.json <<EOF
+          {
+            "repository": "vistaphantor/fx",
+            "commit_sha": "${GITHUB_SHA}",
+            "workflow_run_id": "${GITHUB_RUN_ID}",
+            "workflow_run_attempt": "${GITHUB_RUN_ATTEMPT}",
+            "execution_mode": "research_training_only",
+            "live_broker_execution": false
+          }
+          EOF
+
+      - name: Publish trained-model evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vista-fx-market-model-${{ github.sha }}
+          if-no-files-found: warn
+          retention-days: 30
+          path: |
+            data/models/**
+            data/features.jsonl
