@@ -1,0 +1,130 @@
+name: Continue 2M dense reasoner prototype
+
+on:
+  workflow_run:
+    workflows: ["Train 2M dense reasoner prototype"]
+    types: [completed]
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: continue-2m-dense-reasoner-prototype
+  cancel-in-progress: false
+
+jobs:
+  resume:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      startsWith(github.event.workflow_run.head_branch, 'cloud-train-2m-dense-')
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    env:
+      PYTHONUNBUFFERED: "1"
+      PYTHONHASHSEED: "0"
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      GH_TOKEN: ${{ github.token }}
+      SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+      TARGET_BUNDLE: data/models/trading_language/2m_dense/foundation-prototype
+    steps:
+      - name: Checkout authoritative repository state
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install language dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest torch datasets
+
+      - name: Restore exact checkpoint from bounded session
+        shell: bash
+        run: |
+          rm -rf _resume "$TARGET_BUNDLE"
+          mkdir -p _resume "$TARGET_BUNDLE"
+          gh run download "$SOURCE_RUN_ID" -R "$GITHUB_REPOSITORY" -D _resume
+          STATE="$(find _resume -type f -path '*/.training/training_state.pt' -print -quit)"
+          if [ -z "$STATE" ]; then
+            echo "No resumable training_state.pt in source artifact" >&2
+            find _resume -maxdepth 8 -type f -print >&2 || true
+            exit 1
+          fi
+          SRC_BUNDLE="$(dirname "$(dirname "$STATE")")"
+          cp -a "$SRC_BUNDLE"/. "$TARGET_BUNDLE"/
+          test -f "$TARGET_BUNDLE/.training/tokenizer.json"
+          test -f "$TARGET_BUNDLE/.training/preflight.json"
+          test -f "$TARGET_BUNDLE/.training/training_state.pt"
+
+      - name: Resume same 2M dense foundation model
+        run: |
+          python tools/train_language_reasoner.py \
+            --profile 2m_dense \
+            --training-stage foundation \
+            --bundle-dir "$TARGET_BUNDLE" \
+            --hf-config config/hf_sources.json \
+            --hf-sample-examples 600 \
+            --threads 4 \
+            --session-hours 0.50 \
+            --compute-probe-steps 1 \
+            --source-audit-rows 30 \
+            --resume
+
+      - name: Examine resumed checkpoint
+        if: success()
+        run: |
+          python tools/exam_language_checkpoint.py \
+            --bundle "$TARGET_BUNDLE" \
+            --checkpoint current \
+            --training-stage foundation \
+            --max-new-tokens 64 | tee "$TARGET_BUNDLE/resumed_checkpoint_exam.txt"
+
+      - name: Probe resumed language behavior
+        if: success()
+        run: |
+          python tools/probe_language_foundation.py \
+            --bundle "$TARGET_BUNDLE" \
+            --checkpoint current \
+            --max-new-tokens 64 \
+            --prompt "A market is a place where" \
+            --prompt "Gold prices can rise when" \
+            --prompt "Risk management matters because" \
+            --prompt "If a trader loses one percent, the disciplined next step is" \
+            --prompt "A central bank changes interest rates because" \
+            | tee "$TARGET_BUNDLE/resumed_foundation_probe.txt"
+
+      - name: Record continuation provenance
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p "$TARGET_BUNDLE"
+          cat > "$TARGET_BUNDLE/continuation_provenance.json" <<EOF
+          {
+            "repository": "vistaphantor/fx",
+            "source_workflow_run_id": "${SOURCE_RUN_ID}",
+            "continuation_workflow_run_id": "${GITHUB_RUN_ID}",
+            "profile": "2m_dense",
+            "training_stage": "foundation",
+            "resume": true,
+            "canonical_foundation_target_changed": false,
+            "live_broker_execution": false
+          }
+          EOF
+
+      - name: Publish resumed checkpoint
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vista-fx-2m-dense-reasoner-resumed-${{ github.run_id }}
+          if-no-files-found: warn
+          retention-days: 30
+          include-hidden-files: true
+          path: |
+            data/models/trading_language/2m_dense/foundation-prototype/**
