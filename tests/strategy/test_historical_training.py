@@ -9,7 +9,7 @@ from src.strategy.historical_training import (
     aggregate_consecutive_bars,
     average_true_range_proxy,
     closed_candles_at,
-    realized_forward_outcome,
+    realized_directional_outcome,
 )
 
 
@@ -49,24 +49,67 @@ def test_closed_candles_limit_keeps_most_recent_observable_history():
     assert [c.close for c in visible] == [101.0, 102.0]
 
 
-def test_realized_forward_outcome_uses_actual_later_close_and_cost_gate():
+def test_realized_directional_outcome_uses_actual_later_close_net_of_cost():
     candles = [_candle(0, 100.0), _candle(15, 100.2), _candle(30, 101.0)]
 
-    profitable = realized_forward_outcome(candles, 0, horizon_bars=2, transaction_cost_ratio=0.005)
-    too_expensive = realized_forward_outcome(candles, 0, horizon_bars=2, transaction_cost_ratio=0.02)
+    long_outcome = realized_directional_outcome(
+        candles,
+        0,
+        direction=1,
+        horizon_bars=2,
+        transaction_cost_ratio=0.005,
+    )
+    short_outcome = realized_directional_outcome(
+        candles,
+        0,
+        direction=-1,
+        horizon_bars=2,
+        transaction_cost_ratio=0.005,
+    )
 
-    assert profitable is not None
-    assert profitable.label == 1
-    assert profitable.current_price == 100.0
-    assert profitable.future_price == 101.0
-    assert profitable.realized_return == pytest.approx(0.01)
-    assert too_expensive is not None
-    assert too_expensive.label == 0
+    assert long_outcome is not None
+    assert long_outcome.label == 1
+    assert long_outcome.market_return == pytest.approx(0.01)
+    assert long_outcome.net_return == pytest.approx(0.005)
+    assert short_outcome is not None
+    assert short_outcome.label == 0
+    assert short_outcome.net_return == pytest.approx(-0.015)
 
 
-def test_realized_forward_outcome_fails_closed_without_future_bar():
+def test_realized_directional_outcome_rewards_profitable_short():
+    candles = [_candle(0, 100.0), _candle(15, 99.0)]
+    outcome = realized_directional_outcome(
+        candles,
+        0,
+        direction=-1,
+        horizon_bars=1,
+        transaction_cost_ratio=0.002,
+    )
+    assert outcome is not None
+    assert outcome.label == 1
+    assert outcome.net_return == pytest.approx(0.008)
+
+
+def test_realized_directional_outcome_fails_closed_without_future_bar():
     candles = [_candle(0, 100.0), _candle(15, 100.2)]
-    assert realized_forward_outcome(candles, 1, horizon_bars=1, transaction_cost_ratio=0.0) is None
+    assert realized_directional_outcome(
+        candles,
+        1,
+        direction=1,
+        horizon_bars=1,
+        transaction_cost_ratio=0.0,
+    ) is None
+
+
+def test_realized_directional_outcome_rejects_flat_direction():
+    with pytest.raises(ValueError, match="direction"):
+        realized_directional_outcome(
+            [_candle(0, 100.0), _candle(15, 101.0)],
+            0,
+            direction=0,
+            horizon_bars=1,
+            transaction_cost_ratio=0.0,
+        )
 
 
 def test_aggregate_consecutive_bars_preserves_ohlcv_and_drops_partial_group():
