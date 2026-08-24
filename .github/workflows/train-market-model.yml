@@ -39,13 +39,14 @@ jobs:
       - name: Run focused training-contract tests
         run: |
           python -m pytest \
+            tests/strategy/test_historical_training.py \
             tests/strategy/test_ml_trainer.py \
             tests/test_decision_fusion.py \
             tests/strategy/test_features.py \
             tests/strategy/test_execution_cost.py \
             -q
 
-      - name: Train authoritative 365-day multi-timeframe market model
+      - name: Train authoritative causal multi-timeframe market model
         run: |
           mkdir -p data/models
           python tools/fetch_365d_all_timeframes_train.py
