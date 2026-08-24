@@ -7,11 +7,13 @@ from typing import Any, Sequence
 
 
 @dataclass(frozen=True, slots=True)
-class ForwardOutcome:
+class DirectionalOutcome:
     label: int
-    realized_return: float
+    net_return: float
+    market_return: float
     current_price: float
     future_price: float
+    direction: int
 
 
 def _utc_timestamp(value: Any) -> datetime:
@@ -77,14 +79,23 @@ def aggregate_consecutive_bars(candles: Sequence[Any], *, group_size: int) -> li
     return aggregated
 
 
-def realized_forward_outcome(
+def realized_directional_outcome(
     candles: Sequence[Any],
     index: int,
     *,
+    direction: int,
     horizon_bars: int,
     transaction_cost_ratio: float,
-) -> ForwardOutcome | None:
-    """Build a supervised label from an actually later close on the same series."""
+) -> DirectionalOutcome | None:
+    """Build a TRADE/SKIP target from later price in the proposed trade direction.
+
+    ``direction`` is +1 for a long candidate and -1 for a short candidate. The
+    returned ``net_return`` is directional market return less the supplied round-
+    trip execution-cost ratio. The label is positive only when that net return is
+    strictly profitable. No proxy or model-generated expected return is accepted.
+    """
+    if direction not in {-1, 1}:
+        raise ValueError("direction must be -1 or 1")
     if horizon_bars <= 0:
         raise ValueError("horizon_bars must be positive")
     if transaction_cost_ratio < 0:
@@ -98,12 +109,15 @@ def realized_forward_outcome(
     if current_price <= 0 or future_price <= 0:
         return None
 
-    realized_return = (future_price - current_price) / current_price
-    return ForwardOutcome(
-        label=1 if realized_return > transaction_cost_ratio else 0,
-        realized_return=realized_return,
+    market_return = (future_price - current_price) / current_price
+    net_return = (direction * market_return) - transaction_cost_ratio
+    return DirectionalOutcome(
+        label=1 if net_return > 0.0 else 0,
+        net_return=net_return,
+        market_return=market_return,
         current_price=current_price,
         future_price=future_price,
+        direction=direction,
     )
 
 
