@@ -1,0 +1,114 @@
+name: Train 2M dense reasoner prototype
+
+on:
+  push:
+    paths:
+      - ".github/workflows/train-2m-dense-prototype.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: 2m-dense-reasoner-prototype-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      PYTHONUNBUFFERED: "1"
+      PYTHONHASHSEED: "0"
+      HF_HUB_DISABLE_TELEMETRY: "1"
+    steps:
+      - name: Checkout exact repository state
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install language dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest torch datasets
+
+      - name: Verify dense language architecture
+        run: |
+          python -m compileall -q src/language corpus tools/train_language_reasoner.py tools/probe_language_foundation.py tools/exam_language_checkpoint.py
+          python -m pytest \
+            tests/test_language_architecture.py \
+            tests/test_language_training_pipeline.py \
+            tests/test_language_training_budget.py \
+            tests/test_language_protocol.py \
+            tests/test_language_generation.py \
+            tests/test_language_streaming_sources.py \
+            -q
+
+      - name: Train bounded 2M dense foundation prototype
+        run: |
+          python tools/train_language_reasoner.py \
+            --profile 2m_dense \
+            --training-stage foundation \
+            --bundle-dir data/models/trading_language/2m_dense/foundation-prototype \
+            --hf-config config/hf_sources.json \
+            --hf-sample-examples 600 \
+            --threads 4 \
+            --session-hours 0.20 \
+            --compute-probe-steps 1 \
+            --source-audit-rows 30
+
+      - name: Examine resumable checkpoint
+        if: success()
+        run: |
+          python tools/exam_language_checkpoint.py \
+            --bundle data/models/trading_language/2m_dense/foundation-prototype \
+            --checkpoint current \
+            --training-stage foundation \
+            --max-new-tokens 48 | tee data/models/trading_language/2m_dense/foundation-prototype/checkpoint_exam.txt
+
+      - name: Probe language and trading-domain continuations
+        if: success()
+        run: |
+          python tools/probe_language_foundation.py \
+            --bundle data/models/trading_language/2m_dense/foundation-prototype \
+            --checkpoint current \
+            --max-new-tokens 48 \
+            --prompt "A market is a place where" \
+            --prompt "Gold prices can rise when" \
+            --prompt "Risk management matters because" \
+            --prompt "If a trader loses one percent, the disciplined next step is" \
+            --prompt "A central bank changes interest rates because" \
+            | tee data/models/trading_language/2m_dense/foundation-prototype/foundation_probe.txt
+
+      - name: Record immutable prototype provenance
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p data/models/trading_language/2m_dense/foundation-prototype
+          cat > data/models/trading_language/2m_dense/foundation-prototype/provenance.json <<EOF
+          {
+            "repository": "vistaphantor/fx",
+            "commit_sha": "${GITHUB_SHA}",
+            "workflow_run_id": "${GITHUB_RUN_ID}",
+            "profile": "2m_dense",
+            "training_stage": "foundation",
+            "prototype": true,
+            "canonical_foundation_target_changed": false,
+            "live_broker_execution": false
+          }
+          EOF
+
+      - name: Publish prototype checkpoint
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vista-fx-2m-dense-reasoner-${{ github.sha }}
+          if-no-files-found: warn
+          retention-days: 30
+          include-hidden-files: true
+          path: |
+            data/models/trading_language/2m_dense/foundation-prototype/**
