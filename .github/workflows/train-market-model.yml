@@ -1,10 +1,10 @@
 name: Train market model
 
 on:
-  push:
-    paths:
-      - ".github/workflows/train-market-model.yml"
   pull_request:
+    paths:
+      - ".github/training-requests/strict*.txt"
+      - ".github/workflows/train-market-model.yml"
   workflow_dispatch:
 
 permissions:
