@@ -4,6 +4,10 @@ on:
   push:
     paths:
       - ".github/workflows/train-2m-dense-prototype.yml"
+  pull_request:
+    paths:
+      - ".github/training-requests/2m-dense-prototype*.txt"
+      - ".github/workflows/train-2m-dense-prototype.yml"
   workflow_dispatch:
 
 permissions:
