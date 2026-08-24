@@ -1,14 +1,16 @@
-"""Causal multi-timeframe market-data builder and local-edge model trainer.
+"""Causal multi-asset market-data builder and local-edge model trainer.
 
-Downloads historical Gold and major-FX candles, builds only information that was
-fully observable at each historical decision time, labels candidate trades from
-realized same-symbol future prices net of execution cost, then invokes the repo's
-authoritative local-edge intelligence pipeline with walk-forward promotion gates.
+Downloads liquid Gold/FX histories, constructs only information fully observable at
+each historical decision time, labels a pre-gate directional candidate from later
+same-symbol prices net of execution cost, globally time-sorts the experiment, and
+runs the repo's authoritative local-edge pipeline with an untouched fixed-threshold
+walk-forward evaluation.
 
 This is research/model training. It does not connect to a broker or place trades.
 """
 from __future__ import annotations
 
+import json
 import sys
 from datetime import timedelta, timezone
 from pathlib import Path
@@ -33,7 +35,16 @@ from src.strategy.session_engine import SessionEngine
 
 
 LABEL_HORIZON_M15_BARS = 4
-MAX_TRAINING_ROWS_PER_SYMBOL = 1500
+MAX_TRAINING_ROWS_PER_SYMBOL = 700
+SYMBOLS = [
+    "GC=F",
+    "EURUSD=X",
+    "GBPUSD=X",
+    "USDJPY=X",
+    "AUDUSD=X",
+    "USDCAD=X",
+    "USDCHF=X",
+]
 
 
 def convert_df_to_candles(df):
@@ -79,8 +90,6 @@ def _causal_history(history: dict[str, list], decision_time) -> SimpleNamespace 
     m15 = closed_candles_at(history["M15"], decision_time, bar_duration=timedelta(minutes=15), limit=50)
     m5 = closed_candles_at(history["M5"], decision_time, bar_duration=timedelta(minutes=5), limit=20)
 
-    # Feature extraction has defined fallbacks for sparse higher-timeframe context,
-    # but M15/M5 must be genuinely populated to describe the decision bar.
     if len(m15) < 20 or len(m5) < 5:
         return None
     if not d1:
@@ -102,19 +111,94 @@ def _causal_history(history: dict[str, list], decision_time) -> SimpleNamespace 
     )
 
 
+def _absolute_spread(symbol: str) -> float:
+    if symbol == "GC=F":
+        return 0.25
+    if symbol == "USDJPY=X":
+        return 0.015
+    return 0.00015
+
+
+def _candidate_direction(quant_decision, expected_return: float) -> int:
+    """Recover the directional proposal before TRADE/SKIP execution gates.
+
+    The local-edge model is itself a TRADE/SKIP gate, so restricting its training
+    set to trades already approved by the quant gate creates selection bias. The
+    certainty-equivalent scores retain both directional proposals even when the
+    quant engine ultimately returns action=0.
+    """
+    scores = (getattr(quant_decision, "metadata", {}) or {}).get("ce_scores") or {}
+    long_score = float(scores.get(1, float("-inf")))
+    short_score = float(scores.get(-1, float("-inf")))
+    if long_score != short_score:
+        return 1 if long_score > short_score else -1
+    if expected_return > 0:
+        return 1
+    if expected_return < 0:
+        return -1
+    return 0
+
+
+def _sort_feature_log_by_time(path: Path) -> None:
+    rows = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if isinstance(row, dict) and row.get("timestamp"):
+            rows.append(row)
+    rows.sort(key=lambda row: str(row["timestamp"]))
+    path.write_text("".join(json.dumps(row, sort_keys=True) + "\n" for row in rows), encoding="utf-8")
+
+
+def _strict_validation_gate(walk_forward: dict) -> tuple[bool, dict]:
+    folds = [fold for fold in walk_forward.get("folds", []) if fold.get("status") != "skipped"]
+    average = walk_forward.get("average", {}) or {}
+    recent = folds[-2:]
+    requirements = {
+        "min_samples": 1500,
+        "min_average_precision": 0.52,
+        "min_average_profit_factor": 1.10,
+        "min_recent_fold_precision": 0.45,
+        "min_recent_fold_profit_factor": 1.00,
+        "min_recent_fold_allowed_trades": 5,
+        "required_recent_folds": 2,
+    }
+    recent_checks = []
+    for fold in recent:
+        allowed_trades = int(fold.get("tp", 0) or 0) + int(fold.get("fp", 0) or 0)
+        recent_checks.append(
+            {
+                "fold": fold.get("fold"),
+                "precision": float(fold.get("precision", 0.0) or 0.0),
+                "profit_factor": float(fold.get("profit_factor", 0.0) or 0.0),
+                "allowed_trades": allowed_trades,
+                "passed": (
+                    float(fold.get("precision", 0.0) or 0.0) >= requirements["min_recent_fold_precision"]
+                    and float(fold.get("profit_factor", 0.0) or 0.0) >= requirements["min_recent_fold_profit_factor"]
+                    and allowed_trades >= requirements["min_recent_fold_allowed_trades"]
+                ),
+            }
+        )
+    passed = (
+        int(walk_forward.get("samples", 0) or 0) >= requirements["min_samples"]
+        and float(average.get("precision", 0.0) or 0.0) >= requirements["min_average_precision"]
+        and float(average.get("profit_factor", 0.0) or 0.0) >= requirements["min_average_profit_factor"]
+        and len(recent_checks) == requirements["required_recent_folds"]
+        and all(item["passed"] for item in recent_checks)
+    )
+    return passed, {"passed": passed, "requirements": requirements, "recent_folds": recent_checks}
+
+
 def main():
     print("=" * 100)
-    print(" CAUSAL MULTI-TIMEFRAME LOCAL-EDGE MARKET MODEL TRAINING")
+    print(" STRICT CAUSAL MULTI-ASSET LOCAL-EDGE MARKET MODEL TRAINING")
     print("=" * 100)
 
-    symbols = ["GC=F", "EURUSD=X", "GBPUSD=X"]
     features_file = Path("data/features.jsonl")
     features_file.parent.mkdir(parents=True, exist_ok=True)
-    # Every run is an immutable experiment from fresh historical rows. Carrying
-    # previous feature logs forward would duplicate observations and bias folds.
     features_file.write_text("", encoding="utf-8")
 
-    feature_extractor = FeatureExtractor(window=100)
     equity_tracker = EquityTracker(dd_max=0.20, initial_equity=10000.0)
     quant_params = QuantParams(position_r_max=0.02)
     session_engine = SessionEngine()
@@ -122,8 +206,8 @@ def main():
     total_added = 0
     source_counts: dict[str, int] = {}
 
-    print(f"\n[1/3] Downloading causal multi-timeframe histories for {symbols}...")
-    for symbol in symbols:
+    print(f"\n[1/3] Downloading causal histories for {SYMBOLS}...")
+    for symbol in SYMBOLS:
         history = _download_symbol_history(symbol)
         m15_candles = history["M15"]
         print(
@@ -135,6 +219,9 @@ def main():
             print(f"      {symbol}: skipped (insufficient M15 history)")
             continue
 
+        # Normalization state is market-local. Reusing one rolling z-score buffer
+        # across symbols would let the previous symbol change the next one's inputs.
+        feature_extractor = FeatureExtractor(window=100)
         step = max(1, (len(m15_candles) - 50 - LABEL_HORIZON_M15_BARS) // MAX_TRAINING_ROWS_PER_SYMBOL)
         symbol_added = 0
         for index in range(50, len(m15_candles) - LABEL_HORIZON_M15_BARS, step):
@@ -144,7 +231,7 @@ def main():
             if causal is None:
                 continue
 
-            absolute_spread = 0.25 if "GC" in symbol else 0.00015
+            absolute_spread = _absolute_spread(symbol)
             current_price = float(current.close)
             if current_price <= 0:
                 continue
@@ -175,8 +262,6 @@ def main():
                 for earlier, later in zip(recent[:-1], recent[1:])
             ] or [0.0]
 
-            # Neutral priors prevent the dataset builder from injecting a fabricated
-            # historical win rate before a realized label exists.
             quant_decision = evaluate_master_equation(
                 features=snapshot,
                 params=quant_params,
@@ -191,7 +276,7 @@ def main():
                 dxy_trend=0.0,
             )
 
-            direction = int(quant_decision.action)
+            direction = _candidate_direction(quant_decision, float(snapshot.expected_return))
             if direction not in {-1, 1}:
                 continue
 
@@ -209,7 +294,7 @@ def main():
             append_enriched_snapshot_to_file(
                 snapshot,
                 features_file,
-                quant_is_trade=True,
+                quant_is_trade=bool(quant_decision.is_trade),
                 quant_action=direction,
                 omega_t=quant_decision.omega_t,
                 kelly_fraction=float(metadata.get("kelly_fraction", 0.0)),
@@ -238,48 +323,70 @@ def main():
             total_added += 1
 
         source_counts[symbol] = symbol_added
-        print(f"      {symbol}: {symbol_added} realized direction-aware training rows")
+        print(f"      {symbol}: {symbol_added} realized direction-aware candidate rows")
 
-    print(f"\n[2/3] Built {total_added} causal realized training rows: {source_counts}")
-    if total_added < 100:
+    _sort_feature_log_by_time(features_file)
+    print(f"\n[2/3] Built {total_added} causal rows, globally chronological: {source_counts}")
+    if total_added < 1500:
         raise RuntimeError(f"insufficient_causal_training_rows:{total_added}")
 
-    print("\n[3/3] Running authoritative local-edge training and walk-forward promotion...")
-    from src.strategy.intelligence_pipeline import run_pipeline
+    print("\n[3/3] Running fixed-threshold untouched walk-forward evaluation...")
+    from src.strategy.intelligence_pipeline import promote_candidate, run_pipeline
 
     args = SimpleNamespace(
         features=str(features_file),
         diagnostics="data/live_diagnostics.jsonl",
         paper_trades="data/paper_trades.jsonl",
         candles=None,
-        candidate_model="data/models/local_edge_model.online_candidate.npz",
+        candidate_model="data/models/local_edge_model.strict_candidate.npz",
         live_model="data/models/local_edge_model.npz",
-        report="data/models/training_report_365d.json",
+        report="data/models/training_report_strict.json",
         horizon_bars=LABEL_HORIZON_M15_BARS,
         folds=5,
-        epochs=1200,
+        epochs=800,
         learning_rate=0.025,
         hidden_size=32,
         num_layers=32,
         threshold=0.55,
-        fixed_threshold=False,
-        auto_threshold=True,
+        fixed_threshold=True,
+        auto_threshold=False,
         min_abs_return=0.0,
-        promote=True,
-        min_promotion_samples=100,
+        promote=False,
+        min_promotion_samples=1500,
         min_promotion_precision=0.52,
-        min_promotion_profit_factor=1.05,
+        min_promotion_profit_factor=1.10,
     )
 
     report = run_pipeline(args)
-    promotion = report.get("promotion") or {}
+    walk_forward = report.get("walk_forward") or {}
+    strict_passed, strict_report = _strict_validation_gate(walk_forward)
+    report["strict_validation"] = strict_report
 
+    promotion = {
+        "promoted": False,
+        "reason": "strict_validation_failed",
+        "samples": int(walk_forward.get("samples", 0) or 0),
+    }
+    if strict_passed:
+        promotion = promote_candidate(
+            candidate_path=args.candidate_model,
+            live_model_path=args.live_model,
+            walk_forward=walk_forward,
+            min_samples=args.min_promotion_samples,
+            min_precision=args.min_promotion_precision,
+            min_profit_factor=args.min_promotion_profit_factor,
+        )
+    report["promotion"] = promotion
+    Path(args.report).write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+
+    average = walk_forward.get("average") or {}
     print("\n" + "=" * 100)
-    print(" CAUSAL MULTI-TIMEFRAME TRAINING COMPLETE")
+    print(" STRICT CAUSAL MULTI-ASSET TRAINING COMPLETE")
     print(f" Total Dataset Rows: {report.get('rows')}")
+    print(f" Strict Validation Passed: {strict_passed}")
     print(f" Candidate Promoted: {promotion.get('promoted')}")
-    print(f" Walk-Forward Precision: {float(promotion.get('precision', 0.0) or 0.0):.4f}")
-    print(f" Walk-Forward Profit Factor: {float(promotion.get('profit_factor', 0.0) or 0.0):.4f}")
+    print(f" Walk-Forward Precision: {float(average.get('precision', 0.0) or 0.0):.4f}")
+    print(f" Walk-Forward Profit Factor: {float(average.get('profit_factor', 0.0) or 0.0):.4f}")
     print(f" Live Model Path: {promotion.get('live_model_path')}")
     print("=" * 100)
 
