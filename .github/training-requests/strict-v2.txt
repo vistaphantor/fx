@@ -1,0 +1,4 @@
+strict-causal-multi-asset-v2
+base=9c05acbc097c1384f2fde35962623f079697d337
+purpose=research-training-only
+live-broker-execution=false
