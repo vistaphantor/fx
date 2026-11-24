@@ -68,4 +68,5 @@ jobs:
             tests/test_language_foundation_v11_learning.py \
             tests/test_language_semantic_checkpointing.py \
             tests/test_language_fx_sentiment_probe.py \
+            tests/test_language_finbert_sentiment.py \
             -q

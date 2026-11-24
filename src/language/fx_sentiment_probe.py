@@ -7,6 +7,7 @@ from pathlib import Path
 
 import torch
 
+from src.language.finbert_sentiment import DEFAULT_FINBERT_MODEL, FinBertSentimentAnalyzer
 from src.language.protocol import (
     build_chat_prompt,
     extract_assistant_response,
@@ -160,11 +161,38 @@ def render_probe(answers: tuple[FXProbeAnswer, ...], checkpoint: dict) -> str:
     return "\n".join(lines)
 
 
+def run_finbert_fx_probe(
+    *,
+    analyzer: FinBertSentimentAnalyzer,
+) -> tuple[FXProbeAnswer, ...]:
+    prompts = [prompt for _, prompt in FX_SENTIMENT_PROMPTS]
+    scored = analyzer.score_batch(prompts)
+    answers: list[FXProbeAnswer] = []
+    for (case_id, prompt), item in zip(FX_SENTIMENT_PROMPTS, scored):
+        summary = (
+            f"label={item.label} sentiment_score={item.sentiment_score:+.4f} "
+            f"confidence={item.confidence:.4f} scores={json.dumps(item.scores, sort_keys=True)}"
+        )
+        answers.append(
+            FXProbeAnswer(
+                case_id=case_id,
+                prompt=prompt,
+                response=summary,
+                generated_tokens=0,
+                replacement_characters=0,
+            )
+        )
+    return tuple(answers)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Generate deterministic FX-sentiment samples from a retained training checkpoint."
+        description="Run deterministic FX-sentiment probes using FinBERT or a retained training checkpoint."
     )
-    parser.add_argument("--bundle-dir", required=True)
+    parser.add_argument("--backend", choices=("finbert", "checkpoint"), default="finbert")
+    parser.add_argument("--model-name", default=DEFAULT_FINBERT_MODEL)
+    parser.add_argument("--local-files-only", action="store_true")
+    parser.add_argument("--bundle-dir", default=None)
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--require-cuda", action="store_true")
@@ -172,21 +200,46 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-dir", default=None)
     args = parser.parse_args(argv)
 
-    bundle = Path(args.bundle_dir)
-    checkpoint_path = Path(args.checkpoint) if args.checkpoint else bundle / ".training" / "best_model.pt"
-    tokenizer_path = bundle / ".training" / "tokenizer.json"
-    output_dir = Path(args.output_dir) if args.output_dir else bundle / "fx_sentiment_probe"
-    device = _resolve_device(args.device, require_cuda=bool(args.require_cuda))
-    model, tokenizer, checkpoint = load_training_checkpoint(
-        checkpoint_path=checkpoint_path,
-        tokenizer_path=tokenizer_path,
-        device=device,
-    )
-    answers = run_fx_sentiment_probe(
-        model=model,
-        tokenizer=tokenizer,
-        max_new_tokens=args.max_new_tokens,
-    )
+    if args.backend == "finbert":
+        analyzer = FinBertSentimentAnalyzer.from_pretrained(
+            args.model_name,
+            device=args.device,
+            require_cuda=bool(args.require_cuda),
+            local_files_only=bool(args.local_files_only),
+        )
+        answers = run_finbert_fx_probe(analyzer=analyzer)
+        checkpoint = {
+            "epoch": None,
+            "cumulative_prediction_tokens": None,
+            "validation_loss": None,
+            "exam_correctness_percent": None,
+            "exam_gibberish_answers": 0,
+            "backend": "finbert",
+            "model_name": args.model_name,
+        }
+        output_dir = (
+            Path(args.output_dir)
+            if args.output_dir
+            else (Path(args.bundle_dir) / "fx_sentiment_probe" if args.bundle_dir else Path("logs") / "fx_sentiment_probe")
+        )
+    else:
+        if not args.bundle_dir:
+            parser.error("--bundle-dir is required when --backend checkpoint is used")
+        bundle = Path(args.bundle_dir)
+        checkpoint_path = Path(args.checkpoint) if args.checkpoint else bundle / ".training" / "best_model.pt"
+        tokenizer_path = bundle / ".training" / "tokenizer.json"
+        output_dir = Path(args.output_dir) if args.output_dir else bundle / "fx_sentiment_probe"
+        device = _resolve_device(args.device, require_cuda=bool(args.require_cuda))
+        model, tokenizer, checkpoint = load_training_checkpoint(
+            checkpoint_path=checkpoint_path,
+            tokenizer_path=tokenizer_path,
+            device=device,
+        )
+        answers = run_fx_sentiment_probe(
+            model=model,
+            tokenizer=tokenizer,
+            max_new_tokens=args.max_new_tokens,
+        )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     text_path = output_dir / "fx_sentiment_probe.txt"
