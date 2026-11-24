@@ -174,14 +174,14 @@
 
         async function triggerPanic() {
             if (confirm("LIQUIDATE ALL? Warning: Instant market exit.")) {
-                await fetch('/api/panic');
+                await fetch('api/panic');
                 alert("Signal transmitted.");
             }
         }
 
         async function updateDashboard() {
             try {
-                const res = await fetch('/api/state');
+                const res = await fetch('api/state');
                 const data = await res.json();
                 if (data.status === "waiting_for_bot") {
                     setText('connection-status', 'WAITING FOR BOT STATE');

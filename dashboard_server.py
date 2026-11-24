@@ -1,12 +1,14 @@
 import http.server
 import json
+import os
 import socketserver
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from src.strategy.orderflow import OrderflowSignalStore, parse_orderflow_payload
 
-PORT = 8000
+HOST = os.environ.get("FX_DASHBOARD_HOST", "127.0.0.1")
+PORT = int(os.environ.get("FX_DASHBOARD_PORT", "8000"))
 BASE_DIR = Path(__file__).resolve().parent
 
 
@@ -80,6 +82,6 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
         self.end_headers()
 
 if __name__ == "__main__":
-    print(f"Dashboard serving at http://localhost:{PORT}")
-    with ReusableTCPServer(("", PORT), DashboardHandler) as httpd:
+    print(f"Dashboard serving at http://{HOST}:{PORT}")
+    with ReusableTCPServer((HOST, PORT), DashboardHandler) as httpd:
         httpd.serve_forever()

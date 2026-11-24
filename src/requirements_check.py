@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -22,7 +23,12 @@ def requirement_import_name(requirement: str) -> str:
     return PACKAGE_IMPORT_ALIASES.get(package_name.lower(), package_name)
 
 
-def load_requirement_import_names(requirements_path: str | Path) -> list[str]:
+def load_requirement_import_names(
+    requirements_path: str | Path,
+    *,
+    platform: str | None = None,
+    os_name: str | None = None,
+) -> list[str]:
     path = Path(requirements_path)
     if not path.exists():
         raise FileNotFoundError(f"requirements file not found: {path}")
@@ -32,8 +38,31 @@ def load_requirement_import_names(requirements_path: str | Path) -> list[str]:
         line = raw_line.split("#", 1)[0].strip()
         if not line:
             continue
+        if ";" in line:
+            _, marker = line.split(";", 1)
+            if not _marker_applies(marker, platform=platform, os_name=os_name):
+                continue
         import_names.append(requirement_import_name(line))
     return import_names
+
+
+def _marker_applies(
+    marker: str,
+    *,
+    platform: str | None = None,
+    os_name: str | None = None,
+) -> bool:
+    current_platform = sys.platform if platform is None else platform
+    current_os = os.name if os_name is None else os_name
+    match = re.match(
+        r"^\s*(sys_platform|os_name)\s*(==|!=)\s*['\"]([^'\"]+)['\"]\s*$",
+        marker,
+    )
+    if not match:
+        return True
+    key, op, expected = match.groups()
+    actual = current_platform if key == "sys_platform" else current_os
+    return actual == expected if op == "==" else actual != expected
 
 
 def import_available(import_name: str) -> bool:

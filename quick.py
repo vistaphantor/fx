@@ -139,6 +139,44 @@ def format_quick_startup_summary(settings: Settings, account_info=None) -> str:
     )
 
 
+def run_linux_standby_loop(
+    settings: Settings,
+    *,
+    reload_check_fn=None,
+    sleep_fn=None,
+) -> int:
+    import json
+    import time
+    from datetime import datetime, timezone
+    from src.quick_scalp_loop import BOT_STATE_FILE
+
+    sleep = sleep_fn or time.sleep
+    poll = max(1, int(getattr(settings, "quick_poll_seconds", 5)))
+    logging.warning(
+        "Linux standby mode active (%s): MetaTrader5 is Windows-only and no MT4 bridge is ready; "
+        "serving dashboard and updating %s.",
+        sys.platform,
+        BOT_STATE_FILE,
+    )
+    try:
+        while True:
+            payload = {
+                "status": "linux_standby",
+                "mode": "quick_linux_standby",
+                "platform": sys.platform,
+                "symbol": settings.trading_symbol,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "message": "Quick dashboard active on Linux; no Windows MT5 terminal attached.",
+            }
+            with open(BOT_STATE_FILE, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2)
+            if reload_check_fn is not None and reload_check_fn():
+                return 0
+            sleep(poll)
+    except KeyboardInterrupt:
+        return 130
+
+
 def main() -> int:
     ensure_requirements_satisfied()
     configure_logging()
@@ -153,7 +191,13 @@ def main() -> int:
     code_watcher = build_code_watcher()
     start_dashboard()
 
-    mt5 = create_mt5_module()
+    try:
+        mt5 = create_mt5_module()
+    except RuntimeError as exc:
+        if os.name != "nt" and not getattr(settings, "quick_prefer_mt4", False):
+            logging.warning("%s", exc)
+            return run_linux_standby_loop(settings, reload_check_fn=code_watcher.has_changes)
+        raise
     session = Mt5Session(
         terminal_path=settings.mt5_terminal_path,
         startup_wait_seconds=settings.mt5_startup_wait_seconds,

@@ -23,6 +23,19 @@ def test_load_requirement_import_names_ignores_blank_lines_and_comments(tmp_path
     assert load_requirement_import_names(requirements_path) == ["MetaTrader5", "dotenv", "numpy"]
 
 
+def test_load_requirement_import_names_respects_platform_markers(tmp_path):
+    from src.requirements_check import load_requirement_import_names
+
+    requirements_path = tmp_path / "requirements.txt"
+    requirements_path.write_text(
+        'MetaTrader5; sys_platform == "win32"\ntorch\n',
+        encoding="utf-8",
+    )
+
+    assert load_requirement_import_names(requirements_path, platform="win32") == ["MetaTrader5", "torch"]
+    assert load_requirement_import_names(requirements_path, platform="linux") == ["torch"]
+
+
 def test_find_missing_requirements_returns_only_unavailable_imports():
     from src.requirements_check import find_missing_requirements
 

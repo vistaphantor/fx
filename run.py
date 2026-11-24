@@ -19,7 +19,13 @@ def load_settings():
 
 
 def create_mt5_module():
-    import MetaTrader5 as mt5
+    try:
+        import MetaTrader5 as mt5
+    except ImportError as exc:
+        raise RuntimeError(
+            "MetaTrader5 Python package is only available on Windows; "
+            "enable MT4_FALLBACK_ENABLED / QUICK_PREFER_MT4 or run in Linux standby mode."
+        ) from exc
 
     return mt5
 
