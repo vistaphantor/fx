@@ -12,6 +12,15 @@ from src.language.tokenizer import BPETokenizer
 BINOCULARS_TOP_K = 8
 
 
+def _model_device(model: VistaReasoningGPT) -> torch.device:
+    try:
+        return next(model.parameters()).device
+    except (AttributeError, StopIteration):
+        # Scripted exam doubles used by the focused tests are intentionally not
+        # torch.nn.Module instances and therefore run on CPU.
+        return torch.device("cpu")
+
+
 def _token_text(tokenizer: BPETokenizer, token_id: int) -> str:
     return tokenizer.decode([int(token_id)], skip_special=False, errors="replace")
 
@@ -39,7 +48,7 @@ def _trace_generated_decisions(model: VistaReasoningGPT, tokenizer: BPETokenizer
         prompt_offset = max(1, len(prompt_ids) - (len(full) - 1 - len(context)))
     else:
         prompt_offset = len(prompt_ids)
-    logits, _ = model(torch.tensor([context], dtype=torch.long))
+    logits, _ = model(torch.tensor([context], dtype=torch.long, device=_model_device(model)))
     traces: list[DecisionTrace] = []
     start = prompt_offset - 1
     for step, token_id in enumerate(continuation):
@@ -67,7 +76,7 @@ def _trace_target_path(model: VistaReasoningGPT, tokenizer: BPETokenizer, prompt
         return ()
     target_ids = target_ids[:available]
     context = prompt_ids + target_ids[:-1]
-    logits, _ = model(torch.tensor([context], dtype=torch.long))
+    logits, _ = model(torch.tensor([context], dtype=torch.long, device=_model_device(model)))
     traces: list[TargetTokenTrace] = []
     start = len(prompt_ids) - 1
     for step, token_id in enumerate(target_ids):
@@ -85,7 +94,7 @@ def _trace_target_path(model: VistaReasoningGPT, tokenizer: BPETokenizer, prompt
 
 @torch.no_grad()
 def _first_token_distribution(model: VistaReasoningGPT, prompt_ids: list[int]) -> torch.Tensor:
-    logits, _ = model(torch.tensor([prompt_ids], dtype=torch.long))
+    logits, _ = model(torch.tensor([prompt_ids], dtype=torch.long, device=_model_device(model)))
     return torch.softmax(logits[0, -1].float(), dim=-1)
 
 

@@ -37,6 +37,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-audit-rows", type=int, default=500)
     parser.add_argument("--min-source-serialization-rate", type=float, default=0.80)
     parser.add_argument("--warmup-fraction", type=float, default=0.02)
+    parser.add_argument(
+        "--warmup-tokens", type=int, default=None,
+        help="Absolute supervised-token warmup; overrides --warmup-fraction.",
+    )
+    parser.add_argument(
+        "--exam-every-tokens", type=int, default=None,
+        help="Run an exam after this many supervised tokens, in addition to the time-based cadence.",
+    )
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    parser.add_argument("--require-cuda", action="store_true")
     return parser
 
 
@@ -46,6 +56,14 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError("--curriculum-upgrade requires --resume")
     if args.session_hours is not None and args.session_hours <= 0:
         raise ValueError("--session-hours must be positive when supplied")
+    if not 0 <= args.warmup_fraction <= 1:
+        raise ValueError("--warmup-fraction must be between zero and one")
+    if args.warmup_tokens is not None and args.warmup_tokens <= 0:
+        raise ValueError("--warmup-tokens must be positive when supplied")
+    if args.exam_every_tokens is not None and args.exam_every_tokens <= 0:
+        raise ValueError("--exam-every-tokens must be positive when supplied")
+    if (args.device == "cuda" or args.require_cuda) and not torch.cuda.is_available():
+        raise RuntimeError("cuda_required_but_unavailable")
     args.training_stage = normalize_stage(args.training_stage)
 
     torch.manual_seed(SEED)

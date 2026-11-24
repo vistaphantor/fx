@@ -154,6 +154,9 @@ def prepare_training(args: Any) -> PreparedTraining | None:
         "split_fingerprint": split_fp,
         "hf_sources_fingerprint": hf_fp,
         "stream_only": True,
+        "warmup_fraction": float(args.warmup_fraction),
+        "warmup_prediction_tokens": args.warmup_tokens,
+        "exam_interval_prediction_tokens": args.exam_every_tokens,
     }
 
     if tokenizer_path.exists():

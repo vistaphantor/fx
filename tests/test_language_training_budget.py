@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+import pytest
 
 from src.language.foundation_contract import (
     FOUNDATION_EXAM_INTERVAL_SECONDS,
@@ -10,6 +11,7 @@ from src.language.foundation_contract import (
 from src.language.streaming_sources import load_hf_source_config, require_curriculum_capacity
 from src.language.training_profiles import DEFAULT_STAGE_TOKENS_PER_PARAMETER, PROFILES
 from src.language.training_runtime import cap_prediction_targets, set_token_scheduled_lr
+from src.language.training_runtime import main as training_main
 
 
 def test_profiles_have_valid_attention_geometry_and_compute_ordering():
@@ -79,3 +81,16 @@ def test_final_batch_is_masked_to_land_on_exact_prediction_token_target():
     assert counted == 4
     assert int((capped != pad).sum().item()) == 4
     assert capped.tolist() == [[1, 2, 3, 4], [0, 0, 0, 0]]
+
+
+@pytest.mark.parametrize(
+    ("option", "value", "message"),
+    [
+        ("--warmup-tokens", "0", "--warmup-tokens must be positive"),
+        ("--exam-every-tokens", "0", "--exam-every-tokens must be positive"),
+        ("--warmup-fraction", "1.1", "--warmup-fraction must be between"),
+    ],
+)
+def test_training_runtime_rejects_invalid_token_schedule_controls(option, value, message):
+    with pytest.raises(ValueError, match=message):
+        training_main(["--hf-config", "unused.json", option, value])

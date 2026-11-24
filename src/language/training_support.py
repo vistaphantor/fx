@@ -107,10 +107,13 @@ def new_optimizer(model: VistaReasoningGPT, cfg: dict) -> torch.optim.Optimizer:
 
 def validation_loss(model: VistaReasoningGPT, loader: DataLoader, *, pad_id: int) -> tuple[float, int]:
     model.eval()
+    device = next(model.parameters()).device
     weighted = 0.0
     tokens = 0
     with torch.no_grad():
         for x, y in loader:
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
             valid = int((y != pad_id).sum().item())
             if valid <= 0:
                 continue

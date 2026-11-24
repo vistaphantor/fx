@@ -38,9 +38,24 @@ from src.language.training_support import (
 def run_training(prep: PreparedTraining, args: Any) -> None:
     stage, cfg, tokenizer = prep.stage, prep.cfg, prep.tokenizer
     target_tokens = prep.target_tokens
+    if args.warmup_tokens is not None and args.warmup_tokens > target_tokens:
+        raise ValueError("warmup_tokens_cannot_exceed_target_tokens")
+    warmup_fraction = (
+        float(args.warmup_tokens) / target_tokens
+        if args.warmup_tokens is not None else float(args.warmup_fraction)
+    )
+    exam_every_tokens = args.exam_every_tokens
+    use_cuda = args.device == "cuda" or (args.device == "auto" and torch.cuda.is_available())
+    device = torch.device("cuda" if use_cuda else "cpu")
+    if args.require_cuda and device.type != "cuda":
+        raise RuntimeError("cuda_required_but_unavailable")
     torch.manual_seed(SEED)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(SEED)
     random.seed(SEED)
     model = prep.lineage_model if prep.lineage_model is not None else VistaReasoningGPT(**prep.model_config)
+    model = model.to(device)
+    print(f"[RuntimeDevice] device={device} model_device={next(model.parameters()).device}")
     optimizer = new_optimizer(model, cfg)
     val_loader = DataLoader(
         PackedSequenceDataset(prep.val_sequences, int(cfg["seq_len"]), tokenizer.pad_id()),
@@ -53,6 +68,7 @@ def run_training(prep: PreparedTraining, args: Any) -> None:
         "model_config": prep.model_config,
         "target_prediction_tokens": target_tokens,
         "exam_interval_seconds": FOUNDATION_EXAM_INTERVAL_SECONDS,
+        "effective_warmup_fraction": warmup_fraction,
     }
     epoch = 0
     interval_steps = 0
@@ -98,6 +114,8 @@ def run_training(prep: PreparedTraining, args: Any) -> None:
             prep.best_path.unlink(missing_ok=True)
             print(f"[CurriculumUpgrade] reset interval/checkpoint baseline: {','.join(changed_state_data_keys)}")
         torch.set_rng_state(state["torch_rng_state"])
+        if device.type == "cuda" and state.get("cuda_rng_state_all") is not None:
+            torch.cuda.set_rng_state_all(state["cuda_rng_state_all"])
         random.setstate(state["python_random_state"])
         print(
             f"[Resume] exams_completed={epoch} interval_steps={interval_steps} "
@@ -149,6 +167,9 @@ def run_training(prep: PreparedTraining, args: Any) -> None:
             iterator = iter(train_loader)
             x, y = next(iterator)
 
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+
         y, valid = cap_prediction_targets(
             y, pad_id=tokenizer.pad_id(), remaining_tokens=target_tokens - cumulative_tokens,
         )
@@ -157,7 +178,7 @@ def run_training(prep: PreparedTraining, args: Any) -> None:
         set_token_scheduled_lr(
             optimizer, base_lr=float(cfg["lr"]), min_lr=float(cfg["lr_min"]),
             cumulative_tokens=cumulative_tokens, target_tokens=target_tokens,
-            warmup_fraction=args.warmup_fraction,
+            warmup_fraction=warmup_fraction,
         )
         optimizer.zero_grad(set_to_none=True)
         logits, loss = model(x, targets=y, pad_id=tokenizer.pad_id())
@@ -190,7 +211,9 @@ def run_training(prep: PreparedTraining, args: Any) -> None:
             )
             print(f"[Checkpoint] tokens={cumulative_tokens:,}/{target_tokens:,} interval={elapsed/3600:.2f}/4.00h")
 
-        if (time.monotonic() - interval_started) >= FOUNDATION_EXAM_INTERVAL_SECONDS and cumulative_tokens < target_tokens:
+        token_exam_due = exam_every_tokens is not None and interval_prediction_tokens >= exam_every_tokens
+        time_exam_due = (time.monotonic() - interval_started) >= FOUNDATION_EXAM_INTERVAL_SECONDS
+        if (token_exam_due or time_exam_due) and cumulative_tokens < target_tokens:
             if interval_prediction_tokens <= 0:
                 raise RuntimeError("exam_interval_has_no_prediction_tokens")
             train_loss = interval_loss_sum / interval_prediction_tokens
@@ -283,6 +306,9 @@ def run_training(prep: PreparedTraining, args: Any) -> None:
         "tokenizer_efficiency": prep.tokenizer_stats,
         "stream_only": True,
         "exam_interval_hours": FOUNDATION_EXAM_INTERVAL_SECONDS / 3600.0,
+        "exam_interval_prediction_tokens": exam_every_tokens,
+        "warmup_prediction_tokens": args.warmup_tokens,
+        "effective_warmup_fraction": warmup_fraction,
         "session_deadline_default": None,
         "exact_prediction_token_target": True,
         "semantic_checkpoint_selection": True,

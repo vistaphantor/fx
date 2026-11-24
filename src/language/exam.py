@@ -12,6 +12,7 @@ from src.language.exam_types import ExamAnswer, EpochExamResult, ExamQuestion
 from src.language.exam_diagnostics import (
     _deep_diagnostic,
     _first_token_distribution,
+    _model_device,
     _parameter_health,
     _prompt_sensitivity,
     _trace_generated_decisions,
@@ -225,6 +226,7 @@ def run_epoch_exam(*, model: VistaReasoningGPT, tokenizer: BPETokenizer, epoch: 
     stop_ids = {tokenizer.vocab[ENDASSISTANT], tokenizer.vocab[EOS]}
     answers: list[ExamAnswer] = []
     first_distributions: list[torch.Tensor] = []
+    device = _model_device(model)
     was_training = model.training
     rng = torch.get_rng_state()
     try:
@@ -236,7 +238,7 @@ def run_epoch_exam(*, model: VistaReasoningGPT, tokenizer: BPETokenizer, epoch: 
             deep = _deep_diagnostic(question)
             if deep:
                 first_distributions.append(_first_token_distribution(model, prompt_ids))
-            ids = torch.tensor([prompt_ids], dtype=torch.long)
+            ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
             generated = model.generate(ids, max_new_tokens=min(max_new_tokens, model.max_seq_len - len(prompt_ids)), stop_ids=stop_ids, do_sample=False)
             continuation = generated[0, len(prompt_ids):].tolist()
             raw = tokenizer.decode(continuation, skip_special=False, errors="replace")
