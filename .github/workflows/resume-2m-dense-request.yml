@@ -1,0 +1,197 @@
+name: Resume 2M dense reasoner request
+
+on:
+  pull_request:
+    paths:
+      - ".github/training-requests/2m-dense-resume.json"
+      - ".github/workflows/resume-2m-dense-request.yml"
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: observable-2m-dense-resume
+  cancel-in-progress: false
+
+jobs:
+  resume:
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    env:
+      PYTHONUNBUFFERED: "1"
+      PYTHONHASHSEED: "0"
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      GH_TOKEN: ${{ github.token }}
+      TARGET_BUNDLE: data/models/trading_language/2m_dense/foundation-prototype
+    steps:
+      - name: Checkout exact request state
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install language dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest torch datasets
+
+      - name: Read and validate resume request
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          req = json.loads(Path('.github/training-requests/2m-dense-resume.json').read_text())
+          required = {'source_run_id', 'expected_prior_tokens', 'session_hours'}
+          missing = required.difference(req)
+          if missing:
+              raise SystemExit(f'missing request keys: {sorted(missing)}')
+          if int(req['source_run_id']) <= 0 or int(req['expected_prior_tokens']) <= 0:
+              raise SystemExit('source_run_id and expected_prior_tokens must be positive')
+          hours = float(req['session_hours'])
+          if not (0.05 <= hours <= 1.0):
+              raise SystemExit('session_hours must be between 0.05 and 1.0')
+          with open('/tmp/resume_env', 'w', encoding='utf-8') as f:
+              f.write(f"SOURCE_RUN_ID={int(req['source_run_id'])}\n")
+              f.write(f"EXPECTED_PRIOR_TOKENS={int(req['expected_prior_tokens'])}\n")
+              f.write(f"SESSION_HOURS={hours}\n")
+          PY
+          cat /tmp/resume_env >> "$GITHUB_ENV"
+
+      - name: Restore exact prior checkpoint artifact
+        shell: bash
+        run: |
+          rm -rf _resume "$TARGET_BUNDLE"
+          mkdir -p _resume "$TARGET_BUNDLE"
+          gh run download "$SOURCE_RUN_ID" -R "$GITHUB_REPOSITORY" -D _resume
+          STATE="$(find _resume -type f -path '*/.training/training_state.pt' -print -quit)"
+          if [ -z "$STATE" ]; then
+            echo "No resumable training_state.pt found in source run $SOURCE_RUN_ID" >&2
+            find _resume -maxdepth 8 -type f -print >&2 || true
+            exit 1
+          fi
+          SRC_BUNDLE="$(dirname "$(dirname "$STATE")")"
+          cp -a "$SRC_BUNDLE"/. "$TARGET_BUNDLE"/
+          test -f "$TARGET_BUNDLE/.training/tokenizer.json"
+          test -f "$TARGET_BUNDLE/.training/preflight.json"
+          test -f "$TARGET_BUNDLE/.training/training_state.pt"
+
+      - name: Prove exact checkpoint lineage before training
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os, torch
+          from pathlib import Path
+          bundle = Path(os.environ['TARGET_BUNDLE'])
+          state = torch.load(bundle / '.training/training_state.pt', map_location='cpu', weights_only=False)
+          actual = int(state['cumulative_prediction_tokens'])
+          expected = int(os.environ['EXPECTED_PRIOR_TOKENS'])
+          if actual != expected:
+              raise SystemExit(f'resume_lineage_mismatch:{actual}!={expected}')
+          pre = json.loads((bundle / '.training/preflight.json').read_text())
+          if pre.get('profile') != '2m_dense' or pre.get('training_stage') != 'foundation':
+              raise SystemExit('resume_profile_or_stage_mismatch')
+          print(f'[Lineage] exact prior cumulative tokens={actual:,}')
+          print(f"[Lineage] parameters={int(pre['total_parameters']):,} target={int(pre['target_prediction_tokens']):,}")
+          PY
+
+      - name: Resume same 2M dense foundation model
+        shell: bash
+        run: |
+          set -o pipefail
+          python tools/train_language_reasoner.py \
+            --profile 2m_dense \
+            --training-stage foundation \
+            --bundle-dir "$TARGET_BUNDLE" \
+            --hf-config config/hf_sources.json \
+            --hf-sample-examples 600 \
+            --threads 4 \
+            --session-hours "$SESSION_HOURS" \
+            --compute-probe-steps 1 \
+            --source-audit-rows 30 \
+            --resume | tee "$TARGET_BUNDLE/resume_training.log"
+
+      - name: Prove token counter advanced
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os, torch
+          from pathlib import Path
+          bundle = Path(os.environ['TARGET_BUNDLE'])
+          state_path = bundle / '.training/training_state.pt'
+          if not state_path.exists():
+              raise SystemExit('expected resumable state after bounded session')
+          state = torch.load(state_path, map_location='cpu', weights_only=False)
+          prior = int(os.environ['EXPECTED_PRIOR_TOKENS'])
+          current = int(state['cumulative_prediction_tokens'])
+          if current <= prior:
+              raise SystemExit(f'token_counter_did_not_advance:{current}<={prior}')
+          report = {
+              'source_run_id': int(os.environ['SOURCE_RUN_ID']),
+              'prior_cumulative_prediction_tokens': prior,
+              'current_cumulative_prediction_tokens': current,
+              'delta_prediction_tokens': current - prior,
+              'optimizer_steps': int(state['optimizer_steps']),
+              'epoch': int(state['epoch']),
+              'target_prediction_tokens': int(state['target_prediction_tokens']),
+              'best_validation_loss': float(state['best_validation_loss']),
+              'live_broker_execution': False,
+          }
+          (bundle / 'resume_metrics.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
+          print(json.dumps(report, indent=2))
+          PY
+
+      - name: Examine resumed checkpoint
+        run: |
+          python tools/exam_language_checkpoint.py \
+            --bundle "$TARGET_BUNDLE" \
+            --checkpoint current \
+            --training-stage foundation \
+            --max-new-tokens 64 | tee "$TARGET_BUNDLE/resumed_checkpoint_exam.txt"
+
+      - name: Probe resumed language behavior
+        run: |
+          python tools/probe_language_foundation.py \
+            --bundle "$TARGET_BUNDLE" \
+            --checkpoint current \
+            --max-new-tokens 64 \
+            --prompt "A market is a place where" \
+            --prompt "Gold prices can rise when" \
+            --prompt "Risk management matters because" \
+            --prompt "If a trader loses one percent, the disciplined next step is" \
+            --prompt "A central bank changes interest rates because" \
+            | tee "$TARGET_BUNDLE/resumed_foundation_probe.txt"
+
+      - name: Record immutable continuation provenance
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p "$TARGET_BUNDLE"
+          cat > "$TARGET_BUNDLE/observable_resume_provenance.json" <<EOF
+          {
+            "repository": "vistaphantor/fx",
+            "source_workflow_run_id": "${SOURCE_RUN_ID:-unknown}",
+            "resume_workflow_run_id": "${GITHUB_RUN_ID}",
+            "commit_sha": "${GITHUB_SHA}",
+            "profile": "2m_dense",
+            "training_stage": "foundation",
+            "resume": true,
+            "canonical_foundation_target_changed": false,
+            "live_broker_execution": false
+          }
+          EOF
+
+      - name: Publish observable resumed checkpoint
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vista-fx-2m-dense-observable-resume-${{ github.sha }}
+          if-no-files-found: warn
+          retention-days: 30
+          include-hidden-files: true
+          path: |
+            data/models/trading_language/2m_dense/foundation-prototype/**
