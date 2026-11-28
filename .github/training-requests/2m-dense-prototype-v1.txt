@@ -1,0 +1,5 @@
+profile=2m_dense
+stage=foundation
+purpose=bounded-research-prototype
+live-broker-execution=false
+canonical-foundation-target-changed=false
